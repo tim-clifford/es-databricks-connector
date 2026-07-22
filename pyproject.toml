@@ -1,0 +1,29 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "databricks-es-connector"
+version = "0.1.0"
+description = "Serverless-safe bulk export from Databricks/Spark to Elasticsearch (schema-agnostic, gzip, idempotent)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Databricks internal — not for public distribution" }
+authors = [{ name = "Databricks Field Engineering" }]
+dependencies = [
+    "elasticsearch>=8,<9",
+]
+
+[project.optional-dependencies]
+# Spark/pandas are provided by the Databricks runtime; only needed for local dev/testing.
+dev = [
+    "pytest>=7",
+    "pandas>=1.5",
+]
+
+# src/ layout: the wheel packages ONLY the databricks_es_connector library.
+[tool.hatch.build.targets.wheel]
+packages = ["src/databricks_es_connector"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
