@@ -101,7 +101,7 @@ raises (pick one).
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
-| `index` | `str` | `""` | **Yes for writes** | Target index. `bulk_write`/`build_action` raise if empty. |
+| `index` | `str` | `""` | **Yes** | Target index. `bulk_write`/`build_action` raise if empty. |
 | `id_field` | `str \| None` | `None` | No | Column used as the deterministic `_id` → idempotent upserts. If unset, ES assigns random IDs (replays duplicate). If set, the column must be non-null in every row. |
 | `http_compress` | `bool` | `True` | No | gzip the bulk request body (the egress-cost lever). |
 | `chunk_size` | `int` | `500` | No | Docs per bulk request. |
@@ -113,12 +113,11 @@ raises (pick one).
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
-| `drop_fields` | `tuple` | `()` | No | Columns the client chooses to **skip** to shrink payload (egress opt-out), e.g. `("raw_data", "unmapped")`. Purely optional — never required to make a column exportable. |
+| `drop_fields` | `tuple` | `()` | No | Columns the client chooses to **skip** to shrink payload (egress opt-out), e.g. `("raw_data", "unmapped")`. |
 
-## Datatype coverage — 100% of a table is exportable
+## Datatype coverage
 
-Field pruning (`drop_fields`) is a client **opt-out** to reduce payload, not a workaround for
-types that "can't" export. Every Spark column can be exported and lands as usable data:
+Every Spark column can be exported and lands as usable data:
 
 - **Handled automatically by `coerce_value`** (no caller action): all numerics (byte/short/int/
   long/float/double), `decimal` → float, `boolean`, `string`, `binary` → base64 string, `date`/
@@ -211,3 +210,11 @@ tests/                         # unit tests for the pure-Python layer (no Spark/
 
 The built wheel contains only `databricks_es_connector`; `tests/` stays in the repo for
 development but is never part of the customer artifact.
+
+## License & Attribution
+
+**Copyright © Databricks, Inc.** — Developed and maintained by Databricks Forward Deployed Engineering. Available to support customers and the broader community in connecting Databricks to Elasticsearch. For production support and customization, contact your Databricks account team.
+
+---
+
+**Built with 💜 by Databricks Forward Deployed Engineering**
