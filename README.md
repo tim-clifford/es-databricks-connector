@@ -179,6 +179,13 @@ python -m build --wheel                             # writes dist/databricks_es_
 The version comes from `[project].version` in `pyproject.toml`; bump it there before
 building a new release. The wheel lands in `dist/` (git-ignored).
 
+**When cutting a release, regenerate [`requirements.txt`](requirements.txt).** The build does
+*not* read that file — the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
+fresh install resolves transitive versions at install time and drifts from the pinned snapshot.
+`requirements.txt` is a point-in-time closure for security scanning; keep it matched to the
+release by regenerating it (see the command in its header) whenever dependencies or the pin
+change.
+
 Verify the wheel contains only the library (no tests leakage):
 
 ```bash
