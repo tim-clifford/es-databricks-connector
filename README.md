@@ -157,6 +157,14 @@ Private Databricks Field Engineering artifact. Not published to PyPI. Distribute
 customers as a built `.whl` (upload to a Unity Catalog Volume, or via Delta Share),
 installed in a notebook with `%pip install /Volumes/.../databricks_es_connector-*.whl`.
 
+### Dependencies
+
+The wheel's only direct runtime dependency is `elasticsearch>=8,<9` (declared in
+`pyproject.toml`). [`requirements.txt`](requirements.txt) lists the full resolved
+dependency tree with pinned versions — direct and transitive — for security scanning
+(SCA / vulnerability review). Spark/pandas are provided by the Databricks runtime and
+are not bundled.
+
 ### Building the wheel
 
 The build packages only `src/databricks_es_connector/` (see
@@ -170,6 +178,13 @@ python -m build --wheel                             # writes dist/databricks_es_
 
 The version comes from `[project].version` in `pyproject.toml`; bump it there before
 building a new release. The wheel lands in `dist/` (git-ignored).
+
+**When cutting a release, regenerate [`requirements.txt`](requirements.txt).** The build does
+*not* read that file — the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
+fresh install resolves transitive versions at install time and drifts from the pinned snapshot.
+`requirements.txt` is a point-in-time closure for security scanning; keep it matched to the
+release by regenerating it (see the command in its header) whenever dependencies or the pin
+change.
 
 Verify the wheel contains only the library (no tests leakage):
 
