@@ -181,18 +181,27 @@ def collapse_cdf_changes(
 
     Pure function (no Spark, no ES) so every corner case is unit-testable. Given a list of
     row dicts (each carrying a _change_type and a commit version), for each id keep only the
-    LAST change by commit version (ties broken by original order), and drop update_preimage
-    rows entirely. Returns a list of `(row, is_delete)` tuples in a deterministic order (first
-    appearance of each id), where is_delete is True for a `delete` net-change.
+    LAST change by commit version, and drop update_preimage rows entirely. Returns a list of
+    `(row, is_delete)` tuples in a deterministic order (first appearance of each id), where
+    is_delete is True for a `delete` net-change.
 
     Semantics this produces:
-      - insert then update    -> index the update_postimage        (last wins)
-      - update then delete     -> delete                            (last wins)
-      - delete then re-insert  -> index the insert                 (last wins)
+      - insert then update    -> index the update_postimage        (highest version wins)
+      - update then delete     -> delete                            (highest version wins)
+      - delete then re-insert  -> index the insert                 (highest version wins)
       - N updates              -> index the highest-version postimage
     Unknown _change_type values are treated as upserts (fail-open to indexing, not dropping).
+
+    LIMITATION — same-version ties. _commit_version is the only ordering signal CDF provides,
+    and it is per-commit, not per-row. When two DISTINCT net changes for the same id share a
+    _commit_version (e.g. an atomic update+delete of the same key in one MERGE), there is no
+    reliable way to know which came last; the tie falls back to input order, which is NOT a
+    guaranteed ordering (rows may be reordered by an upstream repartition). A preimage/postimage
+    pair shares a version but is unambiguous because the preimage is dropped. Callers that can
+    produce genuine same-key/same-commit conflicts must resolve them upstream. (See README/HANDOFF.)
     """
-    # winner[id] = (commit_version, seq, row, is_delete); seq preserves input order for ties.
+    # winner[id] = (commit_version, seq, row, is_delete). seq is the input index, used only as an
+    # arbitrary, non-authoritative tiebreaker when commit versions are equal (see LIMITATION above).
     winner: dict = {}
     order: list = []  # first-appearance order of ids, for deterministic output
     for seq, row in enumerate(rows):
@@ -214,6 +223,6 @@ def collapse_cdf_changes(
         if prev is None:
             order.append(rid)
             winner[rid] = (cv, seq, row, is_delete)
-        elif (cv, seq) >= (prev[0], prev[1]):   # newer version, or same version later in batch
+        elif (cv, seq) >= (prev[0], prev[1]):   # higher version wins; equal version -> arbitrary (see LIMITATION)
             winner[rid] = (cv, seq, row, is_delete)
     return [(winner[rid][2], winner[rid][3]) for rid in order]

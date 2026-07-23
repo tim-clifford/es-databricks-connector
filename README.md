@@ -124,6 +124,17 @@ Notes:
   incremental updates/deletes. This also avoids collapsing a very large first batch in memory.
 - Deletes are **always** applied in CDF mode. If you need the search index to remain immutable
   even when source rows are purged, filter `delete` rows out of the feed before passing it in.
+- **Same-version tie limitation.** Collapse orders changes by `_commit_version`, the only ordering
+  signal the change feed provides. Both `_commit_version` and `_commit_timestamp` are per-commit,
+  not per-row, and the feed carries no column to order changes *within* a single commit. A
+  `preimage`/`postimage` pair for one update shares a version but is unambiguous (the preimage is
+  dropped). However, if a single commit produces **two distinct net changes for the same `_id`**
+  at the same version (e.g. an operation that both updates and deletes the same key atomically —
+  possible with some `MERGE`/multi-statement transactions), there is no reliable signal for which
+  came last, and the collapse winner among them is **not deterministic**. Per-commit operations
+  that touch each key at most once (ordinary `INSERT`/`UPDATE`/`DELETE`, and standard `MERGE`) are
+  unaffected. If a source can produce same-key/same-commit conflicts and the resolution matters,
+  resolve them upstream (or filter the feed) before passing it to the connector.
 
 ## Configuration (`EsConfig`)
 

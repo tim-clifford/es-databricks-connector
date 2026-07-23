@@ -74,7 +74,14 @@ These were consciously deferred to keep the library focused. Needed before produ
   single very large or skew-heavy batch is the failure mode); (2) deletes are always applied in CDF
   mode — filter `delete` rows out upstream if the index must stay immutable (e.g. SIEM/audit
   retention); (3) at-least-once streaming means a batch can be reprocessed — deletes are idempotent
-  (delete-of-absent = success) and upserts overwrite, so replays converge.
+  (delete-of-absent = success) and upserts overwrite, so replays converge; (4) **same-version ties
+  are not deterministically ordered.** `_commit_version`/`_commit_timestamp` are per-commit, and
+  Change Data Feed exposes no column to order changes within a single commit. A preimage/postimage
+  pair for one update is unambiguous (preimage dropped), but if one commit yields two distinct net
+  changes for the same key at the same version (e.g. an atomic update+delete of the same key,
+  possible with some `MERGE`/multi-statement transactions), the collapse winner is undefined.
+  Operations that touch each key at most once per commit (ordinary INSERT/UPDATE/DELETE, standard
+  MERGE) are unaffected; resolve genuine same-key/same-commit conflicts upstream if it matters.
 
 ## Open items — packaging & portability
 

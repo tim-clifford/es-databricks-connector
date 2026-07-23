@@ -364,12 +364,15 @@ def test_collapse_multiple_updates_highest_version():
         assert out[0][0]["val"] == 30, f"failed for input order {[r['val'] for r in perm]}"
 
 
-def test_collapse_out_of_order_within_same_version_uses_input_order():
-    # Same commit version (e.g. preimage/postimage share a version): later input row wins.
+def test_collapse_same_version_tie_falls_back_to_input_order():
+    # KNOWN LIMITATION: when two distinct changes share a _commit_version, CDF gives no
+    # authoritative ordering, so collapse falls back to input order (later input wins). This
+    # test pins the *implemented* fallback, NOT a correctness guarantee — real same-key/same-
+    # commit conflicts must be resolved upstream (see collapse_cdf_changes docstring / README).
     rows = [_cdf("a", "update_postimage", 5, val="first"),
             _cdf("a", "update_postimage", 5, val="second")]
     out = collapse_cdf_changes(rows, id_field="doc_id")
-    assert out[0][0]["val"] == "second"
+    assert out[0][0]["val"] == "second"   # deterministic given fixed input order; order is not guaranteed upstream
 
 
 def test_collapse_multiple_ids_independent_and_ordered():
