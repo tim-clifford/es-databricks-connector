@@ -68,13 +68,13 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
 - **Updates & deletes.** Inserts/upserts via deterministic `_id` shipped in 0.1.0; **deletes shipped
   in 0.2.0** (`has_deletes` + `delete_flag_column`, emitting delete-by-`_id` bulk actions with
   scoped 404 no-op suppression). The connector deletes exactly the rows the caller flags — it does
-  **not** dedup or order Change Data Feed rows itself. That is deliberate (dedup needs the caller's
-  business sequencing column and must run distributed in Spark, not in-connector); the
-  `cdf_deletes_export` demo shows the CDF → dedup → flag pattern. **Known limitation:** the demo
-  dedups per micro-batch, so late-arriving data whose `event_ts` is older than a doc already in ES,
-  but committed in a *later* batch, can clobber the newer doc. The memory-free fix is ES external
-  versioning (`version` = `event_ts` epoch-millis, `version_type=external_gte`), deferred to keep
-  the 0.2.0 API surface minimal.
+  **not** dedup or order Change Data Feed rows itself. That is deliberate: dedup needs the caller's
+  business sequencing column and should run distributed in Spark, not in executor memory (see the
+  Change-Data-Feed pattern in the README). **Known limitation:** a caller that dedups per
+  micro-batch is only correct within a batch — late-arriving data whose `event_ts` is older than a
+  doc already in ES, but committed in a *later* batch, can clobber the newer doc. The memory-free
+  fix is ES external versioning (`version` = `event_ts` epoch-millis, `version_type=external_gte`),
+  deferred to keep the 0.2.0 API surface minimal.
 
 ## Open items — packaging & portability
 

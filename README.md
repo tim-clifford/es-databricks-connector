@@ -93,11 +93,35 @@ result = bulk_write(prepared_df, cfg)   # -> {"written": N, "deleted": D, "error
 ```
 
 The connector is schema-agnostic about *how* you decide the latest state of a row: it deletes
-exactly the rows you flag and indexes the rest. The typical source is a Delta **Change Data
-Feed** — you dedup to one record per id in Spark and set the flag from `_change_type == 'delete'`.
-That ordering/dedup work stays in your pipeline (it needs your business sequencing column, e.g.
-`event_ts`), not in the connector; see the `cdf_deletes_export` demo for the full pattern and its
-per-batch ordering caveat.
+exactly the rows you flag and indexes the rest. A common source is a Delta **Change Data Feed** —
+you dedup to one record per id in Spark and set the flag from `_change_type == 'delete'`. That
+ordering/dedup work stays in your pipeline, not in the connector, because it needs your business
+sequencing column (e.g. `event_ts`) and the sort should run distributed in Spark rather than in
+executor memory. A typical `foreachBatch` shape:
+
+```python
+from pyspark.sql import functions as F, Window
+
+def upsert_latest(batch_df, batch_id):
+    # keep the latest record per id: business time first, commit version as tie-breaker
+    w = Window.partitionBy("id").orderBy(
+        F.col("event_ts").desc_nulls_last(),
+        F.col("_commit_version").desc(),
+    )
+    latest = (
+        batch_df
+        .withColumn("rn", F.row_number().over(w)).where("rn = 1").drop("rn")
+        .withColumn("_is_delete", F.col("_change_type") == "delete")
+    )
+    make_foreach_batch(cfg, on_batch=on_batch)(latest, batch_id)  # cfg has has_deletes=True
+```
+
+**Ordering caveat:** dedup like the above is only authoritative *within* one micro-batch. Across
+batches, Elasticsearch applies writes in arrival/commit order, so a late-arriving row whose
+`event_ts` is older than a doc already in ES — but committed in a later batch — can overwrite the
+newer doc. If your source can deliver out-of-order events across batches, make `event_ts` globally
+authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
+`version_type=external_gte`) so ES itself rejects stale writes regardless of batch order.
 
 ## Configuration (`EsConfig`)
 
@@ -155,9 +179,8 @@ an expected no-op (not an error) — so checkpoint replays, filtered rows, and r
 stay clean. This suppression is scoped strictly to `delete` + `404`; a 404 on an index, or any
 other status on a delete, is still counted in `errors`.
 
-See the `cdf_deletes_export` demo in the demos repo for the recommended pattern: read a Delta
-Change Data Feed, dedup to the latest record per id in Spark (no in-connector sort), and hand the
-`_change_type == 'delete'` rows to the connector as the delete flag.
+See [Usage (deletes)](#usage-deletes) above for the recommended Change-Data-Feed pattern and the
+cross-batch ordering caveat.
 
 ## Datatype coverage
 
