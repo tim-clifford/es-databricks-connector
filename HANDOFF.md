@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.1.0)
+# Production Readiness / Known Limitations (0.2.0)
 
 `databricks-es-connector` 0.1.0 proves the **mechanism**: serverless Databricks can bulk-write
 to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -42,8 +42,8 @@ before a customer relies on it.
 
 These were consciously deferred to keep 0.1.0 focused. Needed before production for SIEM/audit data:
 
-- **Error capture / dead-letter.** `bulk_write` returns `{written, errors}` but the per-doc error
-  bodies from `helpers.bulk` are counted and discarded — a failed write is currently
+- **Error capture / dead-letter.** `bulk_write` returns `{written, deleted, errors}` but the per-doc
+  error bodies from `streaming_bulk` are counted and discarded — a failed write is currently
   undiagnosable, and errored events are silently dropped. Add error-reason logging (at minimum) and
   a dead-letter path (for SIEM, silent event loss is a correctness/audit problem).
 - **Backpressure / concurrency cap.** `mapInPandas` opens one ES client per Spark partition; a
@@ -65,9 +65,16 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   batch (StatsD, a Delta audit table).
 - **Monitoring.** The `on_batch` hook is a seam for metrics but nothing sinks throughput / error
   rate / lag.
-- **Updates & deletes.** The connector exports appends (and, via a deterministic `_id`, upserts on
-  replay). Propagating source-side updates/deletes to ES requires reading Delta Change Data Feed
-  and emitting delete bulk actions — not built in 0.1.0.
+- **Updates & deletes.** Inserts/upserts via deterministic `_id` shipped in 0.1.0; **deletes shipped
+  in 0.2.0** (`has_deletes` + `delete_flag_column`, emitting delete-by-`_id` bulk actions with
+  scoped 404 no-op suppression). The connector deletes exactly the rows the caller flags — it does
+  **not** dedup or order Change Data Feed rows itself. That is deliberate (dedup needs the caller's
+  business sequencing column and must run distributed in Spark, not in-connector); the
+  `cdf_deletes_export` demo shows the CDF → dedup → flag pattern. **Known limitation:** the demo
+  dedups per micro-batch, so late-arriving data whose `event_ts` is older than a doc already in ES,
+  but committed in a *later* batch, can clobber the newer doc. The memory-free fix is ES external
+  versioning (`version` = `event_ts` epoch-millis, `version_type=external_gte`), deferred to keep
+  the 0.2.0 API surface minimal.
 
 ## Open items — packaging & portability
 

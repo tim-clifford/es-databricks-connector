@@ -257,3 +257,77 @@ def test_build_action_coerces_timestamp_in_source():
     row = {"doc_id": "1", "time": dt.datetime(2024, 1, 26, 11, 55, 23, tzinfo=dt.timezone.utc)}
     action = build_action(row, index="idx", id_field="doc_id")
     assert action["_source"]["time"] == 1706270123000
+
+
+# --- delete routing (has_deletes + delete_flag_column) -----------------------------------
+
+def test_flagged_row_becomes_delete_action():
+    # A truthy flag routes the row to a delete-by-id action: id-only, no _source body.
+    row = {"doc_id": "abc", "x": 1, "is_deleted": True}
+    action = build_action(row, index="idx", id_field="doc_id",
+                          has_deletes=True, delete_flag_column="is_deleted")
+    assert action == {"_op_type": "delete", "_index": "idx", "_id": "abc"}
+    assert "_source" not in action
+
+
+def test_unflagged_row_is_index_and_flag_dropped_from_source():
+    # A falsy flag keeps the row as an index, and the flag column must NOT be indexed as data.
+    row = {"doc_id": "abc", "x": 1, "is_deleted": False}
+    action = build_action(row, index="idx", id_field="doc_id",
+                          has_deletes=True, delete_flag_column="is_deleted")
+    assert action["_op_type"] if "_op_type" in action else True  # not a delete
+    assert action["_index"] == "idx" and action["_id"] == "abc"
+    assert action["_source"] == {"doc_id": "abc", "x": 1}   # is_deleted pruned
+
+
+def test_null_flag_is_not_a_delete():
+    # A missing/null flag must never be read as a delete.
+    for null in (None, float("nan")):
+        row = {"doc_id": "abc", "is_deleted": null}
+        action = build_action(row, index="idx", id_field="doc_id",
+                              has_deletes=True, delete_flag_column="is_deleted")
+        assert action.get("_op_type") != "delete"
+
+
+def test_string_flag_values_parsed_leniently():
+    truthy = ["true", "True", "t", "1", "yes"]
+    falsy = ["false", "f", "0", "no", ""]
+    for v in truthy:
+        a = build_action({"doc_id": "x", "d": v}, index="i", id_field="doc_id",
+                         has_deletes=True, delete_flag_column="d")
+        assert a.get("_op_type") == "delete", v
+    for v in falsy:
+        a = build_action({"doc_id": "x", "d": v}, index="i", id_field="doc_id",
+                         has_deletes=True, delete_flag_column="d")
+        assert a.get("_op_type") != "delete", v
+
+
+def test_numpy_bool_flag_is_a_delete():
+    np = pytest.importorskip("numpy")
+    a = build_action({"doc_id": "x", "d": np.bool_(True)}, index="i", id_field="doc_id",
+                     has_deletes=True, delete_flag_column="d")
+    assert a.get("_op_type") == "delete"
+
+
+def test_delete_requires_id_field():
+    with pytest.raises(ValueError):
+        build_action({"d": True}, index="i", has_deletes=True, delete_flag_column="d")
+
+
+def test_delete_flagged_row_missing_id_raises():
+    with pytest.raises(KeyError):
+        build_action({"d": True}, index="i", id_field="doc_id",
+                     has_deletes=True, delete_flag_column="d")
+
+
+def test_has_deletes_without_flag_column_raises():
+    with pytest.raises(ValueError):
+        build_action({"doc_id": "x"}, index="i", id_field="doc_id", has_deletes=True)
+
+
+def test_deletes_off_ignores_flag_column():
+    # With has_deletes=False, the flag column is just ordinary data and is indexed.
+    row = {"doc_id": "abc", "is_deleted": True}
+    action = build_action(row, index="idx", id_field="doc_id")
+    assert action.get("_op_type") != "delete"
+    assert action["_source"]["is_deleted"] is True
