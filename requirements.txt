@@ -1,0 +1,25 @@
+# Full runtime dependency tree for the databricks-es-connector wheel.
+#
+# Purpose: a complete, pinned inventory of third-party packages the built wheel pulls
+# in at runtime, for security scanning (SCA / vulnerability review).
+#
+# Direct dependency (declared in pyproject.toml): elasticsearch>=8,<9
+# Everything else below is a transitive dependency of elasticsearch.
+#
+# Versions are the resolved closure of `pip install "elasticsearch>=8,<9"` (Python 3.14,
+# resolved 2026-07). Pins are exact so the scan reflects a reproducible set; the wheel
+# itself constrains only `elasticsearch>=8,<9`, so a fresh install may resolve newer
+# transitive patch versions. Regenerate with:
+#     python -m venv /tmp/req && /tmp/req/bin/pip install "elasticsearch>=8,<9"
+#     /tmp/req/bin/pip freeze > requirements.txt   # then restore this header
+#
+# NOT included (provided by the Databricks runtime, never bundled in the wheel):
+# pyspark, pandas, numpy, pyarrow. Dev/test-only tools (pytest, build) are excluded too.
+
+certifi==2026.6.17
+elastic-transport==8.19.0
+elasticsearch==8.19.3
+python-dateutil==2.9.0.post0
+six==1.17.0
+typing_extensions==4.16.0
+urllib3==2.7.0

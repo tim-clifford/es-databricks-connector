@@ -157,6 +157,14 @@ Private Databricks Field Engineering artifact. Not published to PyPI. Distribute
 customers as a built `.whl` (upload to a Unity Catalog Volume, or via Delta Share),
 installed in a notebook with `%pip install /Volumes/.../databricks_es_connector-*.whl`.
 
+### Dependencies
+
+The wheel's only direct runtime dependency is `elasticsearch>=8,<9` (declared in
+`pyproject.toml`). [`requirements.txt`](requirements.txt) lists the full resolved
+dependency tree with pinned versions — direct and transitive — for security scanning
+(SCA / vulnerability review). Spark/pandas are provided by the Databricks runtime and
+are not bundled.
+
 ### Building the wheel
 
 The build packages only `src/databricks_es_connector/` (see
