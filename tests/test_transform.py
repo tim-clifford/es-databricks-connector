@@ -275,7 +275,7 @@ def test_unflagged_row_is_index_and_flag_dropped_from_source():
     row = {"doc_id": "abc", "x": 1, "is_deleted": False}
     action = build_action(row, index="idx", id_field="doc_id",
                           has_deletes=True, delete_flag_column="is_deleted")
-    assert action["_op_type"] if "_op_type" in action else True  # not a delete
+    assert action.get("_op_type") != "delete"               # indexed, not deleted
     assert action["_index"] == "idx" and action["_id"] == "abc"
     assert action["_source"] == {"doc_id": "abc", "x": 1}   # is_deleted pruned
 

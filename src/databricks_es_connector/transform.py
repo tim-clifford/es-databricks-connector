@@ -128,7 +128,8 @@ def _is_delete_flagged(v: Any) -> bool:
 
     The flag arrives from Spark via mapInPandas, so it may be a Python bool, a numpy
     bool_, 0/1, or a string. Nulls (None/NaN/NaT/pd.NA) mean 'not a delete' — a missing
-    flag must never be read as a delete. Strings are parsed leniently ('true'/'t'/'1'/'yes').
+    flag must never be read as a delete. Strings are parsed leniently
+    ('true'/'t'/'1'/'yes'/'y', case-insensitive).
     """
     if _is_null(v):
         return False

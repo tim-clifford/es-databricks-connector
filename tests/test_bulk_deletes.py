@@ -7,7 +7,7 @@ import pytest
 
 from databricks_es_connector.config import EsConfig
 from databricks_es_connector.bulk import (
-    classify_bulk_result, WRITTEN, DELETED, IGNORED, ERROR,
+    classify_bulk_result, make_partition_writer, WRITTEN, DELETED, IGNORED, ERROR,
 )
 
 
@@ -77,3 +77,69 @@ def test_delete_non_404_is_still_an_error():
 def test_index_non_404_failures_are_errors():
     for status in (400, 409, 429, 500):
         assert classify_bulk_result(False, "index", status) == ERROR
+
+
+# --- the writer glue: streaming_bulk results -> {written, deleted, errors} ----------------
+# Exercises the loop in make_partition_writer without Spark or a live ES, by monkeypatching
+# the elasticsearch module the writer imports internally. Guards the wiring (result counting
+# + the yielded pandas schema) that classify_bulk_result's unit tests don't cover.
+
+def test_partition_writer_counts_and_schema(monkeypatch):
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    import elasticsearch.helpers
+
+    # A mixed batch: 2 indexed, 1 real delete (200), 1 delete-404 (no-op), 1 index error (409),
+    # 1 delete error (409). Expect written=2, deleted=1, errors=2 (the 404 is ignored).
+    canned = [
+        (True,  {"index":  {"status": 201}}),
+        (True,  {"index":  {"status": 200}}),
+        (True,  {"delete": {"status": 200}}),
+        (False, {"delete": {"status": 404}}),   # no-op — must NOT count
+        (False, {"index":  {"status": 409}}),   # real error
+        (False, {"delete": {"status": 409}}),   # real error (non-404 delete)
+    ]
+
+    class _FakeES:
+        def __init__(self, **kw):
+            pass
+
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", _FakeES)
+    monkeypatch.setattr(elasticsearch.helpers, "streaming_bulk",
+                        lambda es, actions, **kw: iter(canned))
+
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id")
+    writer = make_partition_writer(cfg)
+    # One non-empty pandas chunk drives one streaming_bulk call (its content is irrelevant here
+    # since streaming_bulk is stubbed; it just needs >=1 row so the actions list is non-empty).
+    out = list(writer(iter([pd.DataFrame({"id": ["a"]})])))
+
+    assert len(out) == 1
+    row = out[0].iloc[0]
+    assert list(out[0].columns) == ["written", "deleted", "errors"]   # mapInPandas schema
+    assert (int(row["written"]), int(row["deleted"]), int(row["errors"])) == (2, 1, 2)
+
+
+def test_partition_writer_empty_chunk_yields_zeros(monkeypatch):
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    import elasticsearch.helpers
+
+    class _FakeES:
+        def __init__(self, **kw):
+            pass
+
+    called = {"n": 0}
+    def _stub(es, actions, **kw):
+        called["n"] += 1
+        return iter([])
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", _FakeES)
+    monkeypatch.setattr(elasticsearch.helpers, "streaming_bulk", _stub)
+
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id")
+    writer = make_partition_writer(cfg)
+    # An empty pandas chunk => no actions => streaming_bulk is skipped, counts are all zero.
+    out = list(writer(iter([pd.DataFrame({"id": []})])))
+    row = out[0].iloc[0]
+    assert (int(row["written"]), int(row["deleted"]), int(row["errors"])) == (0, 0, 0)
+    assert called["n"] == 0   # no bulk call for an empty chunk
