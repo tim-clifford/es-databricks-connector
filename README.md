@@ -11,10 +11,10 @@ Built because the `elasticsearch-spark` connector cannot run on serverless compu
 (no third-party Spark JARs), has no Spark 4 / DBR 17+ build, and offers no request
 compression. The Python client has none of those limits.
 
-> **Maturity: 0.1.0.** The mechanism is proven and every Spark datatype is exportable, but
-> production hardening items (TLS/CA trust, API-key auth worked example, FIPS/FedRAMP, error
-> dead-lettering, index templates/ILM) are not yet built. See [HANDOFF.md](HANDOFF.md) for the
-> known limitations and pre-production checklist.
+> **Maturity: 0.2.0.** The mechanism is proven, every Spark datatype is exportable, and updates
+> & deletes are supported via Change Data Feed. Production hardening items (TLS/CA trust, API-key
+> auth worked example, FIPS/FedRAMP, error dead-lettering, index templates/ILM) are not yet built.
+> See [HANDOFF.md](HANDOFF.md) for the known limitations and pre-production checklist.
 
 ## Why this shape
 
@@ -76,6 +76,55 @@ Notes for serverless:
   hang). Wrap it in a job that calls `spark.streams.awaitAnyTermination()`. See
   [HANDOFF.md](HANDOFF.md) for the details and the at-least-once / freshness caveats.
 
+## Usage (updates & deletes via Change Data Feed)
+
+By default the connector treats every input row as an insert/upsert (append semantics). To also
+propagate **updates and deletes**, read the source as a Delta
+[Change Data Feed](https://docs.databricks.com/delta/delta-change-data-feed.html) and set
+`change_feed=True`:
+
+```python
+from databricks_es_connector import EsConfig, bulk_write   # or make_foreach_batch for streaming
+
+# 1. Enable CDF on the source table (one-time, by the table owner):
+#    ALTER TABLE catalog.schema.source_table SET TBLPROPERTIES (delta.enableChangeDataFeed = true)
+
+# 2. Read the change feed and hand it to the connector:
+cdf = (spark.read.format("delta")
+       .option("readChangeFeed", "true")
+       .option("startingVersion", 0)          # or .table(...) as a stream for incremental
+       .table("catalog.schema.source_table"))
+
+cfg = EsConfig(hosts=..., api_key=..., index="my-index",
+               id_field="doc_id",             # REQUIRED when change_feed=True
+               change_feed=True)
+result = bulk_write(cdf, cfg)                  # -> {"written": N, "deleted": M, "errors": K}
+```
+
+How it routes each change (the connector handles all of this):
+
+- `insert` / `update_postimage` → **index** (upsert on `_id`).
+- `delete` → **delete** by `_id` (deleting an already-absent doc is treated as success —
+  idempotent).
+- `update_preimage` → dropped (it's the pre-update state; the postimage carries the new value).
+- Within each batch, **multiple changes to the same `_id` are collapsed to the single latest
+  one** (highest `_commit_version` wins), so an insert-then-delete in one batch nets to a delete,
+  a delete-then-reinsert nets to an index, and N updates apply only the newest. The connector
+  repartitions by `id_field` so all changes for a record are collapsed together.
+- The CDF metadata columns (`_change_type`, `_commit_version`, `_commit_timestamp`) are stripped
+  from the indexed document.
+
+Notes:
+
+- **`id_field` is required** with `change_feed=True` — a deterministic `_id` is what lets the
+  connector upsert, delete, and collapse per record. Constructing `EsConfig(change_feed=True)`
+  without `id_field` raises `ValueError`.
+- **Initial load:** for a brand-new index, do the backfill with a plain `bulk_write` (CDF off) —
+  it's all inserts, so there's nothing to collapse — then switch to `change_feed=True` for
+  incremental updates/deletes. This also avoids collapsing a very large first batch in memory.
+- Deletes are **always** applied in CDF mode. If you need the search index to remain immutable
+  even when source rows are purged, filter `delete` rows out of the feed before passing it in.
+
 ## Configuration (`EsConfig`)
 
 Every knob for both batch and streaming lives on the `EsConfig` dataclass
@@ -114,6 +163,14 @@ raises (pick one).
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
 | `drop_fields` | `tuple` | `()` | No | Columns the client chooses to **skip** to shrink payload (egress opt-out), e.g. `("raw_data", "unmapped")`. |
+
+**Change Data Feed (updates & deletes)**
+
+| Field | Type | Default | Required | Notes |
+|-------|------|---------|----------|-------|
+| `change_feed` | `bool` | `False` | No | Treat the input as a Delta Change Data Feed and route inserts/updates/deletes to ES (see [Usage](#usage-updates--deletes-via-change-data-feed)). Requires `id_field`. Default `False` = plain append/upsert. |
+| `change_type_field` | `str` | `"_change_type"` | No | Name of the CDF change-type column. |
+| `commit_version_field` | `str` | `"_commit_version"` | No | Name of the CDF commit-version column (used to order changes per id). |
 
 ## Datatype coverage
 

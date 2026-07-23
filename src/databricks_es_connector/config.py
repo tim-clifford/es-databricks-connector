@@ -32,6 +32,17 @@ class EsConfig:
     # --- doc shaping ---
     drop_fields: tuple = field(default_factory=tuple)  # columns to prune before indexing (egress lever)
 
+    # --- change data feed (CDC) ---
+    # When change_feed=True, the input DataFrame is expected to be a Delta Change Data Feed
+    # (read with .option("readChangeFeed","true")). The connector then routes each change to
+    # the right ES op: insert/update_postimage -> index (upsert on _id), delete -> delete;
+    # update_preimage rows are dropped. Within each batch, multiple changes to the same _id are
+    # collapsed to the single latest one (highest commit version). Default False keeps the plain
+    # append/upsert behavior unchanged.
+    change_feed: bool = False
+    change_type_field: str = "_change_type"      # CDF column naming the change kind
+    commit_version_field: str = "_commit_version"  # CDF column giving per-commit ordering
+
     def __post_init__(self):
         if not self.hosts:
             raise ValueError("EsConfig.hosts is required")
@@ -39,6 +50,10 @@ class EsConfig:
             raise ValueError("EsConfig requires either api_key or basic_auth")
         if self.verify_certs is False and self.ca_certs:
             raise ValueError("ca_certs is set but verify_certs is False — pick one")
+        if self.change_feed and not self.id_field:
+            # No deterministic _id => cannot upsert or delete a specific doc, and cannot
+            # collapse multiple changes for the same record.
+            raise ValueError("change_feed=True requires id_field (deterministic _id)")
 
     def client_kwargs(self) -> dict:
         """Kwargs for elasticsearch.Elasticsearch(...). Built on the executor."""

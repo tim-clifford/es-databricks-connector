@@ -1,6 +1,6 @@
-# Production Readiness / Known Limitations (0.1.0)
+# Production Readiness / Known Limitations (0.2.0)
 
-`databricks-es-connector` 0.1.0 proves the **mechanism**: serverless Databricks can bulk-write
+`databricks-es-connector` proves the **mechanism**: serverless Databricks can bulk-write
 to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
 deterministic IDs, and every Spark datatype is exportable. This document lists what a production
 customer deployment still needs, so the gaps are explicit rather than assumed.
@@ -40,7 +40,7 @@ before a customer relies on it.
 
 ## Open items — data durability & operations (deferred hardening)
 
-These were consciously deferred to keep 0.1.0 focused. Needed before production for SIEM/audit data:
+These were consciously deferred to keep the library focused. Needed before production for SIEM/audit data:
 
 - **Error capture / dead-letter.** `bulk_write` returns `{written, errors}` but the per-doc error
   bodies from `helpers.bulk` are counted and discarded — a failed write is currently
@@ -65,9 +65,16 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   batch (StatsD, a Delta audit table).
 - **Monitoring.** The `on_batch` hook is a seam for metrics but nothing sinks throughput / error
   rate / lag.
-- **Updates & deletes.** The connector exports appends (and, via a deterministic `_id`, upserts on
-  replay). Propagating source-side updates/deletes to ES requires reading Delta Change Data Feed
-  and emitting delete bulk actions — not built in 0.1.0.
+- **Updates & deletes (built in 0.2.0, via Change Data Feed).** With `EsConfig(change_feed=True)`
+  the connector consumes a Delta Change Data Feed and routes inserts/updates to index-upserts and
+  deletes to ES deletes, collapsing multiple changes per `_id` within a batch to the latest one.
+  Requires the source table to have CDF enabled (`delta.enableChangeDataFeed=true`) and `id_field`
+  set. Remaining caveats: (1) the collapse buffers a partition's changes in pandas — use plain
+  `bulk_write` for the initial backfill and CDF only for incremental deltas to bound memory (a
+  single very large or skew-heavy batch is the failure mode); (2) deletes are always applied in CDF
+  mode — filter `delete` rows out upstream if the index must stay immutable (e.g. SIEM/audit
+  retention); (3) at-least-once streaming means a batch can be reprocessed — deletes are idempotent
+  (delete-of-absent = success) and upserts overwrite, so replays converge.
 
 ## Open items — packaging & portability
 

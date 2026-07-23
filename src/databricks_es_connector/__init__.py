@@ -7,7 +7,7 @@ gzip request compression and deterministic document IDs.
 """
 
 from .config import EsConfig
-from .transform import to_es_source, coerce_value
+from .transform import to_es_source, coerce_value, build_action, collapse_cdf_changes
 from .bulk import bulk_write, make_partition_writer
 from .stream import make_foreach_batch
 from .spark_prep import cast_unsupported_to_string
@@ -16,10 +16,12 @@ __all__ = [
     "EsConfig",
     "to_es_source",
     "coerce_value",
+    "build_action",
+    "collapse_cdf_changes",
     "bulk_write",
     "make_partition_writer",
     "make_foreach_batch",
     "cast_unsupported_to_string",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

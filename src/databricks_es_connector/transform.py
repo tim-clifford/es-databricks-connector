@@ -129,14 +129,24 @@ def build_action(
     index: str,
     id_field: Optional[str] = None,
     drop_fields: Iterable[str] = (),
+    delete: bool = False,
 ) -> dict:
     """Build one Elasticsearch bulk action dict from a row.
 
     Deterministic _id (from id_field) gives idempotent upserts: replays/backfills
     overwrite the same doc instead of duplicating.
+
+    delete=True builds a delete action ({"_op_type": "delete", "_id": ...}) with no _source
+    — used for Change Data Feed `delete` rows. A delete requires id_field.
     """
     if not index:
         raise ValueError("index is required to build a bulk action")
+    if delete:
+        if id_field is None:
+            raise ValueError("delete action requires id_field")
+        if id_field not in row or row[id_field] is None:
+            raise KeyError(f"id_field '{id_field}' missing/None in row")
+        return {"_op_type": "delete", "_index": index, "_id": str(row[id_field])}
     source = to_es_source(row, id_field=id_field, drop_fields=drop_fields)
     action = {"_index": index, "_source": source}
     if id_field is not None:
@@ -144,3 +154,66 @@ def build_action(
             raise KeyError(f"id_field '{id_field}' missing/None in row")
         action["_id"] = str(row[id_field])
     return action
+
+
+# --- Change Data Feed (CDC) handling -----------------------------------------------------
+# CDF metadata columns emitted by Delta's readChangeFeed. They describe the change but must
+# never land in the ES _source, so they are always pruned from the indexed document.
+CDF_METADATA_FIELDS = ("_change_type", "_commit_version", "_commit_timestamp")
+
+# _change_type values that mean "this row is the new/current state of the doc" (-> index).
+_CDF_UPSERT_TYPES = ("insert", "update_postimage")
+# The value that means "remove this doc" (-> delete).
+_CDF_DELETE_TYPE = "delete"
+# update_preimage is the OLD state before an update; it carries no new information and is
+# always dropped (the matching update_postimage row carries the new state).
+_CDF_DROP_TYPES = ("update_preimage",)
+
+
+def collapse_cdf_changes(
+    rows: list,
+    *,
+    id_field: str,
+    change_type_field: str = "_change_type",
+    commit_version_field: str = "_commit_version",
+) -> list:
+    """Collapse a batch of CDF change rows to one net action per id.
+
+    Pure function (no Spark, no ES) so every corner case is unit-testable. Given a list of
+    row dicts (each carrying a _change_type and a commit version), for each id keep only the
+    LAST change by commit version (ties broken by original order), and drop update_preimage
+    rows entirely. Returns a list of `(row, is_delete)` tuples in a deterministic order (first
+    appearance of each id), where is_delete is True for a `delete` net-change.
+
+    Semantics this produces:
+      - insert then update    -> index the update_postimage        (last wins)
+      - update then delete     -> delete                            (last wins)
+      - delete then re-insert  -> index the insert                 (last wins)
+      - N updates              -> index the highest-version postimage
+    Unknown _change_type values are treated as upserts (fail-open to indexing, not dropping).
+    """
+    # winner[id] = (commit_version, seq, row, is_delete); seq preserves input order for ties.
+    winner: dict = {}
+    order: list = []  # first-appearance order of ids, for deterministic output
+    for seq, row in enumerate(rows):
+        ct = row.get(change_type_field)
+        if ct in _CDF_DROP_TYPES:
+            continue
+        rid = row.get(id_field)
+        if rid is None:
+            raise KeyError(f"id_field '{id_field}' missing/None in a CDF row")
+        rid = str(rid)
+        # commit version may be absent/None; treat as -1 so any real version wins over it.
+        cv = row.get(commit_version_field)
+        try:
+            cv = int(cv)
+        except (TypeError, ValueError):
+            cv = -1
+        is_delete = (ct == _CDF_DELETE_TYPE)
+        prev = winner.get(rid)
+        if prev is None:
+            order.append(rid)
+            winner[rid] = (cv, seq, row, is_delete)
+        elif (cv, seq) >= (prev[0], prev[1]):   # newer version, or same version later in batch
+            winner[rid] = (cv, seq, row, is_delete)
+    return [(winner[rid][2], winner[rid][3]) for rid in order]
