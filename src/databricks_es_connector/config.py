@@ -32,6 +32,13 @@ class EsConfig:
     # --- doc shaping ---
     drop_fields: tuple = field(default_factory=tuple)  # columns to prune before indexing (egress lever)
 
+    # --- deletes ---
+    # has_deletes=False (default) is the historical behavior: every row is an index/upsert.
+    # Set has_deletes=True *and* delete_flag_column to route rows whose flag is truthy to an
+    # ES delete-by-id instead of an index. Requires id_field (you cannot delete without an _id).
+    has_deletes: bool = False
+    delete_flag_column: Optional[str] = None  # boolean-ish column: truthy => delete this _id
+
     def __post_init__(self):
         if not self.hosts:
             raise ValueError("EsConfig.hosts is required")
@@ -39,6 +46,16 @@ class EsConfig:
             raise ValueError("EsConfig requires either api_key or basic_auth")
         if self.verify_certs is False and self.ca_certs:
             raise ValueError("ca_certs is set but verify_certs is False — pick one")
+        # Delete routing is all-or-nothing and needs an _id to target.
+        if self.has_deletes:
+            if not self.delete_flag_column:
+                raise ValueError("has_deletes=True requires delete_flag_column")
+            if self.id_field is None:
+                raise ValueError("has_deletes=True requires id_field (deletes target a doc _id)")
+        elif self.delete_flag_column is not None:
+            # A flag column set with deletes off would silently do nothing — reject the misconfig
+            # rather than let a caller believe deletes are happening.
+            raise ValueError("delete_flag_column is set but has_deletes is False — enable has_deletes or drop it")
 
     def client_kwargs(self) -> dict:
         """Kwargs for elasticsearch.Elasticsearch(...). Built on the executor."""

@@ -123,24 +123,67 @@ def to_es_source(
     return {k: coerce_value(v) for k, v in row.items() if k not in drop}
 
 
+def _is_delete_flagged(v: Any) -> bool:
+    """True if a delete-flag column value means 'delete this row'.
+
+    The flag arrives from Spark via mapInPandas, so it may be a Python bool, a numpy
+    bool_, 0/1, or a string. Nulls (None/NaN/NaT/pd.NA) mean 'not a delete' — a missing
+    flag must never be read as a delete. Strings are parsed leniently
+    ('true'/'t'/'1'/'yes'/'y', case-insensitive).
+    """
+    if _is_null(v):
+        return False
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "t", "1", "yes", "y")
+    # numpy bool_/int and Python bool/int both respond correctly to bool(); coerce numpy
+    # scalars to a Python value first so bool() is well-defined.
+    if type(v).__module__ == "numpy" and hasattr(v, "item"):
+        v = v.item()
+    return bool(v)
+
+
+def _require_id(row: dict, id_field: str) -> str:
+    if id_field not in row or row[id_field] is None:
+        raise KeyError(f"id_field '{id_field}' missing/None in row")
+    return str(row[id_field])
+
+
 def build_action(
     row: dict,
     *,
     index: str,
     id_field: Optional[str] = None,
     drop_fields: Iterable[str] = (),
+    has_deletes: bool = False,
+    delete_flag_column: Optional[str] = None,
 ) -> dict:
     """Build one Elasticsearch bulk action dict from a row.
 
     Deterministic _id (from id_field) gives idempotent upserts: replays/backfills
     overwrite the same doc instead of duplicating.
+
+    When has_deletes is True and the row's delete_flag_column is truthy, emit a
+    delete-by-id action ({"_op_type": "delete", "_index", "_id"} — no _source) instead
+    of an index. Deletes require id_field. The flag column itself is dropped from the
+    _source of kept (non-delete) rows so it never pollutes the indexed document.
     """
     if not index:
         raise ValueError("index is required to build a bulk action")
-    source = to_es_source(row, id_field=id_field, drop_fields=drop_fields)
+
+    if has_deletes:
+        if not delete_flag_column:
+            raise ValueError("has_deletes=True requires delete_flag_column")
+        if id_field is None:
+            raise ValueError("has_deletes=True requires id_field (deletes target a doc _id)")
+        if _is_delete_flagged(row.get(delete_flag_column)):
+            # Delete action: id-only, no body. Idempotent — deleting an absent doc is a no-op
+            # (the 404 is suppressed in the bulk layer).
+            return {"_op_type": "delete", "_index": index, "_id": _require_id(row, id_field)}
+
+    # Index path. Drop the delete flag from the body so it isn't indexed as data.
+    drop = tuple(drop_fields) + ((delete_flag_column,) if (has_deletes and delete_flag_column) else ())
+    source = to_es_source(row, id_field=id_field, drop_fields=drop)
     action = {"_index": index, "_source": source}
     if id_field is not None:
-        if id_field not in row or row[id_field] is None:
-            raise KeyError(f"id_field '{id_field}' missing/None in row")
-        action["_id"] = str(row[id_field])
+        action["_id"] = _require_id(row, id_field)
     return action

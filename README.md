@@ -11,10 +11,10 @@ Built because the `elasticsearch-spark` connector cannot run on serverless compu
 (no third-party Spark JARs), has no Spark 4 / DBR 17+ build, and offers no request
 compression. The Python client has none of those limits.
 
-> **Maturity: 0.1.0.** The mechanism is proven and every Spark datatype is exportable, but
-> production hardening items (TLS/CA trust, API-key auth worked example, FIPS/FedRAMP, error
-> dead-lettering, index templates/ILM) are not yet built. See [HANDOFF.md](HANDOFF.md) for the
-> known limitations and pre-production checklist.
+> **Maturity: 0.2.0.** The mechanism is proven and every Spark datatype is exportable; inserts,
+> upserts, and (new in 0.2.0) deletes are supported. Production hardening items (TLS/CA trust,
+> API-key auth worked example, FIPS/FedRAMP, error dead-lettering, index templates/ILM) are not yet
+> built. See [HANDOFF.md](HANDOFF.md) for the known limitations and pre-production checklist.
 
 ## Why this shape
 
@@ -45,7 +45,7 @@ cfg = EsConfig(
     drop_fields=("raw_data", "unmapped"),  # prune before indexing
     verify_certs=True,
 )
-result = bulk_write(gold_df, cfg)   # -> {"written": N, "errors": M}
+result = bulk_write(gold_df, cfg)   # -> {"written": N, "deleted": D, "errors": M}
 ```
 
 ## Usage (streaming)
@@ -75,6 +75,53 @@ Notes for serverless:
   cell-by-cell on serverless / Spark Connect is unreliable (`query.start()` can intermittently
   hang). Wrap it in a job that calls `spark.streams.awaitAnyTermination()`. See
   [HANDOFF.md](HANDOFF.md) for the details and the at-least-once / freshness caveats.
+
+## Usage (deletes)
+
+By default the connector only inserts and updates (replace-by-`_id`). To also propagate
+**deletes**, set `has_deletes=True` and name a `delete_flag_column`: rows whose flag is truthy
+are sent to ES as a delete-by-`_id`; all other rows index as usual.
+
+```python
+cfg = EsConfig(
+    hosts=..., api_key=..., index="my-index",
+    id_field="doc_id",              # required for deletes — you delete by _id
+    has_deletes=True,
+    delete_flag_column="_is_delete",  # truthy row => delete that _id from ES
+)
+result = bulk_write(prepared_df, cfg)   # -> {"written": N, "deleted": D, "errors": M}
+```
+
+The connector is schema-agnostic about *how* you decide the latest state of a row: it deletes
+exactly the rows you flag and indexes the rest. A common source is a Delta **Change Data Feed** —
+you dedup to one record per id in Spark and set the flag from `_change_type == 'delete'`. That
+ordering/dedup work stays in your pipeline, not in the connector, because it needs your business
+sequencing column (e.g. `event_ts`) and the sort should run distributed in Spark rather than in
+executor memory. A typical `foreachBatch` shape:
+
+```python
+from pyspark.sql import functions as F, Window
+
+def upsert_latest(batch_df, batch_id):
+    # keep the latest record per id: business time first, commit version as tie-breaker
+    w = Window.partitionBy("id").orderBy(
+        F.col("event_ts").desc_nulls_last(),
+        F.col("_commit_version").desc(),
+    )
+    latest = (
+        batch_df
+        .withColumn("rn", F.row_number().over(w)).where("rn = 1").drop("rn")
+        .withColumn("_is_delete", F.col("_change_type") == "delete")
+    )
+    make_foreach_batch(cfg, on_batch=on_batch)(latest, batch_id)  # cfg has has_deletes=True
+```
+
+**Ordering caveat:** dedup like the above is only authoritative *within* one micro-batch. Across
+batches, Elasticsearch applies writes in arrival/commit order, so a late-arriving row whose
+`event_ts` is older than a doc already in ES — but committed in a later batch — can overwrite the
+newer doc. If your source can deliver out-of-order events across batches, make `event_ts` globally
+authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
+`version_type=external_gte`) so ES itself rejects stale writes regardless of batch order.
 
 ## Configuration (`EsConfig`)
 
@@ -114,6 +161,26 @@ raises (pick one).
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
 | `drop_fields` | `tuple` | `()` | No | Columns the client chooses to **skip** to shrink payload (egress opt-out), e.g. `("raw_data", "unmapped")`. |
+
+**Deletes**
+
+| Field | Type | Default | Required | Notes |
+|-------|------|---------|----------|-------|
+| `has_deletes` | `bool` | `False` | No | `False` (default) = every row is an index/upsert (historical behavior, unchanged). `True` routes rows whose `delete_flag_column` is truthy to an ES delete-by-`_id`. |
+| `delete_flag_column` | `str \| None` | `None` | when `has_deletes` | Boolean-ish column; a truthy value (`True`/`1`/`"true"`/…) deletes that `_id`. Null/absent = not a delete. The column is pruned from the `_source` of kept rows so it is never indexed. |
+
+When `has_deletes=True` the constructor requires both `id_field` (you cannot delete without an
+`_id`) and `delete_flag_column`, and raises `ValueError` otherwise. Setting `delete_flag_column`
+while `has_deletes=False` also raises — a flag column that does nothing is a misconfiguration, not
+a silent no-op.
+
+Delete idempotency: deleting a doc that isn't in ES returns a 404, which the connector treats as
+an expected no-op (not an error) — so checkpoint replays, filtered rows, and re-processed deletes
+stay clean. This suppression is scoped strictly to `delete` + `404`; a 404 on an index, or any
+other status on a delete, is still counted in `errors`.
+
+See [Usage (deletes)](#usage-deletes) above for the recommended Change-Data-Feed pattern and the
+cross-batch ordering caveat.
 
 ## Datatype coverage
 
