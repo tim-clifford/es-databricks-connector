@@ -191,16 +191,16 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | Spark type | ES `_source` value | Example (input → stored) |
 |---|---|---|
 | `string`, `boolean` | unchanged | `"hi"` → `"hi"`; `true` → `true` |
-| `byte`/`short`/`int`/`long` | unchanged (JSON number) | `5` → `5` |
-| `float`/`double` | unchanged (JSON number) | `1.5` → `1.5` |
+| `byte`/`short`/`int`/`long` | unchanged (all integer widths become one JSON number; width not preserved) | `5` → `5` |
+| `float`/`double` | unchanged | `1.5` → `1.5` |
 | `decimal(p,s)` | **float** (precision lost beyond ~15–17 sig figs) | `Decimal("1.50")` → `1.5` |
 | `date` / `timestamp` | **epoch milliseconds** (integer) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
-| `struct` / `map` | nested JSON object (recursed) | `{a: 1}` → `{"a": 1}` |
-| `array` | JSON array (recursed) | `[1, 2]` → `[1, 2]` |
-| `null` (any type) | JSON `null` (field omitted from `_source`) | `None` → *(absent)* |
-| `variant` | **JSON string** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
-| `interval` | **JSON/ISO string** (see below) | an interval → its string form |
+| `struct` / `map` | nested object (recursed) | `{a: 1}` → `{"a": 1}` |
+| `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
+| `null` (any type) | omitted from `_source` entirely | `None` → *(absent)* |
+| `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
+| `interval` | **string** (see below) | an interval → its string form |
 
 ### Arrow-hostile types: `variant` and `interval` (handled automatically)
 
