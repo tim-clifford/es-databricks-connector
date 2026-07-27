@@ -17,8 +17,8 @@ Spark type that survives Arrow -> pandas conversion:
     never silently pass through and crash `helpers.bulk` (it lands as a string, not a crash).
 
 NOT handled here (cannot be): types that fail Spark's Arrow conversion BEFORE reaching this
-code — notably INTERVAL (year-month intervals raise UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION).
-Cast those to string in Spark first; see `spark_prep.cast_unsupported_to_string`.
+code — VARIANT and INTERVAL. `spark_prep.sanitize_for_arrow` serializes those to a JSON string
+in Spark before the export (called automatically by `bulk_write`), so they never reach here.
 """
 from __future__ import annotations
 

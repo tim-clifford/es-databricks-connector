@@ -10,7 +10,7 @@ from .config import EsConfig
 from .transform import to_es_source, coerce_value
 from .bulk import bulk_write, make_partition_writer
 from .stream import make_foreach_batch
-from .spark_prep import cast_unsupported_to_string
+from .spark_prep import sanitize_for_arrow
 
 __all__ = [
     "EsConfig",
@@ -19,7 +19,7 @@ __all__ = [
     "bulk_write",
     "make_partition_writer",
     "make_foreach_batch",
-    "cast_unsupported_to_string",
+    "sanitize_for_arrow",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

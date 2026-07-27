@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Iterator
 
 from .config import EsConfig
+from .spark_prep import sanitize_for_arrow
 from .transform import build_action
 
 # Per-document outcomes from classify_bulk_result. Kept as module constants so the
@@ -99,7 +100,13 @@ def bulk_write(df, cfg: EsConfig) -> dict:
     'written' counts index/upsert ops, 'deleted' counts successful delete-by-id ops
     (only non-zero when cfg.has_deletes). Batch entry point; for streaming, use
     stream.make_foreach_batch.
+
+    Arrow-hostile columns (VARIANT / INTERVAL, at any nesting depth) are serialized to JSON
+    strings automatically via sanitize_for_arrow before the mapInPandas export — mapInPandas
+    cannot carry them otherwise. Callers do not need to pre-process; any valid Spark DataFrame
+    works. Such columns land in ES as JSON strings (map them as keyword/text, not object).
     """
+    df = sanitize_for_arrow(df)
     writer = make_partition_writer(cfg)
     result = (
         df.mapInPandas(writer, "written long, deleted long, errors long")

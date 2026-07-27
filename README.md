@@ -11,8 +11,8 @@ Built because the `elasticsearch-spark` connector cannot run on serverless compu
 (no third-party Spark JARs), has no Spark 4 / DBR 17+ build, and offers no request
 compression. The Python client has none of those limits.
 
-> **Maturity: 0.2.0.** The mechanism is proven and every Spark datatype is exportable; inserts,
-> upserts, and (new in 0.2.0) deletes are supported. Production hardening items (TLS/CA trust,
+> **Maturity: 0.3.0.** The mechanism is proven and every valid Spark datatype is exportable with no
+> caller pre-processing; inserts, upserts, and deletes are supported. Production hardening items (TLS/CA trust,
 > API-key auth worked example, FIPS/FedRAMP, error dead-lettering, index templates/ILM) are not yet
 > built. See [HANDOFF.md](HANDOFF.md) for the known limitations and pre-production checklist.
 
@@ -184,26 +184,39 @@ cross-batch ordering caveat.
 
 ## Datatype coverage
 
-Every Spark column can be exported and lands as usable data:
+Every valid Spark column can be exported with **no caller pre-processing** — hand `bulk_write` any
+DataFrame. Values are transformed on the way to Elasticsearch as follows. These transforms are
+**by design**: they are the deltas to expect between the Spark row and the ES `_source`, not bugs.
 
-- **Handled automatically by `coerce_value`** (no caller action): all numerics (byte/short/int/
-  long/float/double), `decimal` → float, `boolean`, `string`, `binary` → base64 string, `date`/
-  `timestamp` → epoch-millis, `array`/`map`/`struct` (recursed), and null. Any unforeseen type
-  falls back to its string form rather than failing the write.
-- **Requires a one-line Spark-side cast first:** `INTERVAL` types cannot cross Arrow into
-  `mapInPandas` at all (Spark raises `UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION`). Call
-  `cast_unsupported_to_string(df)` before `bulk_write` / the streaming source to cast those
-  columns (top-level or nested) to string:
+| Spark type | ES `_source` value | Example (input → stored) |
+|---|---|---|
+| `string`, `boolean` | unchanged | `"hi"` → `"hi"`; `true` → `true` |
+| `byte`/`short`/`int`/`long` | unchanged (all integer widths become one JSON number; width not preserved) | `5` → `5` |
+| `float`/`double` | unchanged | `1.5` → `1.5` |
+| `decimal(p,s)` | **float** (precision lost beyond ~15–17 sig figs) | `Decimal("1.50")` → `1.5` |
+| `date` / `timestamp` | **epoch milliseconds** (integer) | `2021-01-01T00:00:00Z` → `1609459200000` |
+| `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
+| `struct` / `map` | nested object (recursed) | `{a: 1}` → `{"a": 1}` |
+| `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
+| `null` (any type) | omitted from `_source` entirely | `None` → *(absent)* |
+| `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
+| `interval` | **string** (see below) | an interval → its string form |
 
-  ```python
-  from databricks_es_connector import cast_unsupported_to_string, bulk_write
-  bulk_write(cast_unsupported_to_string(gold_df), cfg)
-  ```
+### Arrow-hostile types: `variant` and `interval` (handled automatically)
 
-Verified end-to-end (Spark → Arrow → bulk → ES) across every type above. Two fidelity notes:
-`decimal` → float loses precision beyond ~15–17 significant figures (cast the column to string
-in Spark if exactness matters); `binary` is stored base64-encoded. When adding fields, add a
-matching entry to the ES index mapping or ES will dynamic-map (and guess) the type.
+`VARIANT` and `INTERVAL` have no Apache Arrow representation, so they cannot cross into
+`mapInPandas` directly. `bulk_write` handles this for you: any column whose type **contains** one
+of these at **any nesting depth** (e.g. `variant`, `struct<...,v:variant>`,
+`array<struct<...,v:variant>>`) is serialized to a **JSON string** before export. No caller action
+is required — hand `bulk_write` the raw DataFrame.
+
+Round-trip consequence to expect: such a column lands in ES as a **JSON string**, not a queryable
+nested object — so map it as `keyword`/`text`, not `object`. Example: a `variant` holding
+`{"k": 1, "nested": [2, 3]}` is stored as the string `"{\"k\":1,\"nested\":[2,3]}"`.
+
+Verified end-to-end (Spark → Arrow → bulk → ES → read back) across every type above, including
+tables with deeply nested VARIANT. When adding fields, add a matching entry to the ES index
+mapping or ES will dynamic-map (and guess) the type.
 
 ## Developing the library
 
@@ -286,7 +299,7 @@ src/databricks_es_connector/   # the library (this is what ships in the .whl)
   transform.py                 #   pure-Python row shaping (timestamps, numpy/arrays, decimal, binary, pruning)
   bulk.py                      #   executor-side mapInPandas bulk write (batch entry point)
   stream.py                    #   foreachBatch helper for Structured Streaming
-  spark_prep.py                #   cast_unsupported_to_string: Arrow-hostile types (intervals) -> string
+  spark_prep.py                #   sanitize_for_arrow: Arrow-hostile types (VARIANT/INTERVAL) -> JSON string
 tests/                         # unit tests for the pure-Python layer (no Spark/ES needed)
 ```
 
