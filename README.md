@@ -12,8 +12,7 @@ Built because the `elasticsearch-spark` connector cannot run on serverless compu
 compression. The Python client has none of those limits.
 
 > **Maturity: 0.3.0.** The mechanism is proven and every valid Spark datatype is exportable with no
-> caller pre-processing (0.3.0 auto-serializes Arrow-hostile `VARIANT`/`INTERVAL` columns); inserts,
-> upserts, and deletes are supported. Production hardening items (TLS/CA trust,
+> caller pre-processing; inserts, upserts, and deletes are supported. Production hardening items (TLS/CA trust,
 > API-key auth worked example, FIPS/FedRAMP, error dead-lettering, index templates/ILM) are not yet
 > built. See [HANDOFF.md](HANDOFF.md) for the known limitations and pre-production checklist.
 
@@ -206,18 +205,14 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 ### Arrow-hostile types: `variant` and `interval` (handled automatically)
 
 `VARIANT` and `INTERVAL` have no Apache Arrow representation, so they cannot cross into
-`mapInPandas` — the export Spark would raise `[UNSUPPORTED_OPERATION]` / 
-`UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION`. `bulk_write` now detects any column whose type
-**contains** one of these at **any nesting depth** (e.g. `variant`, `struct<...,v:variant>`,
-`array<struct<...,v:variant>>`) and serializes that whole column to a **JSON string** before the
-export (`sanitize_for_arrow`, called internally). No caller action is required.
+`mapInPandas` directly. `bulk_write` handles this for you: any column whose type **contains** one
+of these at **any nesting depth** (e.g. `variant`, `struct<...,v:variant>`,
+`array<struct<...,v:variant>>`) is serialized to a **JSON string** before export. No caller action
+is required — hand `bulk_write` the raw DataFrame.
 
 Round-trip consequence to expect: such a column lands in ES as a **JSON string**, not a queryable
 nested object — so map it as `keyword`/`text`, not `object`. Example: a `variant` holding
 `{"k": 1, "nested": [2, 3]}` is stored as the string `"{\"k\":1,\"nested\":[2,3]}"`.
-
-> The old `cast_unsupported_to_string(df)` helper is now a deprecated alias for
-> `sanitize_for_arrow` and is no longer needed — `bulk_write` does this for you.
 
 Verified end-to-end (Spark → Arrow → bulk → ES → read back) across every type above, including
 tables with deeply nested VARIANT. When adding fields, add a matching entry to the ES index
@@ -304,7 +299,7 @@ src/databricks_es_connector/   # the library (this is what ships in the .whl)
   transform.py                 #   pure-Python row shaping (timestamps, numpy/arrays, decimal, binary, pruning)
   bulk.py                      #   executor-side mapInPandas bulk write (batch entry point)
   stream.py                    #   foreachBatch helper for Structured Streaming
-  spark_prep.py                #   cast_unsupported_to_string: Arrow-hostile types (intervals) -> string
+  spark_prep.py                #   sanitize_for_arrow: Arrow-hostile types (VARIANT/INTERVAL) -> JSON string
 tests/                         # unit tests for the pure-Python layer (no Spark/ES needed)
 ```
 

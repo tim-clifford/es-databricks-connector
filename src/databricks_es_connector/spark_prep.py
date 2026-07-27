@@ -92,13 +92,3 @@ def sanitize_for_arrow(df: "DataFrame") -> "DataFrame":
     for name in hostile:
         out = out.withColumn(name, F.to_json(F.col(name)))
     return out
-
-
-def cast_unsupported_to_string(df: "DataFrame") -> "DataFrame":
-    """Deprecated alias for `sanitize_for_arrow`, kept for backward compatibility.
-
-    `bulk_write` now sanitizes Arrow-hostile columns automatically, so calling this before
-    `bulk_write` is no longer necessary (it is harmless — sanitize is idempotent). Prefer not
-    calling it at all; it will be removed in a future release.
-    """
-    return sanitize_for_arrow(df)

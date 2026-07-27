@@ -182,8 +182,8 @@ def test_dtype_map_and_struct():      # Spark map/struct -> dict (both arrive as
     assert _json_roundtrip({"a": 1, "b": "x"}) == {"a": 1, "b": "x"}
 
 
-def test_dtype_interval_as_string():  # INTERVAL can't cross Arrow; caller casts to string
-    # After a Spark-side cast (see cast_unsupported_to_string) it arrives as a plain str.
+def test_dtype_interval_as_string():  # INTERVAL can't cross Arrow; sanitize_for_arrow serializes it
+    # sanitize_for_arrow (called by bulk_write) turns it into a JSON string before it reaches here.
     assert _json_roundtrip("INTERVAL '1 02:03:04' DAY TO SECOND") == "INTERVAL '1 02:03:04' DAY TO SECOND"
 
 
