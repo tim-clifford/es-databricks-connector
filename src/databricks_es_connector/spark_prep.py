@@ -31,16 +31,34 @@ stay importable without Spark for local unit testing.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyspark.sql import DataFrame
 
-# Substrings that, if present anywhere in a column's DESCRIBE type string, mean the column cannot
-# cross the Arrow boundary and must be JSON-serialized first. Matched case-insensitively against
-# the full (possibly nested) type text, so a nested occurrence is caught too.
-_ARROW_HOSTILE_TOKENS = ("variant", "interval")
+# Arrow-hostile type names to find inside a column's DESCRIBE type string. VARIANT/INTERVAL have no
+# Arrow representation, so a column whose type CONTAINS one (top-level or nested) must be
+# JSON-serialized before export.
+#
+# The match is in TYPE POSITION, not a bare substring. A DESCRIBE type string interleaves type
+# names with struct FIELD NAMES (`struct<field_name:field_type,...>`), so a plain `"variant" in
+# text` check false-positives on innocuous field names like `polling_interval` or `invariant_score`
+# and would silently JSON-stringify a valid struct/array column. So:
+#   - the token must be bounded by non-identifier chars (not part of a longer word like
+#     `polling_interval` / `invariant`), and
+#   - it must NOT be immediately followed by ':' — a field name is always `name:type`, so a token
+#     followed by ':' is a field name, whereas a real type is followed by '>', ',', whitespace, or
+#     end of string.
+# Types appear at start-of-string or after '<' ':' ',' (array element / struct field type / map
+# key-value), all of which are non-identifier chars, so the left boundary needs no special casing.
+_ARROW_HOSTILE_RE = re.compile(r"(?<![a-z0-9_])(?:variant|interval)(?![a-z0-9_:])")
+
+
+def _type_is_arrow_hostile(type_text: str) -> bool:
+    """True if a DESCRIBE type string contains VARIANT or INTERVAL in type position (any depth)."""
+    return bool(_ARROW_HOSTILE_RE.search((type_text or "").lower()))
 
 
 def _hostile_columns_from_describe(describe_rows) -> List[str]:
@@ -56,8 +74,7 @@ def _hostile_columns_from_describe(describe_rows) -> List[str]:
         col = r["col_name"]
         if not col or col.startswith("#"):
             break  # end of the column section
-        type_text = (r["data_type"] or "").lower()
-        if any(tok in type_text for tok in _ARROW_HOSTILE_TOKENS):
+        if _type_is_arrow_hostile(r["data_type"]):
             hostile.append(col)
     return hostile
 
