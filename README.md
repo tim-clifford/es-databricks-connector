@@ -218,10 +218,8 @@ is required; hand `bulk_write` the raw DataFrame. The string form depends on the
 Round-trip consequence to expect: such a column lands in ES as a **string**, not a queryable nested
 object — so map it as `keyword`/`text`, not `object`.
 
-Every transform above is exercised end-to-end (Spark → Arrow → bulk → ES → read back) — one column
-per Spark type, plus edge cases (non-finite floats, empty/null containers, nested VARIANT, unicode)
-— reading each value back to confirm what lands in `_source`. When adding fields, add a matching
-entry to the ES index mapping or ES will dynamic-map (and guess) the type.
+When adding fields, add a matching entry to the ES index mapping or ES will dynamic-map (and guess)
+the type.
 
 ## Developing the library
 
