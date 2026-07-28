@@ -10,9 +10,12 @@ code runs, so they cannot be fixed on the executor — they must be rewritten in
   - INTERVAL (YearMonth and DayTime). Year-month intervals raise
     `UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION`.
 
-`sanitize_for_arrow(df)` rewrites those columns to a JSON string (`to_json`) so the whole
-DataFrame can be exported. It is called automatically by `bulk_write`, so callers do NOT need to
-pre-process anything — any valid Spark DataFrame just works. Only Arrow-hostile columns are
+`sanitize_for_arrow(df)` rewrites those columns to a string so the whole DataFrame can be exported,
+picking the serialization by type: a struct/array/map/variant goes through `to_json` (a JSON
+string), while a scalar (top-level) INTERVAL is `cast(... as string)` — because Spark's `to_json`
+REJECTS a scalar interval (`[DATATYPE_MISMATCH.INVALID_JSON_SCHEMA] Input schema must be a struct,
+an array, a map or a variant`). It is called automatically by `bulk_write`, so callers do NOT need
+to pre-process anything — any valid Spark DataFrame just works. Only Arrow-hostile columns are
 touched; every other column is left exactly as-is (and handled downstream by `coerce_value`).
 
 Serverless / Spark Connect constraint (this is why the implementation looks the way it does):
@@ -24,7 +27,7 @@ the column type strings, rather than touching `df.schema`.
 
 Because DESCRIBE gives us top-level column *type strings* (not a navigable typed schema), a column
 with a hostile type nested inside a struct/array is serialized *whole* to a JSON string — we cannot
-surgically cast just the inner field. Data is preserved; the column lands in ES as a JSON string.
+surgically cast just the inner field. Data is preserved; the column lands in ES as a string.
 
 This module imports pyspark lazily (inside functions) so the pure-Python transform/config layers
 stay importable without Spark for local unit testing.
@@ -33,7 +36,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyspark.sql import DataFrame
@@ -61,9 +64,27 @@ def _type_is_arrow_hostile(type_text: str) -> bool:
     return bool(_ARROW_HOSTILE_RE.search((type_text or "").lower()))
 
 
-def _hostile_columns_from_describe(describe_rows) -> List[str]:
+def _is_scalar_interval_type(type_text: str) -> bool:
+    """True if the column's TOP-LEVEL type is itself an interval (not a struct/array/map that merely
+    contains one). Scalar interval type strings begin with `interval` (e.g. `interval day to second`,
+    `interval year to month`).
+
+    Why this matters for serialization: Spark's `to_json` REJECTS a scalar interval —
+    `to_json(<interval>)` raises `[DATATYPE_MISMATCH.INVALID_JSON_SCHEMA] Input schema must be a
+    struct, an array, a map or a variant`. So a top-level interval must be serialized with
+    `cast(... as string)` instead. A struct/array/map that *contains* an interval has a top-level
+    type of `struct<...>` / `array<...>` / `map<...>`, which `to_json` accepts, so those still go
+    through `to_json`.
+    """
+    return (type_text or "").strip().lower().startswith("interval")
+
+
+def _hostile_columns_from_describe(describe_rows) -> List[Tuple[str, str]]:
     """Pure logic: given DESCRIBE output rows (each a mapping with 'col_name'/'data_type'), return
-    the names of top-level columns whose type text contains an Arrow-hostile type.
+    (col_name, data_type) pairs for top-level columns whose type text contains an Arrow-hostile type.
+
+    Returns the type text alongside the name because the caller must decide serialization per column
+    (scalar interval -> cast string; everything else -> to_json; see sanitize_for_arrow).
 
     Split out from the Spark call so it is unit-testable without a session. DESCRIBE lists nested
     subfields and partition/metadata rows after the column list; the column rows come first and end
@@ -75,12 +96,12 @@ def _hostile_columns_from_describe(describe_rows) -> List[str]:
         if not col or col.startswith("#"):
             break  # end of the column section
         if _type_is_arrow_hostile(r["data_type"]):
-            hostile.append(col)
+            hostile.append((col, r["data_type"]))
     return hostile
 
 
-def _hostile_columns(df: "DataFrame") -> List[str]:
-    """Return the names of top-level columns whose type contains an Arrow-hostile type at any depth.
+def _hostile_columns(df: "DataFrame") -> List[Tuple[str, str]]:
+    """Return (name, type_text) for top-level columns whose type contains an Arrow-hostile type.
 
     Uses DESCRIBE over a temp view — the only schema read that survives a VARIANT column on Spark
     Connect (see module docstring).
@@ -96,16 +117,24 @@ def _hostile_columns(df: "DataFrame") -> List[str]:
 
 def sanitize_for_arrow(df: "DataFrame") -> "DataFrame":
     """Return `df` with every Arrow-incompatible column (VARIANT / INTERVAL, at any depth) rewritten
-    to a JSON string via `to_json`, so the DataFrame can be exported through `mapInPandas`.
+    to a string, so the DataFrame can be exported through `mapInPandas`.
+
+    Serialization is per-column by type:
+      - a scalar (top-level) INTERVAL -> `cast(... as string)` (Spark's `to_json` rejects intervals),
+        e.g. `INTERVAL '1 02:03:04' DAY TO SECOND`.
+      - everything else hostile (VARIANT at any depth, or a struct/array/map containing one)
+        -> `to_json`, landing as a JSON string.
 
     Called automatically by `bulk_write`; callers do not need to invoke it. Idempotent: a DataFrame
     with no hostile columns is returned unchanged. A column serialized here lands in Elasticsearch
-    as a JSON string (map it as `keyword`/`text`, not `object`).
+    as a string (map it as `keyword`/`text`, not `object`).
     """
     from pyspark.sql import functions as F
 
-    hostile = _hostile_columns(df)
     out = df
-    for name in hostile:
-        out = out.withColumn(name, F.to_json(F.col(name)))
+    for name, type_text in _hostile_columns(df):
+        if _is_scalar_interval_type(type_text):
+            out = out.withColumn(name, F.col(name).cast("string"))
+        else:
+            out = out.withColumn(name, F.to_json(F.col(name)))
     return out

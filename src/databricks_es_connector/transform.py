@@ -9,6 +9,8 @@ Spark type that survives Arrow -> pandas conversion:
     (a naive value's local-tz epoch would differ per worker).
   - pandas nulls (NaT for datetimes, NaN for numerics, pd.NA) must become JSON null:
     NaT.timestamp() raises, and NaN serializes to the token `NaN` which ES rejects.
+  - non-finite floats (inf, -inf) likewise have no JSON form (they serialize to `Infinity` /
+    `-Infinity`, which ES rejects) and become JSON null.
   - numpy scalars/arrays (from Arrow) -> Python scalars / lists.
   - Decimal -> float (numeric + queryable in ES; note: >~15-17 sig-fig precision is lost).
   - bytes/bytearray (binary) -> base64 str (reversible, ES-safe).
@@ -24,6 +26,7 @@ from __future__ import annotations
 
 import base64 as _base64
 import datetime as _dt
+import math as _math
 from decimal import Decimal as _Decimal
 from typing import Any, Iterable, Optional
 
@@ -63,6 +66,7 @@ def coerce_value(v: Any) -> Any:
     """Recursively make a value JSON/ES-serializable.
 
     - nulls (None, NaN, NaT, pd.NA) -> None
+    - non-finite floats (inf, -inf) -> None (see below)
     - bool -> unchanged (before int/Decimal checks; bool is an int subclass)
     - datetimes/dates -> epoch millis (naive treated as UTC)
     - dict/list/tuple -> recurse (preserves nested structs/arrays)
@@ -87,16 +91,23 @@ def coerce_value(v: Any) -> Any:
     # JSON-serializable and neither is caught by the list/dict branches above, so a
     # DataFrame with an array field (array<struct>) would break helpers.bulk.
     # .tolist() converts an ndarray to a (possibly nested) Python list and a numpy
-    # scalar to a plain Python scalar; recurse on containers so inner values coerce too.
+    # scalar to a plain Python scalar; recurse UNCONDITIONALLY so an unwrapped scalar
+    # (e.g. numpy inf -> Python inf) re-enters and hits the non-finite guard below.
     if type(v).__module__ == "numpy" and hasattr(v, "tolist"):
-        converted = v.tolist()
-        return coerce_value(converted) if isinstance(converted, (list, dict)) else converted
+        return coerce_value(v.tolist())
     if isinstance(v, _Decimal):
         # float => numeric + queryable in ES. Precision beyond ~15-17 sig figs is lost;
         # cast the source column to string in Spark first if exactness is required.
         return float(v)
     if isinstance(v, (bytes, bytearray)):
         return _base64.b64encode(bytes(v)).decode("ascii")
+    if isinstance(v, float) and not _math.isfinite(v):
+        # inf / -inf have no JSON representation: json.dumps emits the bare tokens
+        # `Infinity` / `-Infinity`, which Elasticsearch's strict JSON parser rejects, so the
+        # whole document fails to index and is silently lost to the error count. Coerce to
+        # None (JSON null), mirroring the NaN handling in _is_null. (NaN is already caught by
+        # _is_null above; this branch is reached only for inf/-inf.)
+        return None
     if isinstance(v, (int, float, str)):              # JSON-native scalars
         return v
     # Total fallback: an unforeseen type (e.g. a Spark-side object that slipped through
