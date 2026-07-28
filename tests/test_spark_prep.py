@@ -11,6 +11,7 @@ import pytest
 
 from databricks_es_connector.spark_prep import (
     _hostile_columns_from_describe,
+    _is_scalar_interval_type,
     _type_is_arrow_hostile,
 )
 
@@ -18,6 +19,11 @@ from databricks_es_connector.spark_prep import (
 def _rows(*pairs):
     """Build DESCRIBE-style rows from (col_name, data_type) pairs."""
     return [{"col_name": n, "data_type": t} for n, t in pairs]
+
+
+def _names(describe_rows):
+    """Just the detected column names — most tests assert on names, not the carried type text."""
+    return [name for name, _type in _hostile_columns_from_describe(describe_rows)]
 
 
 # --- _type_is_arrow_hostile: the type-string classifier ---------------------------------------
@@ -70,12 +76,12 @@ def test_type_is_hostile_handles_none():
 
 def test_detects_top_level_variant():
     rows = _rows(("id", "string"), ("raw_data", "variant"), ("n", "int"))
-    assert _hostile_columns_from_describe(rows) == ["raw_data"]
+    assert _names(rows) == ["raw_data"]
 
 
 def test_detects_top_level_interval():
     rows = _rows(("id", "string"), ("dur", "interval day to second"))
-    assert _hostile_columns_from_describe(rows) == ["dur"]
+    assert _names(rows) == ["dur"]
 
 
 def test_detects_variant_nested_in_struct():
@@ -83,7 +89,7 @@ def test_detects_variant_nested_in_struct():
         ("id", "string"),
         ("metadata", "struct<uid:string,tags:variant>"),
     )
-    assert _hostile_columns_from_describe(rows) == ["metadata"]
+    assert _names(rows) == ["metadata"]
 
 
 def test_detects_variant_nested_in_array_of_struct():
@@ -91,7 +97,7 @@ def test_detects_variant_nested_in_array_of_struct():
         ("id", "string"),
         ("enrichments", "array<struct<data:variant,name:string>>"),
     )
-    assert _hostile_columns_from_describe(rows) == ["enrichments"]
+    assert _names(rows) == ["enrichments"]
 
 
 def test_clean_schema_has_no_hostile_columns():
@@ -100,7 +106,7 @@ def test_clean_schema_has_no_hostile_columns():
         ("endpoint", "struct<ip:string,port:int>"),
         ("tags", "array<string>"),
     )
-    assert _hostile_columns_from_describe(rows) == []
+    assert _names(rows) == []
 
 
 def test_multiple_hostile_columns_all_detected():
@@ -111,7 +117,7 @@ def test_multiple_hostile_columns_all_detected():
         ("ok", "string"),
         ("dur", "interval year to month"),
     )
-    assert _hostile_columns_from_describe(rows) == ["raw_data", "metadata", "dur"]
+    assert _names(rows) == ["raw_data", "metadata", "dur"]
 
 
 def test_stops_at_partition_information_section():
@@ -125,18 +131,18 @@ def test_stops_at_partition_information_section():
         ("# col_name", "data_type"),
         ("part_variant_col", "variant"),  # after the marker — must be ignored
     )
-    assert _hostile_columns_from_describe(rows) == ["raw_data"]
+    assert _names(rows) == ["raw_data"]
 
 
 def test_case_insensitive_type_match():
     rows = _rows(("v", "VARIANT"), ("i", "INTERVAL DAY TO SECOND"))
-    assert _hostile_columns_from_describe(rows) == ["v", "i"]
+    assert _names(rows) == ["v", "i"]
 
 
 def test_null_data_type_is_safe():
     # A row with a None data_type (defensive) must not crash.
     rows = [{"col_name": "x", "data_type": None}, {"col_name": "v", "data_type": "variant"}]
-    assert _hostile_columns_from_describe(rows) == ["v"]
+    assert _names(rows) == ["v"]
 
 
 def test_innocuous_field_names_are_not_false_positives():
@@ -151,4 +157,56 @@ def test_innocuous_field_names_are_not_false_positives():
         ("raw_data", "variant"),                                             # genuinely hostile
         ("dur", "interval day to second"),                                   # genuinely hostile
     )
-    assert _hostile_columns_from_describe(rows) == ["raw_data", "dur"]
+    assert _names(rows) == ["raw_data", "dur"]
+
+
+# --- the detector carries each column's TYPE TEXT so the caller can pick a serialization ---------
+# (scalar interval -> cast string; everything else -> to_json). See sanitize_for_arrow.
+
+def test_detect_returns_name_and_type_pairs():
+    rows = _rows(
+        ("id", "string"),
+        ("raw_data", "variant"),
+        ("dur", "interval day to second"),
+    )
+    assert _hostile_columns_from_describe(rows) == [
+        ("raw_data", "variant"),
+        ("dur", "interval day to second"),
+    ]
+
+
+# --- _is_scalar_interval_type: which hostile columns need cast(string) instead of to_json ---------
+# Spark's to_json REJECTS a scalar interval, but ACCEPTS a struct/array/map that contains one. So
+# only a TOP-LEVEL interval type is a "scalar interval"; a container that merely holds an interval
+# is not (its top-level type is struct/array/map, which to_json handles).
+
+_SCALAR_INTERVAL = [
+    "interval day to second",
+    "interval year to month",
+    "INTERVAL DAY TO SECOND",     # case-insensitive
+    "  interval day to second ",  # surrounding whitespace tolerated
+]
+
+_NOT_SCALAR_INTERVAL = [
+    "variant",                                  # variant -> to_json, not cast
+    "struct<dur:interval day to second>",       # CONTAINS interval, but top-level is struct
+    "array<interval day to second>",            # top-level is array
+    "map<string,interval day to second>",       # top-level is map
+    "string", "bigint",
+    "struct<interval_count:int>",               # field name only, not an interval type at all
+]
+
+
+@pytest.mark.parametrize("type_text", _SCALAR_INTERVAL)
+def test_scalar_interval_positive(type_text):
+    assert _is_scalar_interval_type(type_text) is True
+
+
+@pytest.mark.parametrize("type_text", _NOT_SCALAR_INTERVAL)
+def test_scalar_interval_negative(type_text):
+    assert _is_scalar_interval_type(type_text) is False
+
+
+def test_scalar_interval_handles_none():
+    assert _is_scalar_interval_type(None) is False
+    assert _is_scalar_interval_type("") is False

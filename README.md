@@ -192,31 +192,34 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 |---|---|---|
 | `string`, `boolean` | unchanged | `"hi"` → `"hi"`; `true` → `true` |
 | `byte`/`short`/`int`/`long` | unchanged (all integer widths become one JSON number; width not preserved) | `5` → `5` |
-| `float`/`double` | unchanged | `1.5` → `1.5` |
+| `float`/`double` | unchanged; non-finite values (`Infinity`/`-Infinity`/`NaN`) become `null` (no JSON representation) | `1.5` → `1.5`; `Infinity` → `null` |
 | `decimal(p,s)` | **float** (precision lost beyond ~15–17 sig figs) | `Decimal("1.50")` → `1.5` |
 | `date` / `timestamp` | **epoch milliseconds** (integer) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
 | `struct` / `map` | nested object (recursed) | `{a: 1}` → `{"a": 1}` |
 | `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
-| `null` (any type) | omitted from `_source` entirely | `None` → *(absent)* |
+| `null` (any type) | present as JSON `null` (the field is kept, its value is `null`) | `None` → `null` |
 | `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
-| `interval` | **string** (see below) | an interval → its string form |
+| `interval` | **string** (see below) | `INTERVAL '1 02:03:04' DAY TO SECOND` → `"INTERVAL '1 02:03:04' DAY TO SECOND"` |
 
 ### Arrow-hostile types: `variant` and `interval` (handled automatically)
 
 `VARIANT` and `INTERVAL` have no Apache Arrow representation, so they cannot cross into
-`mapInPandas` directly. `bulk_write` handles this for you: any column whose type **contains** one
-of these at **any nesting depth** (e.g. `variant`, `struct<...,v:variant>`,
-`array<struct<...,v:variant>>`) is serialized to a **JSON string** before export. No caller action
-is required — hand `bulk_write` the raw DataFrame.
+`mapInPandas` directly. `bulk_write` handles this for you — any column whose type **contains** one
+of these at **any nesting depth** is serialized to a **string** before export, so no caller action
+is required; hand `bulk_write` the raw DataFrame. The string form depends on the type:
 
-Round-trip consequence to expect: such a column lands in ES as a **JSON string**, not a queryable
-nested object — so map it as `keyword`/`text`, not `object`. Example: a `variant` holding
-`{"k": 1, "nested": [2, 3]}` is stored as the string `"{\"k\":1,\"nested\":[2,3]}"`.
+- **`variant`** (at any depth, e.g. `variant`, `struct<...,v:variant>`, `array<struct<...,v:variant>>`)
+  → a **JSON string**. Example: a `variant` holding `{"k": 1, "nested": [2, 3]}` is stored as the
+  string `"{\"k\":1,\"nested\":[2,3]}"`.
+- **`interval`** (day-time or year-month) → its **Spark string form**. Example:
+  `INTERVAL '1 02:03:04' DAY TO SECOND` is stored as the string `"INTERVAL '1 02:03:04' DAY TO SECOND"`.
 
-Verified end-to-end (Spark → Arrow → bulk → ES → read back) across every type above, including
-tables with deeply nested VARIANT. When adding fields, add a matching entry to the ES index
-mapping or ES will dynamic-map (and guess) the type.
+Round-trip consequence to expect: such a column lands in ES as a **string**, not a queryable nested
+object — so map it as `keyword`/`text`, not `object`.
+
+When adding fields, add a matching entry to the ES index mapping or ES will dynamic-map (and guess)
+the type.
 
 ## Developing the library
 

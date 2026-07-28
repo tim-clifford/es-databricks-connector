@@ -101,10 +101,11 @@ def bulk_write(df, cfg: EsConfig) -> dict:
     (only non-zero when cfg.has_deletes). Batch entry point; for streaming, use
     stream.make_foreach_batch.
 
-    Arrow-hostile columns (VARIANT / INTERVAL, at any nesting depth) are serialized to JSON
-    strings automatically via sanitize_for_arrow before the mapInPandas export — mapInPandas
-    cannot carry them otherwise. Callers do not need to pre-process; any valid Spark DataFrame
-    works. Such columns land in ES as JSON strings (map them as keyword/text, not object).
+    Arrow-hostile columns (VARIANT / INTERVAL, at any nesting depth) are serialized to strings
+    automatically via sanitize_for_arrow before the mapInPandas export — mapInPandas cannot carry
+    them otherwise (VARIANT -> JSON string, scalar INTERVAL -> its Spark string form). Callers do
+    not need to pre-process; any valid Spark DataFrame works. Such columns land in ES as strings
+    (map them as keyword/text, not object).
     """
     df = sanitize_for_arrow(df)
     writer = make_partition_writer(cfg)

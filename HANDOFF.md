@@ -82,11 +82,12 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   path; `%pip` cannot read a widget, so this line is edited per workspace. Documented in the
   README ("Deploying to a workspace").
 - **Datatype coverage is complete, with two fidelity caveats.** Every Spark column is exportable
-  with no caller pre-processing (verified end-to-end across all types): `coerce_value` handles all
-  Arrow-crossable types (numerics, `decimal`→float, `binary`→base64, `date`/`timestamp`→epoch-millis,
-  array/map/struct, plus a str fallback for anything unforeseen); `sanitize_for_arrow` (called by
+  with no caller pre-processing: `coerce_value` handles all Arrow-crossable types (numerics,
+  `decimal`→float, `binary`→base64, `date`/`timestamp`→epoch-millis, array/map/struct, non-finite
+  floats→null, plus a str fallback for anything unforeseen); `sanitize_for_arrow` (called by
   `bulk_write`) serializes the types that can't cross Arrow at all (`variant`, `interval`, at any
-  nesting depth) to a JSON string. Field pruning
+  nesting depth) to a string — `variant`→JSON string, scalar `interval`→its Spark string form.
+  Field pruning
   (`drop_fields`) is a client opt-out to shrink payload, never a capability limit. Caveats to raise
   with a customer: (1) `decimal`→float loses precision beyond ~15-17 sig figs — cast to string in
   Spark if exact decimals matter (money/IDs); (2) added fields need matching ES mapping entries or

@@ -37,6 +37,47 @@ def test_finite_floats_preserved():
     assert coerce_value(0.0) == 0.0
 
 
+# --- non-finite floats: inf/-inf have no JSON representation. json.dumps emits the bare
+# tokens `Infinity`/`-Infinity`, which ES's strict parser rejects, so the doc fails to index
+# and is silently lost to the error count. Must coerce to None, mirroring NaN. The strict
+# json.dumps(allow_nan=False) assertions below are what fail RED without the fix (default
+# json.dumps permits Infinity and would hide the bug).
+
+def _strict_json(v):
+    """coerce, then serialize with the same strictness ES's parser enforces (no NaN/Infinity)."""
+    return json.loads(json.dumps(coerce_value(v), allow_nan=False))
+
+
+def test_positive_infinity_becomes_none():
+    assert coerce_value(float("inf")) is None
+    assert _strict_json(float("inf")) is None
+
+
+def test_negative_infinity_becomes_none():
+    assert coerce_value(float("-inf")) is None
+    assert _strict_json(float("-inf")) is None
+
+
+def test_numpy_infinity_scalar_becomes_none():
+    np = pytest.importorskip("numpy")
+    assert coerce_value(np.float64("inf")) is None
+    assert coerce_value(np.float64("-inf")) is None
+    assert coerce_value(np.float32("inf")) is None   # 32-bit FLOAT column path
+
+
+def test_nested_and_listed_infinity_coerced():
+    # inf anywhere in a struct/array must also be neutralized, or the whole doc's JSON is invalid.
+    assert coerce_value({"a": float("inf")}) == {"a": None}
+    assert coerce_value([float("inf"), float("-inf"), 1.5]) == [None, None, 1.5]
+    assert _strict_json({"nested": {"x": float("inf")}}) == {"nested": {"x": None}}
+
+
+def test_numpy_array_with_infinity_coerced():
+    np = pytest.importorskip("numpy")
+    arr = np.array([1.0, np.inf, -np.inf, 2.0])
+    assert coerce_value(arr) == [1.0, None, None, 2.0]
+
+
 # --- naive datetimes must be treated as UTC (deterministic across executor TZs) ---
 
 def test_naive_datetime_treated_as_utc():
