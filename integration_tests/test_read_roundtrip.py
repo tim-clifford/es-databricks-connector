@@ -17,14 +17,17 @@ import json, base64, datetime, requests, urllib3
 urllib3.disable_warnings()
 from decimal import Decimal
 from dbx_test import NotebookTestFixture, run_notebook_tests
-from databricks_es_connector import EsWriteConfig, EsReadConfig, bulk_write, read_index
+from databricks_es_connector import (
+    EsWriteConfig, EsReadConfig, bulk_write, read_index, read_index_collect,
+)
 from pyspark.sql.types import (
     StructType, StructField, StringType, BooleanType, LongType, IntegerType, DoubleType,
     DecimalType, DateType, TimestampType, BinaryType, ArrayType,
 )
 
 SCOPE = "es_poc"
-INDEX = "connector-integration-read-roundtrip"   # throwaway; recreated + dropped by the fixture
+INDEX = "connector-integration-read-roundtrip"       # throwaway; recreated + dropped by the fixture
+MULTI_INDEX = "connector-integration-read-multishard"  # 3-shard, to exercise sliced-scroll fan-out
 ES_HOSTS = dbutils.secrets.get(SCOPE, "hosts")
 ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "password"))
 
@@ -91,14 +94,40 @@ class TestReadRoundtrip(NotebookTestFixture):
         self.write_result = bulk_write(self.src, self.write_cfg)
         requests.post(f"{ES_HOSTS}/{INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
 
-        # Read back with the SAME schema via the driver-side reader.
+        # Read back with the SAME schema via BOTH entry points:
+        #   read_index         — distributed (mapInPandas fan-out); the primary at-scale path.
+        #   read_index_collect — driver-side; the bounded-read path.
+        # Both must return identical rows (they share the coercion oracle); we assert the
+        # distributed result against the source and cross-check the two agree.
         self.out = read_index(spark, self.read_cfg, SCHEMA)
-        # Collect both sides into {doc_id: Row.asDict()} for order-independent comparison.
+        self.out_collect = read_index_collect(spark, self.read_cfg, SCHEMA)
         self.src_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.src.collect()}
         self.out_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.out.collect()}
+        self.collect_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.out_collect.collect()}
+
+        # --- multi-shard index: exercise REAL sliced-scroll fan-out (>1 slice) ---
+        # A 3-shard index so read_index defaults to 3 slices and each task reads a disjoint slice.
+        requests.delete(f"{ES_HOSTS}/{MULTI_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
+        requests.put(f"{ES_HOSTS}/{MULTI_INDEX}", auth=ES_AUTH, verify=False, timeout=30,
+                     headers={"Content-Type": "application/json"},
+                     data=json.dumps({"settings": {"index": {"number_of_shards": 3,
+                                                             "number_of_replicas": 0}},
+                                      "mappings": {"properties": {"doc_id": {"type": "keyword"}}}}))
+        many = spark.range(0, 50).selectExpr("concat('m', id) AS doc_id", "CAST(id AS INT) AS n")
+        multi_write = EsWriteConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
+                                    index=MULTI_INDEX, id_field="doc_id", http_compress=True)
+        self.multi_write_result = bulk_write(many, multi_write)
+        requests.post(f"{ES_HOSTS}/{MULTI_INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
+        multi_read = EsReadConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
+                                  index=MULTI_INDEX, id_field="doc_id", pit_keep_alive="5m")
+        multi_schema = StructType([StructField("doc_id", StringType()),
+                                   StructField("n", IntegerType())])
+        multi_out = read_index(spark, multi_read, multi_schema)
+        self.multi_ids = {r["doc_id"] for r in multi_out.collect()}
 
     def run_cleanup(self):
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
+        requests.delete(f"{ES_HOSTS}/{MULTI_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
 
     # --- the write landed, the read returned the same rows/schema ---
     def test_write_clean(self):
@@ -140,6 +169,19 @@ class TestReadRoundtrip(NotebookTestFixture):
         # 1.50 and 99.99 both fit in decimal(10,2); read back as Decimal, equal to source.
         assert self.out_rows["r1"]["s_decimal"] == self.src_rows["r1"]["s_decimal"]
         assert self.out_rows["r2"]["s_decimal"] == self.src_rows["r2"]["s_decimal"]
+
+    # --- the two entry points agree (they share the coercion oracle) ---
+    def test_distributed_and_collect_readers_agree(self):
+        assert self.collect_rows == self.out_rows, \
+            "read_index (distributed) and read_index_collect (driver) returned different rows"
+
+    # --- multi-shard: sliced-scroll fan-out reads every doc exactly once, no gaps/dupes ---
+    def test_multishard_slices_cover_all_docs(self):
+        # 50 docs across 3 shards => 3 slices; the union must be exactly the 50 ids, no loss or
+        # duplication across slices (the core correctness property of a sliced read).
+        assert self.multi_write_result["written"] == 50, self.multi_write_result
+        expected = {f"m{i}" for i in range(50)}
+        assert self.multi_ids == expected, (len(self.multi_ids), len(expected))
 
 
 # COMMAND ----------

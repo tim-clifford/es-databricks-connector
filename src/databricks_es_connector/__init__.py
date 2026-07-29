@@ -11,7 +11,7 @@ from .transform import to_es_source, coerce_value
 from .bulk import bulk_write, make_partition_writer
 from .stream import make_foreach_batch
 from .spark_prep import sanitize_for_arrow
-from .read import read_index
+from .read import read_index, read_index_collect
 from .read_transform import read_coerce
 
 __all__ = [
@@ -26,6 +26,7 @@ __all__ = [
     "make_foreach_batch",
     "sanitize_for_arrow",
     "read_index",
+    "read_index_collect",
     "read_coerce",
 ]
 
