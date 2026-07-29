@@ -343,10 +343,19 @@ src/databricks_es_connector/   # the library (this is what ships in the .whl)
   stream.py                    #   foreachBatch helper for Structured Streaming
   spark_prep.py                #   sanitize_for_arrow: Arrow-hostile types (VARIANT/INTERVAL) -> JSON string
 tests/                         # unit tests for the pure-Python layer (no Spark/ES needed)
+integration_tests/             # live-Spark/ES tests run on Databricks serverless via dbx_test
+  test_datatype_coverage.py    #   every Spark datatype + edge cases, round-tripped through ES
+  test_bulk_write_roundtrip.py #   the bulk_write result contract (counts, total_input, error_samples)
+  test_sanitize_for_arrow.py   #   the Spark-side VARIANT/INTERVAL serialization, no ES
+  config/test_config.yml       #   dbx_test config (profile, wheel, serverless env)
 ```
 
-The built wheel contains only `databricks_es_connector`; `tests/` stays in the repo for
-development but is never part of the customer artifact.
+Two test tiers: `tests/` is the fast, infra-free gate (pure-Python, run with `pytest`);
+`integration_tests/` runs on a live serverless workspace + Elasticsearch to cover the Spark-side
+code the unit tests can't reach — see [`integration_tests/README.md`](integration_tests/README.md).
+
+The built wheel contains only `databricks_es_connector`; neither `tests/` nor `integration_tests/`
+is part of the customer artifact.
 
 ## License & Attribution
 
