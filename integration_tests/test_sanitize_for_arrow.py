@@ -45,12 +45,17 @@ class TestSanitizeForArrow(NotebookTestFixture):
         # The constraint that forces sanitize_for_arrow to use DESCRIBE instead of df.schema:
         # touching .schema on a VARIANT-bearing DataFrame raises under Spark Connect. If this ever
         # STOPS throwing, the connector's DESCRIBE workaround could be simplified — so we assert it.
-        raised = False
+        err = None
         try:
             _ = self.df.schema  # VARIANT column present -> UNSUPPORTED_OPERATION on Connect
-        except Exception:
-            raised = True
-        assert raised, "df.schema unexpectedly succeeded on a VARIANT column — revisit spark_prep"
+        except Exception as e:
+            err = e
+        assert err is not None, "df.schema unexpectedly succeeded on a VARIANT column — revisit spark_prep"
+        # Assert it's specifically the unsupported-type error, not just any failure — a DIFFERENT
+        # error would mean something else broke and this test should not quietly pass. Match on the
+        # stable error-class token rather than a version-specific exception type.
+        assert "UNSUPPORTED_OPERATION" in str(err), \
+            f"df.schema raised, but not the expected UNSUPPORTED_OPERATION: {type(err).__name__}: {err}"
 
     def test_sanitized_df_is_arrow_collectable(self):
         # The whole point: after sanitize, every column is Arrow-safe and the df collects.
