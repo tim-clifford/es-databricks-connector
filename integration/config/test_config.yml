@@ -1,0 +1,38 @@
+# dbx_test config for the connector's integration tier.
+#
+# These tests run on LIVE Databricks serverless compute (real Spark + Arrow + ES), unlike the
+# pure-Python `tests/` suite. They exist to cover what the unit tests structurally cannot:
+#   - the Spark-side sanitize_for_arrow path (VARIANT/INTERVAL serialization, df.schema-on-Connect)
+#   - the real mapInPandas bulk_write round-trip (Arrow conversion of every dtype, result schema)
+# See integration/README.md. Run with:
+#   dbx_test run --tests-dir <workspace path> --profile <profile> --config integration/config/test_config.yml
+#
+# Profile/paths are overridden per-invocation on the CLI; the values here are the FEVM defaults
+# used to validate the tier.
+
+workspace:
+  profile: "fe-vm-tim-clifford-classic-dsl-lite"
+
+cluster:
+  # Serverless (no cluster_id / size). dbx_test builds an inline environment from these libraries.
+  # Both the test framework and the connector-under-test are installed into the run.
+  libraries:
+    - whl: "/Volumes/tim_clifford_classic_dsl_lite_catalog/es_poc/artifacts/databricks_es_connector-0.3.1-py3-none-any.whl"
+    - pypi:
+        package: "git+https://github.com/jsparhamii/dbx_test.git"
+    # dbx_test imports pytest at import time (pytest_compat), and serverless has no pytest
+    # by default — install it into the inline environment.
+    - pypi:
+        package: "pytest>=7"
+
+execution:
+  timeout: 900
+  parallel: false
+
+reporting:
+  output_dir: ".dbx-test-results"
+  formats:
+    - "console"
+    - "junit"
+    - "json"
+  verbose: true
