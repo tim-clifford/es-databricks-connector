@@ -365,6 +365,8 @@ tests/                         # unit tests for the pure-Python layer (no Spark/
 integration_tests/             # live-Spark/ES tests run on Databricks serverless via dbx_test
   test_datatype_coverage.py    #   every Spark datatype + edge cases, round-tripped through ES
   test_bulk_write_roundtrip.py #   the bulk_write result contract (counts, total_input, error_samples)
+  test_deletes_roundtrip.py    #   has_deletes routing live: delete-by-id, delete-404 no-op
+  test_streaming_sink.py       #   make_foreach_batch on real Structured Streaming + restart idempotency
   test_sanitize_for_arrow.py   #   the Spark-side VARIANT/INTERVAL serialization, no ES
   config/test_config.yml       #   dbx_test config (profile, wheel, serverless env)
 ```
