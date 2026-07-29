@@ -143,16 +143,21 @@ back-pressure/paging. This is the bulk of the engineering.
 
 ---
 
-## 6. Open questions for design review
+## 6. Design decisions (resolved)
 
-1. **Config surface:** separate `EsReadConfig`, or extend `EsConfig` with read fields? Leaning
-   separate (keeps the frozen write config untouched; read-only knobs don't pollute write validation).
-2. **`_id` handling:** always expose `_id` as a column, only when the schema names it, or via a config
-   flag? Symmetry argues for "when the schema declares the id_field."
-3. **Query pushdown depth in v1:** accept a raw ES query DSL dict only, or also translate simple Spark
-   filters? v1 = raw DSL only (simplest, explicit); Spark predicate pushdown is a later concern.
-4. **Round-trip lossy cases:** confirm the accepted deltas are exactly those in the README datatype
-   table (decimal precision, sub-ms timestamp, float32 widening) — nothing new introduced by reads.
+1. **Config surface — split into `EsReadConfig` + `EsWriteConfig`.** The current `EsConfig` (which is
+   really the write/connection config) will be renamed to `EsWriteConfig`, with `EsReadConfig` its
+   read-side sibling; connection fields (hosts/auth/tls) are shared. This is a **breaking rename** and
+   is done as a **separate refactor before the 0.4.0 release**, not folded into the read spike — the
+   integration test below uses the current `EsConfig` (write) + `EsReadConfig` (read). Tracked as a
+   follow-up so the write API churn is reviewed on its own.
+2. **`_id` handling — match the schema.** Expose `_id` as a column only when the declared schema names
+   the `id_field`; otherwise it isn't surfaced. (Current `read.py` behavior: reads the id column from
+   `_source`, falling back to the hit's `_id` only if `_source` omitted it.)
+3. **Query pushdown — raw ES query DSL only** in v1. No Spark-predicate translation; that's a later
+   concern.
+4. **Round-trip lossy cases — confirmed:** the accepted deltas are exactly the README datatype-table
+   ones (decimal precision, sub-ms timestamp, float32 widening). Reads introduce no new lossiness.
 
 ---
 

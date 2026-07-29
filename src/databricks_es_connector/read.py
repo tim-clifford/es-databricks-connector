@@ -79,17 +79,18 @@ def _scroll_hits(es, index: str, query: dict, batch_size: int, keep_alive: str):
     try:
         search_after = None
         while True:
-            body = {
-                "size": batch_size,
-                "query": query,
-                "pit": {"id": pit_id, "keep_alive": keep_alive},
-                # A deterministic tiebreak sort is required for search_after; _shard_doc is the
-                # cheapest total order and is only valid with a PIT.
-                "sort": [{"_shard_doc": "asc"}],
-            }
+            # Native 8.x keyword form (not the deprecated body=). With a PIT the index is scoped by
+            # the pit itself, so no `index=` here. `_shard_doc` is the cheapest deterministic total
+            # order for search_after and is only valid alongside a PIT.
+            kwargs = dict(
+                size=batch_size,
+                query=query,
+                pit={"id": pit_id, "keep_alive": keep_alive},
+                sort=[{"_shard_doc": "asc"}],
+            )
             if search_after is not None:
-                body["search_after"] = search_after
-            resp = es.search(body=body)
+                kwargs["search_after"] = search_after
+            resp = es.search(**kwargs)
             hits = resp["hits"]["hits"]
             if not hits:
                 break
@@ -99,7 +100,7 @@ def _scroll_hits(es, index: str, query: dict, batch_size: int, keep_alive: str):
             pit_id = resp.get("pit_id", pit_id)   # PIT id can be refreshed across pages
     finally:
         try:
-            es.close_point_in_time(body={"id": pit_id})
+            es.close_point_in_time(id=pit_id)
         except Exception:
             pass
 
