@@ -16,7 +16,8 @@ from dbx_test import NotebookTestFixture, run_notebook_tests
 from databricks_es_connector import EsConfig, bulk_write
 
 SCOPE = "es_poc"
-INDEX = "connector-integration-roundtrip"   # throwaway; recreated + dropped by the fixture
+INDEX = "connector-integration-roundtrip"       # throwaway; recreated + dropped by the fixture
+DUP_INDEX = INDEX + "-dup"                       # separate throwaway for the duplicate-id case
 ES_HOSTS = dbutils.secrets.get(SCOPE, "hosts")
 ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "password"))
 
@@ -67,8 +68,6 @@ class TestBulkWriteResultContract(NotebookTestFixture):
         # and the reconciliation identity holds, yet ES ends up with FEWER docs than rows fed in.
         # A client exporting a table with non-unique id_field values sees a lower doc count with no
         # error signal — this pins that documented behavior. Fresh index so the count is unambiguous.
-        DUP_INDEX = INDEX + "-dup"
-        self.dup_index = DUP_INDEX
         requests.delete(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
         dup_cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
                            index=DUP_INDEX, id_field="doc_id", http_compress=True)
@@ -83,8 +82,10 @@ class TestBulkWriteResultContract(NotebookTestFixture):
             f"{ES_HOSTS}/{DUP_INDEX}/_count", auth=ES_AUTH, verify=False, timeout=30).json()["count"]
 
     def run_cleanup(self):
+        # Reference the module constants (not setup-time instance state) so cleanup runs correctly
+        # even if run_setup raised before finishing — no masking AttributeError on self.dup_index.
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
-        requests.delete(f"{ES_HOSTS}/{self.dup_index}", auth=ES_AUTH, verify=False, timeout=30)
+        requests.delete(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
 
     # --- clean write ---
     def test_clean_write_counts(self):

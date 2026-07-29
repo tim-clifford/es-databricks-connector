@@ -75,6 +75,10 @@ Notes for serverless:
   cell-by-cell on serverless / Spark Connect is unreliable (`query.start()` can intermittently
   hang). Wrap it in a job that calls `spark.streams.awaitAnyTermination()`. See
   [HANDOFF.md](HANDOFF.md) for the details and the at-least-once / freshness caveats.
+- **`on_batch` result shape.** The dict passed to your `on_batch` callback always carries the same
+  keys `bulk_write` returns (`written`/`deleted`/`errors`/`total_input`/`error_samples`). An
+  **empty** micro-batch (no rows) skips the write and additionally sets `empty: True`; that flag is
+  present only on skipped batches, so read it with `result.get("empty")`, not `result["empty"]`.
 
 ## Usage (deletes)
 
