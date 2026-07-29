@@ -11,6 +11,7 @@ so nothing non-serializable is captured on the driver.
 """
 from __future__ import annotations
 
+import json
 from typing import Iterator
 
 from .config import EsConfig
@@ -23,6 +24,31 @@ WRITTEN = "written"
 DELETED = "deleted"
 IGNORED = "ignored"   # a delete-404: expected no-op, counted as neither write nor error
 ERROR = "error"
+
+# Cap on how many failed-doc diagnostics we retain, per partition AND after merging on the driver.
+# The error COUNT is always exact; only the retained sample list is bounded, so a pathological
+# all-failures batch can't blow up executor or driver memory. A handful is enough to diagnose the
+# cause (mapping conflict, term-limit, etc.); it is a breadcrumb, not a dead-letter queue.
+ERROR_SAMPLE_CAP = 20
+
+
+def _extract_error_sample(op_type: str, item: dict) -> dict:
+    """Pull a compact, JSON-safe diagnostic from one failed streaming_bulk result item.
+
+    Keeps only what identifies and explains the failure: the doc _id, the op, the HTTP status,
+    and ES's error reason (truncated). Deliberately small so a batch of failures stays bounded.
+    """
+    err = item.get("error")
+    if isinstance(err, dict):
+        reason = err.get("reason") or err.get("type") or ""
+    else:
+        reason = "" if err is None else str(err)
+    return {
+        "_id": item.get("_id"),
+        "op_type": op_type,
+        "status": item.get("status"),
+        "reason": str(reason)[:300],
+    }
 
 
 def classify_bulk_result(ok: bool, op_type: str, status: int) -> str:
@@ -57,7 +83,11 @@ def make_partition_writer(cfg: EsConfig):
         written = 0
         deleted = 0
         errors = 0
+        total_input = 0            # rows fed in, so the caller can reconcile against the outcomes
+        error_samples = []         # bounded diagnostics for failed docs (see ERROR_SAMPLE_CAP)
         for pdf in iterator:
+            rows = pdf.to_dict("records")
+            total_input += len(rows)
             actions = [
                 build_action(
                     row,
@@ -67,7 +97,7 @@ def make_partition_writer(cfg: EsConfig):
                     has_deletes=cfg.has_deletes,
                     delete_flag_column=cfg.delete_flag_column,
                 )
-                for row in pdf.to_dict("records")
+                for row in rows
             ]
             if not actions:
                 continue
@@ -88,18 +118,57 @@ def make_partition_writer(cfg: EsConfig):
                     deleted += 1
                 elif outcome == ERROR:
                     errors += 1
+                    if len(error_samples) < ERROR_SAMPLE_CAP:
+                        error_samples.append(_extract_error_sample(op_type, item))
                 # IGNORED (delete-404) counts as nothing — an expected no-op.
-        yield pd.DataFrame({"written": [written], "deleted": [deleted], "errors": [errors]})
+        # error_samples is JSON-encoded into a single string column: mapInPandas needs a flat,
+        # typed schema and can't carry a nested list<struct> of varying content cleanly.
+        yield pd.DataFrame({
+            "written": [written], "deleted": [deleted], "errors": [errors],
+            "total_input": [total_input], "error_samples": [json.dumps(error_samples)],
+        })
 
     return _write
 
 
-def bulk_write(df, cfg: EsConfig) -> dict:
-    """Write a Spark DataFrame to Elasticsearch. Returns {'written', 'deleted', 'errors'}.
+def _merge_partition_results(rows) -> dict:
+    """Combine the per-partition summary rows into the final result dict.
 
-    'written' counts index/upsert ops, 'deleted' counts successful delete-by-id ops
-    (only non-zero when cfg.has_deletes). Batch entry point; for streaming, use
-    stream.make_foreach_batch.
+    Pure (no Spark) so it is unit-testable. Each row carries written/deleted/errors/total_input and
+    a JSON string of that partition's bounded error samples. Counts are summed exactly; the sample
+    lists are concatenated and re-capped at ERROR_SAMPLE_CAP so the driver result stays bounded even
+    across many partitions. `errors == 0 and total_input != written + deleted + <ignored>` is the
+    caller's signal that some rows were lost at chunk level (see raise_on_exception in the writer).
+    """
+    written = deleted = errors = total_input = 0
+    samples = []
+    for r in rows:
+        written += int(r["written"] or 0)
+        deleted += int(r["deleted"] or 0)
+        errors += int(r["errors"] or 0)
+        total_input += int(r["total_input"] or 0)
+        if len(samples) < ERROR_SAMPLE_CAP and r["error_samples"]:
+            samples.extend(json.loads(r["error_samples"]))
+    return {
+        "written": written, "deleted": deleted, "errors": errors,
+        "total_input": total_input, "error_samples": samples[:ERROR_SAMPLE_CAP],
+    }
+
+
+def bulk_write(df, cfg: EsConfig) -> dict:
+    """Write a Spark DataFrame to Elasticsearch.
+
+    Returns {'written', 'deleted', 'errors', 'total_input', 'error_samples'}:
+      - 'written'  — index/upsert ops that succeeded.
+      - 'deleted'  — successful delete-by-id ops (only non-zero when cfg.has_deletes).
+      - 'errors'   — docs ES rejected (exact count).
+      - 'total_input' — rows handed to the writer. Reconcile: written+deleted+errors < total_input
+        means some rows were lost below the per-doc level (e.g. a chunk-level exception); equality
+        (accounting for delete-404 no-ops, which count as none) means every row was accounted for.
+      - 'error_samples' — up to ERROR_SAMPLE_CAP diagnostics ({_id, op_type, status, reason}) for
+        rejected docs, so a failure is actionable rather than an opaque count. Bounded, not a full
+        dead-letter log.
+    Batch entry point; for streaming, use stream.make_foreach_batch.
 
     Arrow-hostile columns (VARIANT / INTERVAL, at any nesting depth) are serialized to strings
     automatically via sanitize_for_arrow before the mapInPandas export — mapInPandas cannot carry
@@ -109,17 +178,8 @@ def bulk_write(df, cfg: EsConfig) -> dict:
     """
     df = sanitize_for_arrow(df)
     writer = make_partition_writer(cfg)
-    result = (
-        df.mapInPandas(writer, "written long, deleted long, errors long")
-        .groupBy()
-        .sum("written", "deleted", "errors")
-        .collect()
-    )
-    if not result:
-        return {"written": 0, "deleted": 0, "errors": 0}
-    row = result[0]
-    return {
-        "written": int(row["sum(written)"] or 0),
-        "deleted": int(row["sum(deleted)"] or 0),
-        "errors": int(row["sum(errors)"] or 0),
-    }
+    rows = df.mapInPandas(
+        writer,
+        "written long, deleted long, errors long, total_input long, error_samples string",
+    ).collect()
+    return _merge_partition_results(rows)

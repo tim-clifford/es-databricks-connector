@@ -45,7 +45,7 @@ cfg = EsConfig(
     drop_fields=("raw_data", "unmapped"),  # prune before indexing
     verify_certs=True,
 )
-result = bulk_write(gold_df, cfg)   # -> {"written": N, "deleted": D, "errors": M}
+result = bulk_write(gold_df, cfg)   # -> {"written": N, "deleted": D, "errors": M, "total_input": T, "error_samples": [...]}
 ```
 
 ## Usage (streaming)
@@ -89,7 +89,7 @@ cfg = EsConfig(
     has_deletes=True,
     delete_flag_column="_is_delete",  # truthy row => delete that _id from ES
 )
-result = bulk_write(prepared_df, cfg)   # -> {"written": N, "deleted": D, "errors": M}
+result = bulk_write(prepared_df, cfg)   # -> {"written": N, "deleted": D, "errors": M, "total_input": T, "error_samples": [...]}
 ```
 
 The connector is schema-agnostic about *how* you decide the latest state of a row: it deletes
@@ -182,6 +182,33 @@ other status on a delete, is still counted in `errors`.
 See [Usage (deletes)](#usage-deletes) above for the recommended Change-Data-Feed pattern and the
 cross-batch ordering caveat.
 
+## The write result (`bulk_write` return value)
+
+`bulk_write` returns a dict summarizing the write:
+
+```python
+{
+  "written": 998,          # index/upsert ops that succeeded
+  "deleted": 0,            # successful delete-by-id ops (non-zero only with has_deletes)
+  "errors": 2,             # docs Elasticsearch rejected (exact count)
+  "total_input": 1000,     # rows handed to the writer
+  "error_samples": [       # bounded diagnostics for rejected docs (up to 20)
+    {"_id": "abc", "op_type": "index", "status": 400,
+     "reason": "failed to parse field [ts] of type [date]"},
+  ],
+}
+```
+
+- **Reconcile with `total_input`.** `written + deleted + errors` should equal `total_input` minus
+  any delete-404 no-ops. If it is **less**, some rows were lost below the per-document level (for
+  example a chunk-level serialization/transport error), which the per-doc `errors` count cannot
+  see — so check this equality if exactness matters.
+- **`error_samples` is a breadcrumb, not a dead-letter queue.** It retains up to the first 20
+  failures (id, op, HTTP status, ES reason) so a failed write is diagnosable instead of an opaque
+  count. The `errors` count is always exact; only the retained sample list is capped, so a batch
+  that fails wholesale can't exhaust memory. If you need every failed row durably, capture them
+  from your own pipeline — the connector does not persist them.
+
 ## Datatype coverage
 
 Every valid Spark column can be exported with **no caller pre-processing** — hand `bulk_write` any
@@ -192,15 +219,27 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 |---|---|---|
 | `string`, `boolean` | unchanged | `"hi"` → `"hi"`; `true` → `true` |
 | `byte`/`short`/`int`/`long` | unchanged (all integer widths become one JSON number; width not preserved) | `5` → `5` |
-| `float`/`double` | unchanged; non-finite values (`Infinity`/`-Infinity`/`NaN`) become `null` (no JSON representation) | `1.5` → `1.5`; `Infinity` → `null` |
+| `double` | unchanged; non-finite values (`Infinity`/`-Infinity`/`NaN`) become `null` (no JSON representation) | `1.5` → `1.5`; `Infinity` → `null` |
+| `float` (32-bit) | its **exact 32-bit value widened to double** — the stored number shows the float32 rounding, not the literal you typed (see note) | `0.1` (float) → `0.10000000149011612` |
 | `decimal(p,s)` | **float** (precision lost beyond ~15–17 sig figs) | `Decimal("1.50")` → `1.5` |
-| `date` / `timestamp` | **epoch milliseconds** (integer) | `2021-01-01T00:00:00Z` → `1609459200000` |
+| `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
-| `struct` / `map` | nested object (recursed) | `{a: 1}` → `{"a": 1}` |
+| `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
 | `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
 | `null` (any type) | present as JSON `null` (the field is kept, its value is `null`) | `None` → `null` |
 | `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
 | `interval` | **string** (see below) | `INTERVAL '1 02:03:04' DAY TO SECOND` → `"INTERVAL '1 02:03:04' DAY TO SECOND"` |
+
+**Why `float` looks "changed":** a Spark `FLOAT` is 32-bit and can't represent `0.1` exactly — it
+holds the nearest float32, whose true value is `0.10000000149011612`. The connector stores that
+exact value (widened to a 64-bit double) rather than reformatting it back to `0.1`, so the stored
+number is faithful to what Spark actually held, not to the source literal. Use `DOUBLE` if you need
+`0.1` to store as `0.1`.
+
+**Timestamp precision:** epoch-millis is floored to the containing millisecond, consistently for
+pre- and post-epoch instants (matches Spark/Java `unix_millis`). Elasticsearch `date` is
+millisecond-resolution by default; sub-millisecond (microsecond) precision from a Spark `timestamp`
+is not preserved. Map the field as `date_nanos` and send nanos yourself if you need finer than ms.
 
 ### Arrow-hostile types: `variant` and `interval` (handled automatically)
 

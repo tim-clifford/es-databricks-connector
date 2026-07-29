@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.2.0)
+# Production Readiness / Known Limitations (0.3.1)
 
 `databricks-es-connector` 0.1.0 proves the **mechanism**: serverless Databricks can bulk-write
 to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -42,10 +42,13 @@ before a customer relies on it.
 
 These were consciously deferred to keep 0.1.0 focused. Needed before production for SIEM/audit data:
 
-- **Error capture / dead-letter.** `bulk_write` returns `{written, deleted, errors}` but the per-doc
-  error bodies from `streaming_bulk` are counted and discarded — a failed write is currently
-  undiagnosable, and errored events are silently dropped. Add error-reason logging (at minimum) and
-  a dead-letter path (for SIEM, silent event loss is a correctness/audit problem).
+- **Error capture / dead-letter.** *Partially addressed in 0.3.1.* `bulk_write` now returns
+  `{written, deleted, errors, total_input, error_samples}`: `error_samples` is a **bounded** sample
+  (≤20) of per-doc failure diagnostics (`_id`, op, status, ES reason), and `total_input` lets a
+  caller reconcile `written+deleted+errors` against rows-in to detect below-per-doc loss. This makes
+  a failed write diagnosable and detectable. **Still deferred:** a durable **dead-letter path** that
+  captures *every* failed row (not just a sample) — for SIEM/audit, silent loss of the un-sampled
+  failures beyond the cap is still a correctness gap. Route failures to a Delta table / DLQ.
 - **Backpressure / concurrency cap.** `mapInPandas` opens one ES client per Spark partition; a
   large Databricks cluster can overrun a modest ES cluster (429s). No coordinated throttle exists.
 - **Index templates + ILM / data streams.** The connector writes to a single target index.
@@ -88,10 +91,14 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   `bulk_write`) serializes the types that can't cross Arrow at all (`variant`, `interval`, at any
   nesting depth) to a string — `variant`→JSON string, scalar `interval`→its Spark string form.
   Field pruning
-  (`drop_fields`) is a client opt-out to shrink payload, never a capability limit. Caveats to raise
-  with a customer: (1) `decimal`→float loses precision beyond ~15-17 sig figs — cast to string in
-  Spark if exact decimals matter (money/IDs); (2) added fields need matching ES mapping entries or
-  ES dynamic-maps and guesses the type.
+  (`drop_fields`) is a client opt-out to shrink payload, never a capability limit. Non-string
+  `map` keys are rendered to strings via the same value transform (0.3.1); Spark maps are
+  homogeneously typed so keys stay distinct. Caveats to raise with a customer: (1) `decimal`→float
+  loses precision beyond ~15-17 sig figs — cast to string in Spark if exact decimals matter
+  (money/IDs); (2) added fields need matching ES mapping entries or ES dynamic-maps and guesses the
+  type; (3) a Spark `FLOAT` (32-bit) stores its exact widened value (`0.1`→`0.10000000149011612`),
+  not the source literal — use `DOUBLE` if that matters; (4) `timestamp`→epoch-millis is floored to
+  the millisecond (sub-ms precision dropped; ES `date` is ms-resolution — use `date_nanos` for finer).
 - **ES version compatibility.** The client is pinned `elasticsearch>=8,<9`; the 8.x client refuses a
   9.x cluster. Confirm the customer's ES major version and adjust.
 
@@ -104,6 +111,6 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
 - [ ] API-key auth via secret scope, worked example
 - [ ] FIPS/FedRAMP requirements confirmed
 - [ ] Index template + ILM defined
-- [ ] Error/dead-letter handling added
+- [ ] Durable dead-letter path added (0.3.1 surfaces bounded `error_samples` + `total_input`; a full DLQ for every failed row is still needed)
 - [ ] Streaming run as a job with checkpoint + restart-idempotency
 - [ ] ES major-version compatibility confirmed
