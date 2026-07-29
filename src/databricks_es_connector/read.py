@@ -113,8 +113,11 @@ def _resolve_num_slices(es, index: str, configured: Optional[int]) -> int:
 # --- shared validation -----------------------------------------------------------------------
 
 def _validate(cfg: EsReadConfig, schema) -> None:
-    from pyspark.sql.types import StructType
-    if not isinstance(schema, StructType) or not schema.fields:
+    # Duck-type the schema (a non-empty `.fields`) rather than isinstance(StructType) — this matches
+    # how _schema_field_tokens already reads the schema, and it keeps this module importable and
+    # unit-testable without pyspark. A wrong type has no truthy `.fields` and hits the error; a real
+    # StructType passes.
+    if not getattr(schema, "fields", None):
         raise ValueError("read_index requires a non-empty Spark StructType schema (v0.4.0 has no "
                          "mapping inference — declare the schema explicitly)")
     if not cfg.index:

@@ -158,3 +158,173 @@ def test_slice_reader_empty_slice_yields_nothing(monkeypatch):
                                 [("doc_id", "string")], num_slices=2)
     out = list(reader(iter([pd.DataFrame({"id": [0, 1]})])))
     assert out == []   # no rows in any slice => no frames yielded
+
+
+# --- _slice_hits: the PIT + search_after paging loop -----------------------------------------
+# A fake ES client returns canned pages, recording the search kwargs so we can assert the loop
+# pages correctly (search_after advances, PIT carried, sort/slice passed) and terminates on empty.
+
+class _FakeSearchES:
+    """Fake Elasticsearch: .search() returns queued pages in order; records each call's kwargs."""
+    def __init__(self, pages):
+        self._pages = list(pages)
+        self.calls = []
+        self.closed = []
+    def search(self, **kwargs):
+        self.calls.append(kwargs)
+        page = self._pages.pop(0) if self._pages else {"hits": {"hits": []}}
+        return page
+    # PIT lifecycle (used by the entry-point tests below)
+    def open_point_in_time(self, index, keep_alive):
+        return {"id": "pit-abc"}
+    def close_point_in_time(self, id):
+        self.closed.append(id)
+
+def _page(*hit_ids, pit_id=None):
+    hits = [{"_id": h, "_source": {"doc_id": h}, "sort": [i]} for i, h in enumerate(hit_ids)]
+    page = {"hits": {"hits": hits}}
+    if pit_id:
+        page["pit_id"] = pit_id
+    return page
+
+
+def test_slice_hits_pages_until_empty():
+    from databricks_es_connector.read import _slice_hits
+    es = _FakeSearchES([_page("a", "b"), _page("c"), _page()])  # 2 + 1 + terminate
+    got = [h["_id"] for h in _slice_hits(es, "pit-1", {"match_all": {}}, 500, "1m")]
+    assert got == ["a", "b", "c"]
+    # 3 search calls: two returning hits, one empty that stops the loop.
+    assert len(es.calls) == 3
+    # First call has no search_after; later calls carry the previous page's last sort value.
+    assert "search_after" not in es.calls[0]
+    assert es.calls[1]["search_after"] == [1]   # last hit of page 1 (index 1)
+    assert es.calls[2]["search_after"] == [0]   # last hit of page 2 (single hit, index 0)
+
+def test_slice_hits_carries_pit_and_sort_no_index():
+    from databricks_es_connector.read import _slice_hits
+    es = _FakeSearchES([_page("a"), _page()])
+    list(_slice_hits(es, "pit-xyz", {"term": {"x": 1}}, 250, "2m"))
+    c = es.calls[0]
+    assert c["pit"] == {"id": "pit-xyz", "keep_alive": "2m"}
+    assert c["sort"] == [{"_shard_doc": "asc"}]
+    assert c["size"] == 250 and c["query"] == {"term": {"x": 1}}
+    assert "index" not in c              # PIT scopes the index; passing index= would error
+    assert "slice" not in c              # no slice unless requested
+
+def test_slice_hits_passes_slice_spec_when_given():
+    from databricks_es_connector.read import _slice_hits
+    es = _FakeSearchES([_page()])
+    list(_slice_hits(es, "pit", {"match_all": {}}, 500, "1m", slice_spec={"id": 2, "max": 4}))
+    assert es.calls[0]["slice"] == {"id": 2, "max": 4}
+
+def test_slice_hits_follows_refreshed_pit_id():
+    # ES can return a refreshed pit_id per page; the next request must use it.
+    from databricks_es_connector.read import _slice_hits
+    es = _FakeSearchES([_page("a", pit_id="pit-2"), _page()])
+    list(_slice_hits(es, "pit-1", {"match_all": {}}, 500, "1m"))
+    assert es.calls[0]["pit"]["id"] == "pit-1"   # first uses the opened id
+    assert es.calls[1]["pit"]["id"] == "pit-2"   # second uses the refreshed id
+
+
+# --- entry-point orchestration + PIT lifecycle (fake Spark + stubbed ES) ---------------------
+
+class _FakeSpark:
+    """Minimal SparkSession stand-in. createDataFrame records (rows, schema) and echoes them back;
+    range(n) returns a fake DF whose repartition/mapInPandas record how they were called."""
+    def __init__(self):
+        self.created = None
+        self.range_n = None
+        self.mapped = None
+    def createDataFrame(self, rows, schema):
+        self.created = (list(rows), schema)
+        return ("collected-df", self.created)
+    def range(self, n):
+        self.range_n = n
+        return _FakeRangeDF(self)
+
+class _FakeRangeDF:
+    def __init__(self, spark, nparts=None):
+        self._spark = spark
+        self._nparts = nparts
+    def repartition(self, n):
+        return _FakeRangeDF(self._spark, nparts=n)
+    def mapInPandas(self, fn, schema):
+        self._spark.mapped = {"fn": fn, "schema": schema, "nparts": self._nparts}
+        return ("lazy-distributed-df", self._spark.mapped)
+
+
+class _Schema:
+    """Duck-typed Spark schema: has .fields, each with .name and .dataType.simpleString()."""
+    def __init__(self, fields):  # fields: list of (name, token)
+        self.fields = [_Field(n, t) for n, t in fields]
+
+class _Field:
+    def __init__(self, name, token):
+        self.name = name
+        self.dataType = _DT(token)
+
+class _DT:
+    def __init__(self, token): self._t = token
+    def simpleString(self): return self._t
+
+
+def _install_fake_es(monkeypatch, es):
+    """Make `from elasticsearch import Elasticsearch` inside read.py return our fake."""
+    import elasticsearch
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
+
+
+def test_read_index_collect_opens_and_closes_pit(monkeypatch):
+    import databricks_es_connector.read as read_mod
+    es = _FakeSearchES([_page("a", "b"), _page()])
+    _install_fake_es(monkeypatch, es)
+    spark = _FakeSpark()
+    schema = _Schema([("doc_id", "string")])
+
+    out = read_mod.read_index_collect(spark, _rcfg(), schema)
+    # Driver path collects rows and builds a DataFrame with the declared schema.
+    rows, used_schema = spark.created
+    assert [r["doc_id"] for r in rows] == ["a", "b"]
+    assert used_schema is schema
+    # PIT was opened and CLOSED (driver path closes in finally).
+    assert es.closed == ["pit-abc"]
+
+def test_read_index_collect_closes_pit_even_on_error(monkeypatch):
+    import databricks_es_connector.read as read_mod
+    class _BoomES(_FakeSearchES):
+        def search(self, **kw):
+            raise RuntimeError("es down")
+    es = _BoomES([])
+    _install_fake_es(monkeypatch, es)
+    with pytest.raises(RuntimeError, match="es down"):
+        read_mod.read_index_collect(_FakeSpark(), _rcfg(), _Schema([("doc_id", "string")]))
+    assert es.closed == ["pit-abc"]   # finally still closed the PIT
+
+def test_read_index_distributed_opens_pit_and_fans_out(monkeypatch):
+    import databricks_es_connector.read as read_mod
+    es = _FakeSearchES([])
+    _install_fake_es(monkeypatch, es)
+    # Force a known slice count so we can assert the fan-out width.
+    monkeypatch.setattr(read_mod, "_resolve_num_slices", lambda es, index, cfg_n: 4)
+    spark = _FakeSpark()
+    schema = _Schema([("doc_id", "string")])
+
+    df = read_mod.read_index(spark, _rcfg(), schema)
+    # Distributed: spark.range(num_slices) + mapInPandas(reader, schema); NOT createDataFrame.
+    assert spark.range_n == 4
+    assert spark.mapped["nparts"] == 4                 # repartitioned to one part per slice
+    assert spark.mapped["schema"] is schema
+    assert callable(spark.mapped["fn"])                # the slice reader
+    assert spark.created is None                        # data never collected to the driver
+    # Deliberately does NOT close the PIT (lazy DF must outlive this call).
+    assert es.closed == []
+
+def test_read_index_validates_before_touching_es(monkeypatch):
+    import databricks_es_connector.read as read_mod
+    es = _FakeSearchES([])
+    _install_fake_es(monkeypatch, es)
+    # Empty schema => raise, and ES/PIT must not have been opened.
+    with pytest.raises(ValueError, match="StructType schema"):
+        read_mod.read_index(_FakeSpark(), _rcfg(), _Schema([]))
+    with pytest.raises(ValueError, match="index is required"):
+        read_mod.read_index(_FakeSpark(), _rcfg(index=""), _Schema([("doc_id", "string")]))

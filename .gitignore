@@ -6,3 +6,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .dbx-test-results/
+.coverage
+htmlcov/
