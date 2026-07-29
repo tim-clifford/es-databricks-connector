@@ -4,8 +4,8 @@
 # pure-Python `tests/` suite. They exist to cover what the unit tests structurally cannot:
 #   - the Spark-side sanitize_for_arrow path (VARIANT/INTERVAL serialization, df.schema-on-Connect)
 #   - the real mapInPandas bulk_write round-trip (Arrow conversion of every dtype, result schema)
-# See integration/README.md. Run with:
-#   dbx_test run --tests-dir <workspace path> --profile <profile> --config integration/config/test_config.yml
+# See integration_tests/README.md. Run with:
+#   dbx_test run --tests-dir <workspace path> --profile <profile> --config integration_tests/config/test_config.yml
 #
 # Profile/paths are overridden per-invocation on the CLI; the values here are the FEVM defaults
 # used to validate the tier.

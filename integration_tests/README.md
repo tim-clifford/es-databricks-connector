@@ -47,7 +47,7 @@ pip install git+https://github.com/jsparhamii/dbx_test.git
 dbx_test run \
   --tests-dir /Workspace/Users/<you>/es_connector_integration \
   --profile <profile> \
-  --config integration/config/test_config.yml
+  --config integration_tests/config/test_config.yml
 ```
 
 `dbx_test` installs the framework + the connector wheel into an inline serverless environment,
@@ -55,9 +55,7 @@ runs each fixture as a notebook, and reports console + JUnit + JSON results (JUn
 
 ## Notes on the dbx_test dependency
 
-- Install from `main` (`git+https://github.com/jsparhamii/dbx_test.git`). The test-discovery
-  `UnboundLocalError` that previously broke fresh installs was fixed in
-  [jsparhamii/dbx_test#3](https://github.com/jsparhamii/dbx_test/pull/3).
+- Install from `main` (`git+https://github.com/jsparhamii/dbx_test.git`).
 - Each fixture ends with `run_notebook_tests(<TheFixtureClass>)`, passing the class **explicitly**.
   The no-argument form auto-discovers via a frame walk that doesn't reach the notebook's globals
   through the wrapper, so it silently finds zero fixtures and reports a hollow pass. Always name the
