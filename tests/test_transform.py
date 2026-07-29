@@ -206,6 +206,20 @@ def test_dtype_decimal_to_float():    # Spark decimal -> float (numeric + querya
     assert out == 1.25 and isinstance(out, float)
 
 
+def test_epoch_millis_floors_consistently_across_epoch():
+    # epoch-millis must FLOOR to the containing millisecond, not truncate toward zero — otherwise
+    # pre-epoch (negative) timestamps round the wrong direction vs post-epoch, an inconsistency.
+    # Matches Spark/Java unix_millis floor semantics.
+    # 0.5 ms AFTER epoch -> floors to 0.
+    post = dt.datetime(1970, 1, 1, 0, 0, 0, 500, tzinfo=dt.timezone.utc)  # +500 microseconds
+    assert _json_roundtrip(post) == 0
+    # 0.5 ms BEFORE epoch (-500 microseconds) -> floors to -1, NOT truncated toward zero (0).
+    pre = dt.datetime(1969, 12, 31, 23, 59, 59, 999_500, tzinfo=dt.timezone.utc)  # -500 microseconds
+    assert _json_roundtrip(pre) == -1
+    # A whole pre-epoch second is exact under both floor and truncate; guards the common case.
+    assert _json_roundtrip(dt.datetime(1969, 12, 31, 23, 59, 59, tzinfo=dt.timezone.utc)) == -1000
+
+
 def test_dtype_binary_to_base64():    # Spark binary (bytes) -> base64 str (reversible)
     import base64
     out = _json_roundtrip(b"abc")
@@ -221,6 +235,40 @@ def test_dtype_array():               # Spark array<int> -> list
 def test_dtype_map_and_struct():      # Spark map/struct -> dict (both arrive as dict)
     assert _json_roundtrip({"k": 1}) == {"k": 1}
     assert _json_roundtrip({"a": 1, "b": "x"}) == {"a": 1, "b": "x"}
+
+
+# --- non-string map keys (Spark map<K,V> where K is not a string) ---
+# json.dumps stringifies int/bool/float/None keys but RAISES on date/decimal/bytes/tuple keys,
+# which would crash helpers.bulk on the executor (uncounted). coerce_value must render every key
+# to a JSON-safe string so any map<K,V> exports without a crash. Spark maps are homogeneously
+# typed, so distinct keys always render distinctly (no collision to detect).
+
+def test_map_int_keys_become_strings():
+    # map<int,V> keys must be JSON strings, deterministically.
+    assert _json_roundtrip({1: "a", 2: "b"}) == {"1": "a", "2": "b"}
+
+
+def test_map_date_keys_do_not_crash():
+    # THE crash case: a date key makes json.dumps raise TypeError without coercion.
+    out = _json_roundtrip({dt.date(2024, 1, 26): "x"})
+    assert out == {"1706227200000": "x"}   # key coerced the same way a date value would be
+
+
+def test_map_decimal_and_bytes_keys_do_not_crash():
+    from decimal import Decimal
+    assert _json_roundtrip({Decimal("1.5"): "a"}) == {"1.5": "a"}
+    assert _json_roundtrip({b"\x01\x02": "a"}) == {"AQI=": "a"}
+
+
+def test_map_none_key_becomes_json_null_key():
+    # A None key stringifies to the literal "null" (JSON object keys are always strings).
+    assert _json_roundtrip({None: "a"}) == {"null": "a"}
+
+
+def test_nested_map_with_nonstring_keys_coerced():
+    # A struct holding a map<int,timestamp> — keys AND values both need coercion, recursively.
+    row = {"counts": {10: dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)}}
+    assert _json_roundtrip(row) == {"counts": {"10": 1704067200000}}
 
 
 def test_dtype_interval_as_string():  # INTERVAL can't cross Arrow; sanitize_for_arrow serializes it

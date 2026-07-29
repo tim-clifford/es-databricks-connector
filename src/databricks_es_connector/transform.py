@@ -52,14 +52,39 @@ def _is_null(v: Any) -> bool:
 
 
 def _to_epoch_millis(v: Any) -> int:
-    """Coerce a datetime/date to epoch milliseconds. Naive values are assumed UTC."""
+    """Coerce a datetime/date to epoch milliseconds. Naive values are assumed UTC.
+
+    Floors to the containing millisecond (sub-millisecond precision is dropped — ES `date` is
+    millisecond-resolution by default). `math.floor`, not `int()`: `int()` truncates toward zero,
+    which would round pre-epoch (negative) timestamps the OPPOSITE direction from post-epoch ones.
+    Flooring is consistent across the epoch boundary and matches Spark/Java `unix_millis`.
+    """
     if isinstance(v, _dt.datetime):
         if v.tzinfo is None:
             v = v.replace(tzinfo=_dt.timezone.utc)
-        return int(v.timestamp() * 1000)
+        return _math.floor(v.timestamp() * 1000)
     # date without time -> midnight UTC
     d = _dt.datetime(v.year, v.month, v.day, tzinfo=_dt.timezone.utc)
-    return int(d.timestamp() * 1000)
+    return _math.floor(d.timestamp() * 1000)
+
+
+def _coerce_key(k: Any) -> str:
+    """Render a map/dict key to a JSON-safe string.
+
+    JSON object keys must be strings. Spark `map<K,V>` allows non-string key types (int, date,
+    decimal, binary, ...); `json.dumps` silently stringifies int/bool/float/None keys but RAISES on
+    date/decimal/bytes/struct keys, crashing helpers.bulk on the executor. So coerce the key with
+    the SAME value transform (date -> epoch-millis, decimal -> float, bytes -> base64, ...) and then
+    render it to a string. Spark maps are homogeneously typed, so distinct keys stay distinct.
+    """
+    ck = coerce_value(k)
+    if isinstance(ck, str):
+        return ck
+    if ck is None:
+        return "null"           # mirror json.dumps' rendering of a None key
+    if isinstance(ck, bool):
+        return "true" if ck else "false"
+    return str(ck)
 
 
 def coerce_value(v: Any) -> Any:
@@ -83,7 +108,7 @@ def coerce_value(v: Any) -> Any:
     if isinstance(v, (_dt.datetime, _dt.date)):
         return _to_epoch_millis(v)
     if isinstance(v, dict):
-        return {k: coerce_value(val) for k, val in v.items()}
+        return {_coerce_key(k): coerce_value(val) for k, val in v.items()}
     if isinstance(v, (list, tuple)):
         return [coerce_value(x) for x in v]
     # numpy values from Arrow / mapInPandas: array<...> columns arrive as np.ndarray

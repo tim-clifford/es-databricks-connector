@@ -7,7 +7,8 @@ import pytest
 
 from databricks_es_connector.config import EsConfig
 from databricks_es_connector.bulk import (
-    classify_bulk_result, make_partition_writer, WRITTEN, DELETED, IGNORED, ERROR,
+    classify_bulk_result, make_partition_writer, _merge_partition_results,
+    ERROR_SAMPLE_CAP, WRITTEN, DELETED, IGNORED, ERROR,
 )
 
 
@@ -116,7 +117,8 @@ def test_partition_writer_counts_and_schema(monkeypatch):
 
     assert len(out) == 1
     row = out[0].iloc[0]
-    assert list(out[0].columns) == ["written", "deleted", "errors"]   # mapInPandas schema
+    # mapInPandas schema: counts + reconciliation total + bounded error samples (JSON string)
+    assert list(out[0].columns) == ["written", "deleted", "errors", "total_input", "error_samples"]
     assert (int(row["written"]), int(row["deleted"]), int(row["errors"])) == (2, 1, 2)
 
 
@@ -142,4 +144,119 @@ def test_partition_writer_empty_chunk_yields_zeros(monkeypatch):
     out = list(writer(iter([pd.DataFrame({"id": []})])))
     row = out[0].iloc[0]
     assert (int(row["written"]), int(row["deleted"]), int(row["errors"])) == (0, 0, 0)
+    assert int(row["total_input"]) == 0
     assert called["n"] == 0   # no bulk call for an empty chunk
+
+
+# --- #5 reconciliation: total_input, and #2: bounded error samples ------------------------
+
+def test_partition_writer_reports_total_input(monkeypatch):
+    # total_input must equal the number of ROWS fed in (so a caller can reconcile
+    # written+deleted+errors+ignored against it and detect silent chunk-level loss).
+    pd = pytest.importorskip("pandas")
+    import elasticsearch, elasticsearch.helpers
+
+    canned = [(True, {"index": {"status": 201}}), (True, {"index": {"status": 201}}),
+              (True, {"index": {"status": 201}})]
+
+    class _FakeES:
+        def __init__(self, **kw): pass
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", _FakeES)
+    monkeypatch.setattr(elasticsearch.helpers, "streaming_bulk", lambda es, actions, **kw: iter(canned))
+
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id")
+    writer = make_partition_writer(cfg)
+    out = list(writer(iter([pd.DataFrame({"id": ["a", "b", "c"]})])))
+    row = out[0].iloc[0]
+    assert int(row["total_input"]) == 3
+    assert int(row["written"]) == 3
+
+
+def test_partition_writer_captures_error_samples(monkeypatch):
+    # A failed doc must leave a diagnostic breadcrumb (id, op, status, reason), not just a count.
+    pd = pytest.importorskip("pandas")
+    import json as _json
+    import elasticsearch, elasticsearch.helpers
+
+    canned = [
+        (True,  {"index": {"status": 201, "_id": "ok1"}}),
+        (False, {"index": {"status": 400, "_id": "bad1",
+                           "error": {"type": "mapper_parsing_exception", "reason": "boom"}}}),
+    ]
+
+    class _FakeES:
+        def __init__(self, **kw): pass
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", _FakeES)
+    monkeypatch.setattr(elasticsearch.helpers, "streaming_bulk", lambda es, actions, **kw: iter(canned))
+
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id")
+    writer = make_partition_writer(cfg)
+    out = list(writer(iter([pd.DataFrame({"id": ["ok1", "bad1"]})])))
+    row = out[0].iloc[0]
+    assert int(row["errors"]) == 1
+    samples = _json.loads(row["error_samples"])
+    assert len(samples) == 1
+    s = samples[0]
+    assert s["_id"] == "bad1" and s["op_type"] == "index" and s["status"] == 400
+    assert "boom" in s["reason"]
+
+
+def test_partition_writer_error_samples_are_bounded(monkeypatch):
+    # Many failures must NOT blow up memory: samples are capped, but the error COUNT is exact.
+    pd = pytest.importorskip("pandas")
+    import json as _json
+    import elasticsearch, elasticsearch.helpers
+    from databricks_es_connector.bulk import ERROR_SAMPLE_CAP
+
+    n = ERROR_SAMPLE_CAP + 25
+    canned = [(False, {"index": {"status": 400, "_id": f"e{i}",
+                                 "error": {"reason": f"r{i}"}}}) for i in range(n)]
+
+    class _FakeES:
+        def __init__(self, **kw): pass
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", _FakeES)
+    monkeypatch.setattr(elasticsearch.helpers, "streaming_bulk", lambda es, actions, **kw: iter(canned))
+
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id")
+    writer = make_partition_writer(cfg)
+    out = list(writer(iter([pd.DataFrame({"id": [f"e{i}" for i in range(n)]})])))
+    row = out[0].iloc[0]
+    assert int(row["errors"]) == n                       # count is exact
+    samples = _json.loads(row["error_samples"])
+    assert len(samples) == ERROR_SAMPLE_CAP              # sample list is capped
+
+
+# --- driver-side merge of per-partition summaries (pure, no Spark) ------------------------
+
+def _prow(written=0, deleted=0, errors=0, total_input=0, samples=None):
+    import json
+    return {"written": written, "deleted": deleted, "errors": errors,
+            "total_input": total_input, "error_samples": json.dumps(samples or [])}
+
+
+def test_merge_sums_counts_and_totals():
+    rows = [_prow(written=5, total_input=5), _prow(written=3, deleted=1, errors=1, total_input=5)]
+    out = _merge_partition_results(rows)
+    assert out["written"] == 8 and out["deleted"] == 1 and out["errors"] == 1
+    assert out["total_input"] == 10
+
+
+def test_merge_reconciliation_gap_is_visible():
+    # A partition that lost rows below the per-doc level: 10 in, only 7 accounted for.
+    out = _merge_partition_results([_prow(written=7, total_input=10)])
+    assert out["total_input"] - (out["written"] + out["deleted"] + out["errors"]) == 3
+
+
+def test_merge_concatenates_and_caps_samples():
+    # Two partitions each with samples; merged list is capped at ERROR_SAMPLE_CAP.
+    half = ERROR_SAMPLE_CAP
+    s1 = [{"_id": f"a{i}", "op_type": "index", "status": 400, "reason": "x"} for i in range(half)]
+    s2 = [{"_id": f"b{i}", "op_type": "index", "status": 400, "reason": "y"} for i in range(half)]
+    out = _merge_partition_results([_prow(errors=half, samples=s1), _prow(errors=half, samples=s2)])
+    assert out["errors"] == 2 * half                 # count exact
+    assert len(out["error_samples"]) == ERROR_SAMPLE_CAP   # merged list capped
+
+
+def test_merge_empty_is_all_zero():
+    out = _merge_partition_results([])
+    assert out == {"written": 0, "deleted": 0, "errors": 0, "total_input": 0, "error_samples": []}
