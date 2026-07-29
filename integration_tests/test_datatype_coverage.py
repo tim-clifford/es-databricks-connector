@@ -72,16 +72,22 @@ class TestDatatypeCoverage(NotebookTestFixture):
               DATE'2021-01-01'                               AS s_date,
               TIMESTAMP'2021-01-01 00:00:00Z'                AS s_timestamp,
               TIMESTAMP'1969-12-31 23:59:59Z'                AS s_ts_preepoch,   -- pre-epoch floor
+              TIMESTAMP_NTZ'2021-06-01 12:00:00'             AS s_timestamp_ntz, -- wall-clock, no tz
               CAST(X'0102' AS BINARY)                        AS s_binary,
               named_struct('ip','10.0.0.1','port',443)       AS s_struct,
               map('k1','v1','k2','v2')                        AS s_map,           -- map<string,string>
               map('a', 1, 'b', 2)                             AS s_map_int,       -- map<string,int>
               map(1, 'a', 2, 'b')                             AS s_map_intkey,    -- non-string keys
+              CAST(map() AS MAP<STRING,INT>)                  AS s_empty_map,     -- empty map container
+              map('a', 1, 'b', CAST(NULL AS INT))             AS s_map_null_val,  -- null map VALUE
               array(1,2,3)                                    AS s_array,
               array(named_struct('k','a','v',1),
                     named_struct('k','b','v',2))              AS s_array_struct,
               array()                                         AS s_empty_array,   -- empty container
+              array(1, CAST(NULL AS INT), 3)                  AS s_array_null_el, -- null array ELEMENT
               named_struct('inner', named_struct('x',1))      AS s_nested_struct,
+              named_struct('a', 1, 'b', CAST(NULL AS INT))    AS s_struct_null_fld, -- partial-null struct
+              CAST(123456789012345678 AS DECIMAL(38,0))       AS s_decimal_hi,    -- 18 sig figs: lossy
               double('Infinity')                              AS s_pos_inf,       -- non-finite
               double('-Infinity')                             AS s_neg_inf,
               double('NaN')                                   AS s_nan,
@@ -111,15 +117,21 @@ class TestDatatypeCoverage(NotebookTestFixture):
               CAST(NULL AS DATE)                             AS s_date,
               CAST(NULL AS TIMESTAMP)                        AS s_timestamp,
               CAST(NULL AS TIMESTAMP)                        AS s_ts_preepoch,
+              CAST(NULL AS TIMESTAMP_NTZ)                    AS s_timestamp_ntz,
               CAST(NULL AS BINARY)                           AS s_binary,
               CAST(NULL AS STRUCT<ip:STRING,port:INT>)       AS s_struct,
               CAST(NULL AS MAP<STRING,STRING>)               AS s_map,
               CAST(NULL AS MAP<STRING,INT>)                  AS s_map_int,
               CAST(NULL AS MAP<INT,STRING>)                  AS s_map_intkey,
+              CAST(NULL AS MAP<STRING,INT>)                  AS s_empty_map,
+              CAST(NULL AS MAP<STRING,INT>)                  AS s_map_null_val,
               CAST(NULL AS ARRAY<INT>)                       AS s_array,
               CAST(NULL AS ARRAY<STRUCT<k:STRING,v:INT>>)    AS s_array_struct,
               CAST(NULL AS ARRAY<INT>)                       AS s_empty_array,
+              CAST(NULL AS ARRAY<INT>)                       AS s_array_null_el,
               CAST(NULL AS STRUCT<inner:STRUCT<x:INT>>)      AS s_nested_struct,
+              CAST(NULL AS STRUCT<a:INT,b:INT>)              AS s_struct_null_fld,
+              CAST(NULL AS DECIMAL(38,0))                    AS s_decimal_hi,
               CAST(NULL AS DOUBLE)                           AS s_pos_inf,
               CAST(NULL AS DOUBLE)                           AS s_neg_inf,
               CAST(NULL AS DOUBLE)                           AS s_nan,
@@ -208,6 +220,14 @@ class TestDatatypeCoverage(NotebookTestFixture):
         # One whole second before epoch floors to -1000 ms (floor, not truncate-toward-zero).
         self._assert("s_ts_preepoch", -1000)
 
+    def test_timestamp_ntz_interpreted_as_utc(self):
+        # TIMESTAMP_NTZ has no zone. It crosses Arrow as a NAIVE datetime, and the connector treats
+        # naive datetimes as UTC (deterministic across executor timezones). So a wall-clock
+        # 2021-06-01 12:00:00 is stored as the epoch-ms of that instant *in UTC*, NOT the executor's
+        # local zone. A client storing wall-clock NTZ values must expect UTC interpretation.
+        self._assert("s_timestamp_ntz",
+                     _epoch_millis(datetime.datetime(2021, 6, 1, 12, 0, 0, tzinfo=datetime.timezone.utc)))
+
     def test_binary_base64(self):
         self._assert("s_binary", base64.b64encode(b"\x01\x02").decode("ascii"))
 
@@ -231,6 +251,10 @@ class TestDatatypeCoverage(NotebookTestFixture):
         # 0.3.1: int keys rendered to strings (JSON object keys must be strings).
         self._assert("s_map_intkey", {"1": "a", "2": "b"})
 
+    def test_empty_map(self):
+        # Empty map() -> empty JSON object, the sibling of the empty-array edge.
+        self._assert("s_empty_map", {})
+
     def test_array(self):
         self._assert("s_array", [1, 2, 3])
 
@@ -239,6 +263,28 @@ class TestDatatypeCoverage(NotebookTestFixture):
 
     def test_empty_array(self):
         self._assert("s_empty_array", [])
+
+    # --- nulls INSIDE containers (not just a fully-null row) ---
+    def test_null_map_value(self):
+        # A null map VALUE lands as JSON null, keeping the key (recursion hits _is_null).
+        self._assert("s_map_null_val", {"a": 1, "b": None})
+
+    def test_null_array_element(self):
+        # A null element inside an array is preserved positionally as JSON null.
+        self._assert("s_array_null_el", [1, None, 3])
+
+    def test_partial_null_struct(self):
+        # A struct with one null field: present field kept, null field -> JSON null.
+        self._assert("s_struct_null_fld", {"a": 1, "b": None})
+
+    # --- decimal precision loss at the documented boundary ---
+    def test_decimal_precision_loss(self):
+        # An 18-sig-fig decimal widened to a double loses its low digits — the connector's
+        # documented decimal->float behavior. Proves the README caveat end-to-end, not just in a
+        # unit test: what a client sends (…678) is NOT what ES holds (…680).
+        got = self._got("s_decimal_hi")
+        assert int(got) == 123456789012345680, f"s_decimal_hi: got {got!r}"
+        assert int(got) != 123456789012345678, "expected the low digits to be lost to float64"
 
     # --- Arrow-hostile: VARIANT (any depth) + INTERVAL, serialized to strings by the connector ---
     def test_variant_top_level(self):
@@ -273,10 +319,12 @@ class TestDatatypeCoverage(NotebookTestFixture):
     def test_no_unexpected_fields(self):
         expected_cols = {
             "doc_id", "s_string", "s_bool", "s_byte", "s_short", "s_int", "s_long", "s_float",
-            "s_double", "s_float32_prec", "s_decimal", "s_date", "s_timestamp", "s_ts_preepoch",
-            "s_binary", "s_struct", "s_map", "s_map_int", "s_map_intkey", "s_array", "s_array_struct",
-            "s_empty_array", "s_nested_struct", "s_pos_inf", "s_neg_inf", "s_nan", "s_variant",
-            "s_struct_variant", "s_array_variant", "s_interval_dt", "s_interval_ym",
+            "s_double", "s_float32_prec", "s_decimal", "s_decimal_hi", "s_date", "s_timestamp",
+            "s_ts_preepoch", "s_timestamp_ntz", "s_binary", "s_struct", "s_map", "s_map_int", "s_map_intkey",
+            "s_empty_map", "s_map_null_val", "s_array", "s_array_struct", "s_empty_array",
+            "s_array_null_el", "s_struct_null_fld", "s_nested_struct", "s_pos_inf", "s_neg_inf",
+            "s_nan", "s_variant", "s_struct_variant", "s_array_variant", "s_interval_dt",
+            "s_interval_ym",
         }
         # ES omits explicit nulls and an empty array from _source, so the full row may legitimately
         # have FEWER keys than expected — but never MORE. Only extras are a leak.

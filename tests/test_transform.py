@@ -237,6 +237,51 @@ def test_dtype_map_and_struct():      # Spark map/struct -> dict (both arrive as
     assert _json_roundtrip({"a": 1, "b": "x"}) == {"a": 1, "b": "x"}
 
 
+def test_dtype_empty_map():           # Spark map() -> {} (sibling of the empty-array edge)
+    assert _json_roundtrip({}) == {}
+
+
+# --- nulls INSIDE containers (not just a fully-null row) ---
+# A client with sparse nested data relies on a null map value / array element / struct field
+# landing as JSON null, recursively — the _is_null guard must fire inside the dict/list recursion,
+# not only at the top level.
+
+def test_null_map_value_becomes_json_null():
+    assert _json_roundtrip({"k": None}) == {"k": None}
+    assert _json_roundtrip({"k": float("nan")}) == {"k": None}   # pandas null inside a map
+
+
+def test_null_array_element_becomes_json_null():
+    assert _json_roundtrip([1, None, 3]) == [1, None, 3]
+    assert _json_roundtrip([1, float("nan"), 3]) == [1, None, 3]  # pandas null inside an array
+
+
+def test_partially_null_struct_keeps_nulls():
+    # A struct where some fields are null: present fields kept, null fields -> JSON null.
+    assert _json_roundtrip({"a": 1, "b": None, "c": "x"}) == {"a": 1, "b": None, "c": "x"}
+
+
+def test_deeply_nested_nulls_coerced():
+    # array<struct> where an inner field and an inner array element are both null.
+    row = {"items": [{"v": None, "tags": ["a", None]}]}
+    assert _json_roundtrip(row) == {"items": [{"v": None, "tags": ["a", None]}]}
+
+
+# --- decimal precision loss at the documented boundary ---
+# README documents "precision lost beyond ~15-17 sig figs" for decimal -> float. Prove it: an
+# 18-sig-fig decimal does NOT round-trip to the same integer once widened to a double. This makes
+# the documented lossy contract a *tested* fact (a client exporting a high-precision decimal must
+# cast it to string in Spark first if exactness matters).
+
+def test_decimal_precision_lost_beyond_double():
+    from decimal import Decimal
+    d = Decimal("123456789012345678")            # 18 significant digits
+    out = _json_roundtrip(d)
+    assert isinstance(out, float)
+    assert int(out) == 123456789012345680         # NOT ...678: the low digits are lost to float64
+    assert int(out) != int(d)                     # explicit: the exact integer did not survive
+
+
 # --- non-string map keys (Spark map<K,V> where K is not a string) ---
 # json.dumps stringifies int/bool/float/None keys but RAISES on date/decimal/bytes/tuple keys,
 # which would crash helpers.bulk on the executor (uncounted). coerce_value must render every key

@@ -26,7 +26,11 @@ def make_foreach_batch(cfg: EsConfig, on_batch: Optional[Callable] = None) -> Ca
         # df.isEmpty() (not df.rdd.isEmpty(), which is blocked on serverless)
         if batch_df.isEmpty():
             if on_batch:
-                on_batch(batch_id, {"written": 0, "deleted": 0, "errors": 0, "empty": True})
+                # Same shape bulk_write returns (written/deleted/errors/total_input/error_samples)
+                # so a callback can read any of those keys uniformly, empty batch or not, plus an
+                # `empty` flag to distinguish "no rows this micro-batch" from "0 written of N".
+                on_batch(batch_id, {"written": 0, "deleted": 0, "errors": 0,
+                                    "total_input": 0, "error_samples": [], "empty": True})
             return
         result = bulk_write(batch_df, cfg)
         if on_batch:

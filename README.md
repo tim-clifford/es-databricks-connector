@@ -75,6 +75,10 @@ Notes for serverless:
   cell-by-cell on serverless / Spark Connect is unreliable (`query.start()` can intermittently
   hang). Wrap it in a job that calls `spark.streams.awaitAnyTermination()`. See
   [HANDOFF.md](HANDOFF.md) for the details and the at-least-once / freshness caveats.
+- **`on_batch` result shape.** The dict passed to your `on_batch` callback always carries the same
+  keys `bulk_write` returns (`written`/`deleted`/`errors`/`total_input`/`error_samples`). An
+  **empty** micro-batch (no rows) skips the write and additionally sets `empty: True`; that flag is
+  present only on skipped batches, so read it with `result.get("empty")`, not `result["empty"]`.
 
 ## Usage (deletes)
 
@@ -208,6 +212,14 @@ cross-batch ordering caveat.
   count. The `errors` count is always exact; only the retained sample list is capped, so a batch
   that fails wholesale can't exhaust memory. If you need every failed row durably, capture them
   from your own pipeline — the connector does not persist them.
+- **Duplicate `id_field` values collapse — and reconciliation won't flag it.** If `id_field` is
+  set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
+  over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
+  success (`written` counts each op, not each surviving doc), so `written + deleted + errors` still
+  equals `total_input` — the reconciliation identity passes even though the ES doc count is lower.
+  This is the same idempotency that makes replays safe, but if you expect a 1:1 row→document
+  mapping, ensure `id_field` is unique across the input (e.g. dedup upstream) or leave it unset to
+  let ES assign random ids.
 
 ## Datatype coverage
 
@@ -240,6 +252,13 @@ number is faithful to what Spark actually held, not to the source literal. Use `
 pre- and post-epoch instants (matches Spark/Java `unix_millis`). Elasticsearch `date` is
 millisecond-resolution by default; sub-millisecond (microsecond) precision from a Spark `timestamp`
 is not preserved. Map the field as `date_nanos` and send nanos yourself if you need finer than ms.
+
+**`timestamp` vs `timestamp_ntz`:** a regular Spark `timestamp` is an instant and converts to its
+true epoch-millis. A `timestamp_ntz` (no time zone) carries a wall-clock value with no zone, so the
+connector interprets it as **UTC** — deterministically, since executors can be in different zones.
+The stored epoch-millis is that wall-clock time read as UTC, not as the cluster's local zone. If
+your NTZ values are really in some other zone, convert them to a zoned `timestamp` in Spark before
+export so the epoch is correct.
 
 ### Arrow-hostile types: `variant` and `interval` (handled automatically)
 

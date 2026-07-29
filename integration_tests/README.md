@@ -7,9 +7,9 @@ structurally cannot.
 ## Why this exists
 
 `tests/` is fast, infra-free, and covers the pure-Python layer (`coerce_value`,
-`classify_bulk_result`, `_merge_partition_results`, `EsConfig`) with hand-built inputs and a
-stubbed ES client. Two things can't be tested there and only manifest on a live serverless
-session:
+`classify_bulk_result`, `_merge_partition_results`, `EsConfig`, and the `make_foreach_batch`
+streaming glue) with hand-built inputs and a stubbed ES client. Two things can't be tested there and
+only manifest on a live serverless session:
 
 - **`sanitize_for_arrow`** — the Spark-side VARIANT/INTERVAL serialization, including the fact that
   `df.schema` *throws* on a VARIANT column under Spark Connect (the reason the connector uses
@@ -30,15 +30,18 @@ Each fixture owns one concern:
 
 - **`test_datatype_coverage.py`** — live ES. The exhaustive datatype-fidelity test: one wide row
   covering **every** Spark type + edge cases (byte/short/int/long, float32 widening, double,
-  decimal, date/timestamp incl. pre-epoch floor, binary, unicode string, bool, struct/nested-struct,
-  map incl. non-string keys, array/empty-array/array-of-struct, non-finite floats, VARIANT at every
-  depth, INTERVAL), plus an all-NULL row proving the null contract (field present as JSON null, not
+  decimal incl. an 18-sig-fig value that proves the documented precision loss, date/timestamp incl.
+  pre-epoch floor and `timestamp_ntz` UTC interpretation, binary, unicode string, bool,
+  struct/nested-struct/partial-null-struct, map incl. non-string keys/empty-map/null-value,
+  array/empty-array/array-of-struct/null-element, non-finite floats, VARIANT at every depth,
+  INTERVAL), plus an all-NULL row proving the null contract (field present as JSON null, not
   absent), plus a reverse check that the connector adds no unexpected fields. Asserts each value
   against the README "Datatype coverage" contract. Throwaway index, dropped per run.
 - **`test_bulk_write_roundtrip.py`** — live ES. Owns the **write-result contract**: `bulk_write`
   returns `written`/`deleted`/`errors`/`total_input`/`error_samples` correctly, including a
   deliberately-rejected doc (so the error path + `error_samples` are exercised, not just the clean
-  path) and idempotent re-write via a deterministic `_id`. Does not re-assert per-type transforms.
+  path), idempotent re-write via a deterministic `_id`, and a duplicate-id-within-one-input case
+  proving the collapse (counts succeed, ES doc count is lower). Does not re-assert per-type transforms.
 - **`test_sanitize_for_arrow.py`** — Spark only, no ES. The Spark-side transform in isolation:
   VARIANT→JSON-string at any depth, scalar INTERVAL→Spark string form, plain columns untouched,
   idempotency, Arrow-collectability, and the `df.schema`-throws-on-Connect constraint.

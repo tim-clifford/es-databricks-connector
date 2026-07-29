@@ -16,7 +16,8 @@ from dbx_test import NotebookTestFixture, run_notebook_tests
 from databricks_es_connector import EsConfig, bulk_write
 
 SCOPE = "es_poc"
-INDEX = "connector-integration-roundtrip"   # throwaway; recreated + dropped by the fixture
+INDEX = "connector-integration-roundtrip"       # throwaway; recreated + dropped by the fixture
+DUP_INDEX = INDEX + "-dup"                       # separate throwaway for the duplicate-id case
 ES_HOSTS = dbutils.secrets.get(SCOPE, "hosts")
 ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "password"))
 
@@ -62,8 +63,29 @@ class TestBulkWriteResultContract(NotebookTestFixture):
         """)
         self.res_mixed = bulk_write(mixed, self.cfg)
 
+        # DUPLICATE _id within one input. Two rows share doc_id 'dup' => the deterministic _id
+        # makes the second upsert OVER the first. Every op succeeds (written == total_input == 3)
+        # and the reconciliation identity holds, yet ES ends up with FEWER docs than rows fed in.
+        # A client exporting a table with non-unique id_field values sees a lower doc count with no
+        # error signal — this pins that documented behavior. Fresh index so the count is unambiguous.
+        requests.delete(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
+        dup_cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
+                           index=DUP_INDEX, id_field="doc_id", http_compress=True)
+        dup = spark.sql("""
+            SELECT 'uniq' AS doc_id, 1 AS n UNION ALL
+            SELECT 'dup', 2 UNION ALL
+            SELECT 'dup', 3
+        """)
+        self.res_dup = bulk_write(dup, dup_cfg)
+        requests.post(f"{ES_HOSTS}/{DUP_INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
+        self.dup_es_count = requests.get(
+            f"{ES_HOSTS}/{DUP_INDEX}/_count", auth=ES_AUTH, verify=False, timeout=30).json()["count"]
+
     def run_cleanup(self):
+        # Reference the module constants (not setup-time instance state) so cleanup runs correctly
+        # even if run_setup raised before finishing — no masking AttributeError on self.dup_index.
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
+        requests.delete(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
 
     # --- clean write ---
     def test_clean_write_counts(self):
@@ -84,6 +106,19 @@ class TestBulkWriteResultContract(NotebookTestFixture):
         # Second write of the same _ids upserts; ES still holds exactly 3 docs.
         assert self.res_idem["written"] == 3, self.res_idem
         assert self.es_count_after_idem == 3, self.es_count_after_idem
+
+    # --- duplicate _id within one input: collapses to one doc, counts still "succeed" ---
+    def test_duplicate_id_collapses_but_counts_succeed(self):
+        # 3 rows in, 2 distinct ids => all 3 ops report success (written == total_input == 3)...
+        assert self.res_dup["written"] == 3, self.res_dup
+        assert self.res_dup["errors"] == 0, self.res_dup
+        assert self.res_dup["total_input"] == 3, self.res_dup
+        # ...and the reconciliation identity HOLDS, so it gives no warning...
+        assert (self.res_dup["written"] + self.res_dup["deleted"] + self.res_dup["errors"]
+                == self.res_dup["total_input"])
+        # ...yet ES holds only 2 docs: the duplicate id upserted over itself. This is the client
+        # gotcha — fewer docs than input rows, with no error to signal it.
+        assert self.dup_es_count == 2, self.dup_es_count
 
     # --- error path: a rejected doc must be counted AND sampled, good docs still written ---
     def test_rejected_doc_counted(self):
