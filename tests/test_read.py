@@ -6,19 +6,39 @@ import datetime as dt
 
 import pytest
 
-from databricks_es_connector.read import EsReadConfig, _coerce_hit, _schema_field_tokens
+from databricks_es_connector import EsReadConfig
+from databricks_es_connector.read import _coerce_hit, _schema_field_tokens
+
+
+def _rcfg(**kw):
+    base = dict(hosts="https://h:9200", basic_auth=("u", "p"), index="i")
+    base.update(kw)
+    return EsReadConfig(**base)
 
 
 # --- EsReadConfig ----------------------------------------------------------------------------
 
 def test_read_config_defaults():
-    c = EsReadConfig()
+    c = _rcfg()
     assert c.query is None and c.num_slices is None
     assert c.batch_size == 1000 and c.pit_keep_alive == "1m" and c.include_id is True
+    assert "hosts" in c.client_kwargs()   # connection fields are shared from EsConnection
+
+def test_read_config_requires_hosts():
+    with pytest.raises(ValueError, match="hosts"):
+        EsReadConfig(index="i", basic_auth=("u", "p"), hosts="")
+
+def test_read_config_requires_auth():
+    with pytest.raises(ValueError, match="api_key or basic_auth"):
+        EsReadConfig(hosts="https://h:9200", index="i")
 
 def test_read_config_rejects_nonpositive_batch():
     with pytest.raises(ValueError, match="batch_size"):
-        EsReadConfig(batch_size=0)
+        _rcfg(batch_size=0)
+
+def test_read_config_rejects_bad_num_slices():
+    with pytest.raises(ValueError, match="num_slices"):
+        _rcfg(num_slices=0)
 
 
 # --- _coerce_hit: map one ES hit to a schema-shaped row --------------------------------------

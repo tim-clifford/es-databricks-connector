@@ -15,30 +15,14 @@ layers stay importable without Spark.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
-from .config import EsConfig
+from .config import EsReadConfig
 from .read_transform import read_coerce
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyspark.sql import DataFrame, SparkSession
     from pyspark.sql.types import DataType, StructType
-
-
-@dataclass(frozen=True)
-class EsReadConfig:
-    """Read-only knobs, kept separate from the (write) EsConfig so the write surface is untouched.
-    Frozen + serializable so it can ship to executors when the distributed reader lands."""
-    query: Optional[dict] = None          # ES query DSL; None => match_all
-    num_slices: Optional[int] = None      # distributed reader parallelism (unused by the driver path)
-    batch_size: int = 1000                # docs per page
-    pit_keep_alive: str = "1m"            # Point-in-Time lifetime
-    include_id: bool = True               # expose ES _id when the schema declares the id_field
-
-    def __post_init__(self):
-        if self.batch_size <= 0:
-            raise ValueError("EsReadConfig.batch_size must be positive")
 
 
 def _spark_type_token(dtype: "DataType") -> str:
@@ -107,15 +91,18 @@ def _scroll_hits(es, index: str, query: dict, batch_size: int, keep_alive: str):
 
 def read_index(
     spark: "SparkSession",
-    cfg: EsConfig,
+    cfg: EsReadConfig,
     schema: "StructType",
-    read: Optional[EsReadConfig] = None,
 ) -> "DataFrame":
     """Read an ES index into a Spark DataFrame against the caller-declared `schema` (required).
 
     Driver-side (Option A): pulls all matching hits through the driver, coerces each to `schema`
     via the documented inverse transforms, and returns `spark.createDataFrame(rows, schema)`. Use
     for bounded reads; the distributed reader is future work (see READ_DESIGN.md).
+
+    `cfg` is an EsReadConfig carrying the connection, source `index`, optional `query` (raw ES DSL),
+    and paging. The Spark `schema` is required — v0.4.0 does no mapping inference (several write
+    transforms are one-way and can't be inverted from _source without the declared type).
     """
     from pyspark.sql.types import StructType
 
@@ -123,17 +110,16 @@ def read_index(
         raise ValueError("read_index requires a non-empty Spark StructType schema (v0.4.0 has no "
                          "mapping inference — declare the schema explicitly)")
     if not cfg.index:
-        raise ValueError("EsConfig.index is required to read")
+        raise ValueError("EsReadConfig.index is required to read")
 
-    read = read or EsReadConfig()
-    query = read.query or {"match_all": {}}
+    query = cfg.query or {"match_all": {}}
     field_tokens = _schema_field_tokens(schema)
 
     from elasticsearch import Elasticsearch
     es = Elasticsearch(**cfg.client_kwargs())
 
     rows = [
-        _coerce_hit(h.get("_source", {}), h.get("_id"), field_tokens, cfg.id_field, read.include_id)
-        for h in _scroll_hits(es, cfg.index, query, read.batch_size, read.pit_keep_alive)
+        _coerce_hit(h.get("_source", {}), h.get("_id"), field_tokens, cfg.id_field, cfg.include_id)
+        for h in _scroll_hits(es, cfg.index, query, cfg.batch_size, cfg.pit_keep_alive)
     ]
     return spark.createDataFrame(rows, schema)

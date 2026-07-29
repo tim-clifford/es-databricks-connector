@@ -17,7 +17,7 @@ import json, base64, datetime, requests, urllib3
 urllib3.disable_warnings()
 from decimal import Decimal
 from dbx_test import NotebookTestFixture, run_notebook_tests
-from databricks_es_connector import EsConfig, EsReadConfig, bulk_write, read_index
+from databricks_es_connector import EsWriteConfig, EsReadConfig, bulk_write, read_index
 from pyspark.sql.types import (
     StructType, StructField, StringType, BooleanType, LongType, IntegerType, DoubleType,
     DecimalType, DateType, TimestampType, BinaryType, ArrayType,
@@ -54,8 +54,11 @@ class TestReadRoundtrip(NotebookTestFixture):
     """write(df) then read_index(df.schema) reproduces the original rows, modulo documented deltas."""
 
     def run_setup(self):
-        self.write_cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
-                                  index=INDEX, id_field="doc_id", http_compress=True)
+        self.write_cfg = EsWriteConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
+                                       index=INDEX, id_field="doc_id", http_compress=True)
+        # Read config shares the same connection; carries the source index + paging.
+        self.read_cfg = EsReadConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
+                                     index=INDEX, id_field="doc_id", batch_size=100)
 
         # Explicit CASTs so the source column TYPES match SCHEMA exactly.
         self.src = spark.sql("""
@@ -89,7 +92,7 @@ class TestReadRoundtrip(NotebookTestFixture):
         requests.post(f"{ES_HOSTS}/{INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
 
         # Read back with the SAME schema via the driver-side reader.
-        self.out = read_index(spark, self.write_cfg, SCHEMA, read=EsReadConfig(batch_size=100))
+        self.out = read_index(spark, self.read_cfg, SCHEMA)
         # Collect both sides into {doc_id: Row.asDict()} for order-independent comparison.
         self.src_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.src.collect()}
         self.out_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.out.collect()}
