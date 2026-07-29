@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.3.1)
+# Production Readiness / Known Limitations (0.4.0)
 
 `databricks-es-connector` 0.1.0 proves the **mechanism**: serverless Databricks can bulk-write
 to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -78,6 +78,27 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   doc already in ES, but committed in a *later* batch, can clobber the newer doc. The memory-free
   fix is ES external versioning (`version` = `event_ts` epoch-millis, `version_type=external_gte`),
   deferred to keep the 0.2.0 API surface minimal.
+
+## Open items — read path (`read_index`, shipped 0.4.0)
+
+- **Explicit schema required; no mapping inference.** `read_index` requires the caller to declare a
+  Spark `StructType`. This is deliberate — several write transforms are one-way (epoch-millis,
+  decimal→float, base64, variant/interval→string) and can't be inverted from `_source` alone. A
+  best-effort `GET /_mapping` inference for the unambiguous types is a candidate for a later version,
+  but must never silently guess the ambiguous ones.
+- **PIT keep-alive must cover the whole downstream job.** `read_index` returns a *lazy* distributed
+  DataFrame, so its Point-in-Time snapshot can't be driver-closed (that would kill the still-lazy
+  read); it expires via `pit_keep_alive`. If a downstream job runs longer than that window, slices
+  read late will fail with an expired-PIT error. Set `pit_keep_alive` generously, or use
+  `read_index_collect` (bounded, driver-side, closes its PIT explicitly) for small reads. No
+  automatic PIT renewal yet.
+- **No Spark predicate/column pushdown.** v0.4.0 accepts a raw ES query DSL dict (`EsReadConfig.query`)
+  for server-side filtering, but does not translate Spark `.filter(...)`/`.select(...)` into ES
+  queries. A caller wanting pushdown must express it as the raw query. A proper Spark `DataSource`
+  with pushdown is out of scope (and blocked on serverless anyway).
+- **Read throughput not yet benchmarked.** The sliced-scroll fan-out is proven correct (all docs,
+  once, across shards) but has no throughput/large-index benchmark. `num_slices` defaults to the
+  shard count; the optimal slice count and `batch_size` for a large export are untuned.
 
 ## Open items — packaging & portability
 
