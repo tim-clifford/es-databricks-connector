@@ -11,6 +11,8 @@ from .transform import to_es_source, coerce_value
 from .bulk import bulk_write, make_partition_writer
 from .stream import make_foreach_batch
 from .spark_prep import sanitize_for_arrow
+from .read import read_index, EsReadConfig
+from .read_transform import read_coerce
 
 __all__ = [
     "EsConfig",
@@ -20,6 +22,9 @@ __all__ = [
     "make_partition_writer",
     "make_foreach_batch",
     "sanitize_for_arrow",
+    "read_index",
+    "EsReadConfig",
+    "read_coerce",
 ]
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
