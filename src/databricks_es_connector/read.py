@@ -10,8 +10,8 @@ differs.
                            `spark.range(num_slices).mapInPandas(...)`, one task per PIT slice, each
                            task building its own ES client and paging its slice with `search_after`.
                            Serverless-safe (same mechanism as the write path); data stays distributed
-                           (never collected to the driver). The returned DataFrame is lazy, so the
-                           PIT is left to expire via `pit_keep_alive` (see read_index docstring). For
+                           (never collected to the driver). The returned DataFrame is lazy; the PIT is
+                           self-extended by each page's `keep_alive` (see read_index docstring). For
                            full-index export.
   - `read_index_collect` — DRIVER-SIDE (Option A). Pages the whole index through the driver and
                            `createDataFrame`s the result. No executors involved. For bounded reads
@@ -215,10 +215,17 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
 
     PIT lifecycle: the returned DataFrame is LAZY — Spark reads each slice when an action runs, not
     when this function returns. So we do NOT close the PIT here (a `finally` close would kill it
-    before evaluation); it is left to expire via `pit_keep_alive`. **Set `pit_keep_alive` long enough
-    to cover the whole downstream job** (the snapshot must outlive the last action that reads it).
-    This is a deliberate trade-off: keeping the read distributed means the PIT can't be
-    driver-closed. For small reads where an explicit close is preferable, use `read_index_collect`.
+    before evaluation); it is left to expire via `pit_keep_alive`. Crucially, `pit_keep_alive` is a
+    SLIDING window, not a total budget: `_slice_hits` re-sends it on every page and follows the
+    refreshed `pit_id`, so each read resets the PIT's expiry (per the ES PIT API — the value "just
+    needs to be long enough for the next request"). It therefore only has to cover the longest gap
+    between consecutive touches of the PIT, NOT the whole job:
+      - the open-PIT -> first-page gap (the read is lazy, so Spark may not schedule the tasks
+        immediately, plus serverless executor cold-start), and
+      - the largest gap between pages if a slow downstream consumer applies backpressure.
+    The default (5m) covers a normal scheduling gap; raise it only if one of those gaps is longer.
+    Keeping the read distributed is why the PIT can't be driver-closed; for small reads where an
+    explicit close is preferable, use `read_index_collect`.
 
     For small/bounded reads, `read_index_collect` (driver-side, no executors) is simpler.
     """

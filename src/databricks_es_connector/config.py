@@ -112,7 +112,14 @@ class EsReadConfig(EsConnection):
     query: Optional[dict] = None            # raw ES query DSL; None => match_all. No Spark pushdown in v1.
     num_slices: Optional[int] = None        # distributed-reader parallelism (None => shard count)
     batch_size: int = 1000                  # docs per scroll/PIT page
-    pit_keep_alive: str = "1m"              # Point-in-Time lifetime
+    # Point-in-Time lifetime. This is a SLIDING window, not a total budget: every page request
+    # re-sends keep_alive and resets the PIT's clock (verified against the ES PIT API), so it only
+    # has to cover the longest gap between consecutive touches of the PIT, not the whole job. The
+    # binding gap for read_index is open-PIT -> first executor page (the DataFrame is lazy, so Spark
+    # may not schedule the read tasks immediately, and serverless executor cold-start adds to it).
+    # Default 5m gives that gap headroom; raise it if a slow downstream consumer stretches the gap
+    # between pages. See read_index's docstring.
+    pit_keep_alive: str = "5m"
     include_id: bool = True                 # expose ES _id when the schema declares the id_field
 
     def __post_init__(self):

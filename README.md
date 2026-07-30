@@ -237,7 +237,7 @@ cfg = EsReadConfig(
     index="my-index",
     id_field="doc_id",               # filled from the ES _id if absent from _source
     query={"term": {"region": "us"}},  # optional raw ES query DSL; omit for match_all
-    pit_keep_alive="5m",             # must outlive the whole downstream job (see note)
+    pit_keep_alive="5m",             # sliding window: covers the gap between PIT touches, not the whole job (see note)
 )
 df = read_index(spark, cfg, schema)  # distributed: one Spark task per shard/slice
 ```
@@ -247,10 +247,15 @@ consistent snapshot, then fans out `spark.range(num_slices).mapInPandas(...)` �
 slice (defaulting to the index's shard count), each task paging its slice with `search_after`. The
 data stays across executors (never collected to the driver), so it scales for full-index export.
 
-- **PIT lifetime matters.** The returned DataFrame is **lazy** — Spark reads each slice when an
-  action runs, so the snapshot must outlive the whole downstream job. Set `pit_keep_alive`
-  accordingly (it can't be closed on the driver without killing the still-lazy read). The PIT
-  expires on its own after that window.
+- **PIT lifetime is a sliding window, not a total budget.** The returned DataFrame is **lazy** —
+  Spark reads each slice when an action runs, not when `read_index` returns. Every page request
+  re-sends `pit_keep_alive` and resets the Point-in-Time's expiry, so `pit_keep_alive` only has to
+  cover the longest gap *between* consecutive reads of the PIT, not the whole job's wall-clock: the
+  open-PIT-to-first-page gap (the read is lazy, so Spark may schedule the tasks late, plus
+  serverless executor cold-start) and any gap between pages if a slow consumer applies backpressure.
+  The `5m` default covers a normal scheduling gap; raise it only if one of those gaps runs longer.
+  (The PIT can't be closed on the driver without killing the still-lazy read, so it's left to expire
+  on its own once reads stop touching it.)
 - **For small/bounded reads** (lookups, reference data), `read_index_collect(spark, cfg, schema)`
   is a simpler driver-side variant: it pages the whole result through the driver and closes its PIT
   explicitly. No executors. Same values, same required schema.
@@ -361,7 +366,7 @@ cross-batch ordering caveat.
 | `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read (e.g. `{"term": {...}}`). `None` = `match_all`. v1 accepts a raw DSL dict only — no Spark-predicate pushdown. |
 | `num_slices` | `int \| None` | `None` | No | Parallelism for the distributed read. `None` defaults to the index's shard count. One slice per Spark task. |
 | `batch_size` | `int` | `1000` | No | Docs per scroll/PIT page. Must be positive. |
-| `pit_keep_alive` | `str` | `"1m"` | No | Point-in-Time lifetime. For `read_index` (lazy), set this long enough to cover the whole downstream job — see below. |
+| `pit_keep_alive` | `str` | `"5m"` | No | Point-in-Time lifetime, as a **sliding window** — each page re-sends it and resets the PIT's expiry, so it need only cover the longest gap between consecutive reads of the PIT (for `read_index`, the lazy open-to-first-page scheduling gap), not the whole job. See the Reading section. |
 | `include_id` | `bool` | `True` | No | Expose the ES `_id` via the `id_field` column when the schema declares it. |
 
 ## Datatype coverage (write transforms + read inverse)

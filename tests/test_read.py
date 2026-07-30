@@ -23,7 +23,7 @@ def _rcfg(**kw):
 def test_read_config_defaults():
     c = _rcfg()
     assert c.query is None and c.num_slices is None
-    assert c.batch_size == 1000 and c.pit_keep_alive == "1m" and c.include_id is True
+    assert c.batch_size == 1000 and c.pit_keep_alive == "5m" and c.include_id is True
     assert "hosts" in c.client_kwargs()   # connection fields are shared from EsConnection
 
 def test_read_config_requires_hosts():
@@ -245,6 +245,21 @@ def test_slice_hits_follows_refreshed_pit_id():
     list(_slice_hits(es, "pit-1", {"match_all": {}}, 500, "1m"))
     assert es.calls[0]["pit"]["id"] == "pit-1"   # first uses the opened id
     assert es.calls[1]["pit"]["id"] == "pit-2"   # second uses the refreshed id
+
+
+def test_slice_hits_resends_keep_alive_on_every_page():
+    # The lazy-read PIT lifecycle documents `pit_keep_alive` as a SLIDING window: it need only cover
+    # the gap between consecutive reads, NOT the whole job, BECAUSE every page re-sends keep_alive
+    # and so resets the PIT's expiry. Guard that contract — a regression that sent keep_alive only on
+    # the first page (or dropped it after the initial open) would silently make the PIT expire
+    # mid-read under exactly the lazy/backpressure conditions the docs say are safe.
+    from databricks_es_connector.read import _slice_hits
+    es = _FakeSearchES([_page("a"), _page("b"), _page("c"), _page()])  # 3 data pages + terminator
+    list(_slice_hits(es, "pit-1", {"match_all": {}}, 500, "7m"))
+    # Every search call, first, middle, and the empty terminating one, carries keep_alive.
+    assert len(es.calls) == 4
+    for c in es.calls:
+        assert c["pit"]["keep_alive"] == "7m", c
 
 
 # --- entry-point orchestration + PIT lifecycle (fake Spark + stubbed ES) ---------------------
