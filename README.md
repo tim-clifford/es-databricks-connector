@@ -12,7 +12,7 @@ Built because the `elasticsearch-spark` connector cannot run on serverless compu
 (no third-party Spark JARs), has no Spark 4 / DBR 17+ build, and offers no request
 compression. The Python client has none of those limits.
 
-> **Maturity: 0.4.0.** The mechanism is proven for both directions: every valid Spark datatype is
+> **Maturity.** The mechanism is proven for both directions: every valid Spark datatype is
 > exportable with no caller pre-processing (inserts, upserts, deletes), and an index can be read back
 > into a DataFrame against a declared schema with write→read fidelity (see
 > [Read fidelity](#read-fidelity-write--read)). Production hardening items (TLS/CA trust, API-key auth
@@ -22,14 +22,19 @@ compression. The Python client has none of those limits.
 ## Contents
 
 - [Why this shape](#why-this-shape)
-- [Usage (batch)](#usage-batch)
-- [Usage (streaming)](#usage-streaming)
-- [Usage (deletes)](#usage-deletes)
-- [Usage (read)](#usage-read)
-- [Read fidelity (write → read)](#read-fidelity-write--read)
-- [Configuration (`EsWriteConfig` / `EsReadConfig`)](#configuration-eswriteconfig--esreadconfig)
-- [The write result (`bulk_write` return value)](#the-write-result-bulk_write-return-value)
-- [Datatype coverage](#datatype-coverage)
+- [Writing to Elasticsearch](#writing-to-elasticsearch)
+  - [Batch (`bulk_write`)](#batch-bulk_write)
+  - [Streaming (`make_foreach_batch`)](#streaming-make_foreach_batch)
+  - [Deletes](#deletes)
+  - [The write result (`bulk_write` return value)](#the-write-result-bulk_write-return-value)
+- [Reading from Elasticsearch](#reading-from-elasticsearch)
+  - [`read_index` / `read_index_collect`](#read_index--read_index_collect)
+  - [Read fidelity (write → read)](#read-fidelity-write--read)
+- [Configuration](#configuration)
+  - [Connection (shared by both configs)](#connection-shared-by-both-configs)
+  - [Write behavior (`EsWriteConfig`)](#write-behavior-eswriteconfig)
+  - [Read behavior (`EsReadConfig`)](#read-behavior-esreadconfig)
+- [Datatype coverage (write transforms + read inverse)](#datatype-coverage-write-transforms--read-inverse)
   - [Arrow-hostile types: `variant` and `interval`](#arrow-hostile-types-variant-and-interval-handled-automatically)
 - [Developing the library](#developing-the-library)
 - [Distribution](#distribution)
@@ -49,18 +54,21 @@ compression. The Python client has none of those limits.
 - **Schema-agnostic.** Knows nothing about any customer schema or data model — you supply
   the DataFrame and the target index.
 
-## Usage (batch)
+## Writing to Elasticsearch
+
+Write a Spark DataFrame to an index with `bulk_write` (batch) or `make_foreach_batch` (streaming),
+configured with an [`EsWriteConfig`](#write-behavior-eswriteconfig).
+
+### Batch (`bulk_write`)
 
 > **First time in a workspace?** Install the library and create the ES secret scope before
 > running any of the snippets below — see [Deploying to a workspace](#deploying-to-a-workspace).
-> The `EsConfig` examples assume `databricks_es_connector` is importable and secrets exist.
-> (`EsConfig` is the write config; since 0.4.0 its canonical name is `EsWriteConfig` — `EsConfig`
-> remains as an alias. See [Configuration](#configuration-eswriteconfig--esreadconfig).)
+> The examples assume `databricks_es_connector` is importable and secrets exist.
 
 ```python
-from databricks_es_connector import EsConfig, bulk_write
+from databricks_es_connector import EsWriteConfig, bulk_write
 
-cfg = EsConfig(
+cfg = EsWriteConfig(
     hosts="https://es-host:9200",
     api_key=dbutils.secrets.get("es", "api_key"),
     index="my-index",
@@ -72,15 +80,15 @@ cfg = EsConfig(
 result = bulk_write(gold_df, cfg)   # -> {"written": N, "deleted": D, "errors": M, "total_input": T, "error_samples": [...]}
 ```
 
-## Usage (streaming)
+### Streaming (`make_foreach_batch`)
 
 The library exposes `make_foreach_batch(cfg, on_batch=None)`, a `foreachBatch` function that
 bulk-writes each micro-batch:
 
 ```python
-from databricks_es_connector import EsConfig, make_foreach_batch
+from databricks_es_connector import EsWriteConfig, make_foreach_batch
 
-cfg = EsConfig(hosts=..., api_key=..., index=..., id_field="doc_id")
+cfg = EsWriteConfig(hosts=..., api_key=..., index=..., id_field="doc_id")
 (spark.readStream.table("catalog.schema.source_table")
    .writeStream
    .foreachBatch(make_foreach_batch(cfg, on_batch=lambda bid, r: print(bid, r)))
@@ -104,14 +112,14 @@ Notes for serverless:
   **empty** micro-batch (no rows) skips the write and additionally sets `empty: True`; that flag is
   present only on skipped batches, so read it with `result.get("empty")`, not `result["empty"]`.
 
-## Usage (deletes)
+### Deletes
 
 By default the connector only inserts and updates (replace-by-`_id`). To also propagate
 **deletes**, set `has_deletes=True` and name a `delete_flag_column`: rows whose flag is truthy
 are sent to ES as a delete-by-`_id`; all other rows index as usual.
 
 ```python
-cfg = EsConfig(
+cfg = EsWriteConfig(
     hosts=..., api_key=..., index="my-index",
     id_field="doc_id",              # required for deletes — you delete by _id
     has_deletes=True,
@@ -151,7 +159,44 @@ newer doc. If your source can deliver out-of-order events across batches, make `
 authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 `version_type=external_gte`) so ES itself rejects stale writes regardless of batch order.
 
-## Usage (read)
+### The write result (`bulk_write` return value)
+
+`bulk_write` returns a dict summarizing the write:
+
+```python
+{
+  "written": 998,          # index/upsert ops that succeeded
+  "deleted": 0,            # successful delete-by-id ops (non-zero only with has_deletes)
+  "errors": 2,             # docs Elasticsearch rejected (exact count)
+  "total_input": 1000,     # rows handed to the writer
+  "error_samples": [       # bounded diagnostics for rejected docs (up to 20)
+    {"_id": "abc", "op_type": "index", "status": 400,
+     "reason": "failed to parse field [ts] of type [date]"},
+  ],
+}
+```
+
+- **Reconcile with `total_input`.** `written + deleted + errors` should equal `total_input` minus
+  any delete-404 no-ops. If it is **less**, some rows were lost below the per-document level (for
+  example a chunk-level serialization/transport error), which the per-doc `errors` count cannot
+  see — so check this equality if exactness matters.
+- **`error_samples` is a breadcrumb, not a dead-letter queue.** It retains up to the first 20
+  failures (id, op, HTTP status, ES reason) so a failed write is diagnosable instead of an opaque
+  count. The `errors` count is always exact; only the retained sample list is capped, so a batch
+  that fails wholesale can't exhaust memory. If you need every failed row durably, capture them
+  from your own pipeline — the connector does not persist them.
+- **Duplicate `id_field` values collapse — and reconciliation won't flag it.** If `id_field` is
+  set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
+  over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
+  success (`written` counts each op, not each surviving doc), so `written + deleted + errors` still
+  equals `total_input` — the reconciliation identity passes even though the ES doc count is lower.
+  This is the same idempotency that makes replays safe, but if you expect a 1:1 row→document
+  mapping, ensure `id_field` is unique across the input (e.g. dedup upstream) or leave it unset to
+  let ES assign random ids.
+
+## Reading from Elasticsearch
+
+### `read_index` / `read_index_collect`
 
 Read an Elasticsearch index back into a Spark DataFrame. **You must declare the target Spark
 schema** — the reader does not infer it (see [Read fidelity](#read-fidelity-write--read) for why).
@@ -190,11 +235,11 @@ data stays across executors (never collected to the driver), so it scales for fu
   is a simpler driver-side variant: it pages the whole result through the driver and closes its PIT
   explicitly. No executors. Same values, same required schema.
 
-## Read fidelity (write → read)
+### Read fidelity (write → read)
 
 Reads honor the **same contract as writes**: `read_index(cfg, df.schema)` after `bulk_write(df,
 cfg)` reproduces the original DataFrame, **except** the deltas the
-[Datatype coverage](#datatype-coverage) table documents as one-way (decimal precision beyond
+[Datatype coverage](#datatype-coverage-write-transforms--read-inverse) table documents as one-way (decimal precision beyond
 ~15–17 sig figs, sub-millisecond timestamp truncation, float32 widening). Each read coercion is the
 exact inverse of the write transform:
 
@@ -208,25 +253,36 @@ exact inverse of the write transform:
 
 **Why the schema is required:** an epoch-millis integer in `_source` could be a `timestamp`, a
 `date`, or a genuine `long`; a base64 string could be `binary` or a real `keyword`. The stored value
-alone is ambiguous, so the reader must be told the intended type. v0.4.0 has no mapping inference —
+alone is ambiguous, so the reader must be told the intended type. There is no mapping inference —
 declare the schema explicitly. (ES also has no array type: a field declared `array<T>` is read as a
 list even if ES returned a scalar.)
 
-## Configuration (`EsWriteConfig` / `EsReadConfig`)
+## Configuration
 
-Configuration lives in three frozen, serializable dataclasses in
-`src/databricks_es_connector/config.py`, so they can be shipped to Spark executors (the
-Elasticsearch client is built *inside* each partition, never on the driver):
+**You always create one of two config objects**, depending on the direction:
 
-- **`EsConnection`** — the shared connection + client tuning base (hosts, auth, TLS, timeouts, gzip).
-- **`EsWriteConfig(EsConnection)`** — connection + write behavior. Used by `bulk_write` /
-  `make_foreach_batch`.
-- **`EsReadConfig(EsConnection)`** — connection + read behavior. Used by `read_index`.
+- **`EsWriteConfig`** — for `bulk_write` / `make_foreach_batch`.
+- **`EsReadConfig`** — for `read_index` / `read_index_collect`.
 
-> **`EsConfig` is a backward-compatible alias for `EsWriteConfig`** (its name before 0.4.0), so
-> existing write code keeps working unchanged. New code should name the config explicitly.
+Both are frozen, serializable dataclasses (in `src/databricks_es_connector/config.py`) so they can
+be shipped to Spark executors — the Elasticsearch client is built *inside* each partition, never on
+the driver. Each one takes the same **connection fields** (hosts, auth, TLS, client tuning) plus the
+fields specific to its direction. So a config is `connection + write behavior` or
+`connection + read behavior`; the three tables below split exactly along that line.
 
-**Connection** (shared by `EsWriteConfig` and `EsReadConfig`)
+> **Where `EsConnection` fits:** the shared connection fields are defined once on a base class,
+> `EsConnection`, that `EsWriteConfig` and `EsReadConfig` both inherit. **You never instantiate
+> `EsConnection` directly** — it has no `index` and issues no requests; it exists only so the
+> connection fields aren't duplicated across the two real configs. Pass those fields straight to
+> `EsWriteConfig` / `EsReadConfig`.
+
+> **`EsConfig` is a backward-compatible alias for `EsWriteConfig`** (its name before the config
+> split), so existing write code keeps working unchanged. New code should use `EsWriteConfig`.
+
+### Connection (shared by both configs)
+
+These fields are defined on the `EsConnection` base and accepted by both `EsWriteConfig` and
+`EsReadConfig`.
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
@@ -244,7 +300,9 @@ Elasticsearch client is built *inside* each partition, never on the driver):
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
 raises (pick one).
 
-**Write behavior** (`EsWriteConfig`)
+### Write behavior (`EsWriteConfig`)
+
+`EsWriteConfig` = the connection fields above **plus** these write-specific fields.
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
@@ -275,10 +333,12 @@ an expected no-op (not an error) — so checkpoint replays, filtered rows, and r
 stay clean. This suppression is scoped strictly to `delete` + `404`; a 404 on an index, or any
 other status on a delete, is still counted in `errors`.
 
-See [Usage (deletes)](#usage-deletes) above for the recommended Change-Data-Feed pattern and the
+See [Deletes](#deletes) above for the recommended Change-Data-Feed pattern and the
 cross-batch ordering caveat.
 
-**Read behavior** (`EsReadConfig`)
+### Read behavior (`EsReadConfig`)
+
+`EsReadConfig` = the connection fields above **plus** these read-specific fields.
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
@@ -290,42 +350,11 @@ cross-batch ordering caveat.
 | `pit_keep_alive` | `str` | `"1m"` | No | Point-in-Time lifetime. For `read_index` (lazy), set this long enough to cover the whole downstream job — see below. |
 | `include_id` | `bool` | `True` | No | Expose the ES `_id` via the `id_field` column when the schema declares it. |
 
-## The write result (`bulk_write` return value)
+## Datatype coverage (write transforms + read inverse)
 
-`bulk_write` returns a dict summarizing the write:
-
-```python
-{
-  "written": 998,          # index/upsert ops that succeeded
-  "deleted": 0,            # successful delete-by-id ops (non-zero only with has_deletes)
-  "errors": 2,             # docs Elasticsearch rejected (exact count)
-  "total_input": 1000,     # rows handed to the writer
-  "error_samples": [       # bounded diagnostics for rejected docs (up to 20)
-    {"_id": "abc", "op_type": "index", "status": 400,
-     "reason": "failed to parse field [ts] of type [date]"},
-  ],
-}
-```
-
-- **Reconcile with `total_input`.** `written + deleted + errors` should equal `total_input` minus
-  any delete-404 no-ops. If it is **less**, some rows were lost below the per-document level (for
-  example a chunk-level serialization/transport error), which the per-doc `errors` count cannot
-  see — so check this equality if exactness matters.
-- **`error_samples` is a breadcrumb, not a dead-letter queue.** It retains up to the first 20
-  failures (id, op, HTTP status, ES reason) so a failed write is diagnosable instead of an opaque
-  count. The `errors` count is always exact; only the retained sample list is capped, so a batch
-  that fails wholesale can't exhaust memory. If you need every failed row durably, capture them
-  from your own pipeline — the connector does not persist them.
-- **Duplicate `id_field` values collapse — and reconciliation won't flag it.** If `id_field` is
-  set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
-  over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
-  success (`written` counts each op, not each surviving doc), so `written + deleted + errors` still
-  equals `total_input` — the reconciliation identity passes even though the ES doc count is lower.
-  This is the same idempotency that makes replays safe, but if you expect a 1:1 row→document
-  mapping, ensure `id_field` is unique across the input (e.g. dedup upstream) or leave it unset to
-  let ES assign random ids.
-
-## Datatype coverage
+This table is the **write** transform (Spark → ES `_source`); the
+[Read fidelity](#read-fidelity-write--read) table above is its inverse (ES `_source` → Spark) and
+lists which of these transforms are one-way. Both directions share this one contract.
 
 Every valid Spark column can be exported with **no caller pre-processing** — hand `bulk_write` any
 DataFrame. Values are transformed on the way to Elasticsearch as follows. These transforms are
@@ -454,7 +483,7 @@ Then install it in a notebook and restart Python:
 ```
 
 For customer hand-off, share the same `.whl` via a UC Volume in their workspace or
-through Delta Share — no code changes, only the `EsConfig` endpoint/auth differ.
+through Delta Share — no code changes, only the `EsWriteConfig` / `EsReadConfig` endpoint/auth differ.
 
 ## Repo layout
 

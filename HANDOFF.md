@@ -1,6 +1,6 @@
 # Production Readiness / Known Limitations (0.4.0)
 
-`databricks-es-connector` 0.1.0 proves the **mechanism**: serverless Databricks can bulk-write
+`databricks-es-connector` proves the **mechanism**: serverless Databricks can bulk-write
 to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
 deterministic IDs, and every Spark datatype is exportable. This document lists what a production
 customer deployment still needs, so the gaps are explicit rather than assumed.
