@@ -45,14 +45,30 @@ compression. The Python client has none of those limits.
 
 ## Why this shape
 
-- **Serverless works.** Uses `mapInPandas`, not RDD APIs (`foreachPartition` is blocked
-  on serverless). Throughput still scales across executors.
+**Shared by both directions:**
+
+- **Serverless works.** Both the write and the read path use `mapInPandas`, not RDD APIs
+  (`foreachPartition` and custom `DataSource`/RDD readers are blocked on serverless). Work still
+  fans out across executors — writes partition the DataFrame, reads fan out one task per index slice.
+
+**Writing** (`bulk_write` / `make_foreach_batch`):
+
 - **Egress-minimized.** `http_compress=True` gzips the bulk body (~5–10x on JSON); field
   pruning drops columns you don't need indexed. Both are levers for cross-cloud cost.
 - **Idempotent.** Deterministic `_id` (from a configurable column) means checkpoint
   replays and backfills upsert instead of duplicating.
-- **Schema-agnostic.** Knows nothing about any customer schema or data model — you supply
-  the DataFrame and the target index.
+- **Schema-agnostic on write.** The writer knows nothing about your schema or data model — you
+  hand it any DataFrame and a target index, and every Spark datatype is exportable with no
+  pre-processing (see [Datatype coverage](#datatype-coverage-write-transforms--read-inverse)).
+
+**Reading** (`read_index` / `read_index_collect`):
+
+- **Distributed snapshot read.** One Elasticsearch Point-in-Time gives a consistent snapshot, and a
+  sliced scroll fans out across executors (one task per shard/slice) so a full-index export scales.
+- **Explicit schema required.** Unlike the writer, the reader must be handed a Spark schema — several
+  stored values are ambiguous and can't be inverted from `_source` alone, so the caller declares the
+  intended types. This is the deliberate trade-off for exact write→read fidelity; see
+  [Read fidelity](#read-fidelity-write--read).
 
 ## Writing to Elasticsearch
 
