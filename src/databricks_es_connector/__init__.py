@@ -1,9 +1,15 @@
-"""databricks-es-connector: serverless-safe bulk export from Databricks/Spark to Elasticsearch.
+"""databricks-es-connector: serverless-safe, bi-directional transfer between Databricks/Spark
+and Elasticsearch.
 
-Schema-agnostic. Given a Spark DataFrame and an EsConfig, writes rows to an
-Elasticsearch index via the `elasticsearch-py` client, parallelized across
-executors with `mapInPandas` (serverless-safe; RDD APIs are not used), with
-gzip request compression and deterministic document IDs.
+Write: given a Spark DataFrame and an EsWriteConfig, `bulk_write` writes rows to an
+Elasticsearch index via the `elasticsearch-py` client, parallelized across executors with
+`mapInPandas` (serverless-safe; RDD APIs are not used), with gzip request compression and
+deterministic document IDs. Schema-agnostic on write — every Spark datatype is exportable
+with no caller pre-processing.
+
+Read: given an EsReadConfig and a declared Spark schema, `read_index` pulls an index back into
+a DataFrame, distributed across executors via a sliced Point-in-Time scroll (same `mapInPandas`
+mechanism). The read schema is required (no mapping inference).
 """
 
 from .config import EsConnection, EsWriteConfig, EsReadConfig, EsConfig
