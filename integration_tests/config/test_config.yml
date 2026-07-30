@@ -19,7 +19,10 @@ cluster:
   libraries:
     - whl: "/Volumes/tim_clifford_classic_dsl_lite_catalog/es_poc/artifacts/databricks_es_connector-0.4.0-py3-none-any.whl"
     - pypi:
-        package: "git+https://github.com/jsparhamii/dbx_test.git"
+        # Pinned to the commit that fixed no-arg run_notebook_tests() fixture discovery
+        # (dbx_test PR #4). Before that fix, no-arg discovery found zero fixtures and "failed
+        # green" — the fixtures now rely on the no-arg form, so this floor guarantees the fix.
+        package: "git+https://github.com/jsparhamii/dbx_test.git@fa08c2c39f9873ba4b263aa309f3ff70fc880561"
     # dbx_test imports pytest at import time (pytest_compat), and serverless has no pytest
     # by default — install it into the inline environment.
     - pypi:

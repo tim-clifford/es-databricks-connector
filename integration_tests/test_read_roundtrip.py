@@ -185,5 +185,5 @@ class TestReadRoundtrip(NotebookTestFixture):
 
 
 # COMMAND ----------
-# Explicit fixture class (no-arg auto-discovery finds nothing through the wrapper).
-dbutils.notebook.exit(json.dumps(run_notebook_tests(TestReadRoundtrip)))
+# Auto-discovers the fixture class in this notebook's scope.
+dbutils.notebook.exit(json.dumps(run_notebook_tests()))

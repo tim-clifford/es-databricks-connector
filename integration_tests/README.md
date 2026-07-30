@@ -71,7 +71,7 @@ and drops its own throwaway index/table/checkpoint.
 ```bash
 # from the connector repo root
 pip install -e ".[dev]"
-pip install git+https://github.com/jsparhamii/dbx_test.git
+pip install "git+https://github.com/jsparhamii/dbx_test.git@fa08c2c39f9873ba4b263aa309f3ff70fc880561"
 
 # upload the fixtures to a workspace path, then:
 dbx_test run \
@@ -85,9 +85,9 @@ runs each fixture as a notebook, and reports console + JUnit + JSON results (JUn
 
 ## Notes on the dbx_test dependency
 
-- Install from `main` (`git+https://github.com/jsparhamii/dbx_test.git`).
-- Each fixture ends with `run_notebook_tests(<TheFixtureClass>)`, passing the class **explicitly**.
-  The no-argument form auto-discovers via a frame walk that doesn't reach the notebook's globals
-  through the wrapper, so it silently finds zero fixtures and reports a hollow pass. Always name the
-  class.
+- Pinned to commit `fa08c2c` (dbx_test PR #4). That commit fixed no-arg `run_notebook_tests()`
+  fixture discovery — before it, the no-arg form walked a hardcoded stack frame that missed the
+  notebook's globals, found zero fixtures, and reported a hollow "green" pass. The fixtures now use
+  the documented no-arg `run_notebook_tests()` form, so the pin is a hard floor guaranteeing the fix
+  is present. Bump the pin deliberately when adopting a newer dbx_test.
 
