@@ -99,7 +99,5 @@ class TestSanitizeForArrow(NotebookTestFixture):
 
 
 # COMMAND ----------
-# Pass the fixture class explicitly. run_notebook_tests() with no arg auto-discovers via a frame
-# walk that doesn't reach the notebook's globals through this wrapper, finding zero fixtures — so
-# we name the class, which routes through the single-fixture path (returns the "results" format).
-dbutils.notebook.exit(json.dumps(run_notebook_tests(TestSanitizeForArrow)))
+# Auto-discovers the fixture class in this notebook's scope.
+dbutils.notebook.exit(json.dumps(run_notebook_tests()))

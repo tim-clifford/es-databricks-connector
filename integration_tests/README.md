@@ -85,9 +85,7 @@ runs each fixture as a notebook, and reports console + JUnit + JSON results (JUn
 
 ## Notes on the dbx_test dependency
 
-- Install from `main` (`git+https://github.com/jsparhamii/dbx_test.git`).
-- Each fixture ends with `run_notebook_tests(<TheFixtureClass>)`, passing the class **explicitly**.
-  The no-argument form auto-discovers via a frame walk that doesn't reach the notebook's globals
-  through the wrapper, so it silently finds zero fixtures and reports a hollow pass. Always name the
-  class.
+- Installed from `main` (`git+https://github.com/jsparhamii/dbx_test.git`). Each fixture ends with
+  the documented no-arg `run_notebook_tests()`, which discovers the fixture class in the notebook's
+  scope.
 

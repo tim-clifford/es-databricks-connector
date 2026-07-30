@@ -260,3 +260,44 @@ def test_merge_concatenates_and_caps_samples():
 def test_merge_empty_is_all_zero():
     out = _merge_partition_results([])
     assert out == {"written": 0, "deleted": 0, "errors": 0, "total_input": 0, "error_samples": []}
+
+
+# --- bulk_write orchestration wiring (fake Spark; symmetry with read_index's unit test) --------
+# bulk_write is linear glue: sanitize_for_arrow(df) -> df.mapInPandas(writer, schema).collect() ->
+# _merge_partition_results. Real Arrow/Spark behavior is covered live in the integration tier; here
+# we only assert the wiring — sanitize is applied, the mapInPandas result schema is the 5-field
+# contract, and the collected partition rows are merged into the final dict.
+
+def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
+    import databricks_es_connector.bulk as bulk_mod
+
+    sanitized = {"marker": "post-sanitize"}
+    captured = {}
+
+    class _FakeDF:
+        def mapInPandas(self, writer, schema):
+            captured["writer"] = writer
+            captured["schema"] = schema
+            # Stand-in for the per-partition summary rows collect() would return.
+            class _Mapped:
+                def collect(self_inner):
+                    return [_prow(written=4, total_input=5, errors=1,
+                                  samples=[{"_id": "b", "op_type": "index", "status": 400,
+                                            "reason": "boom"}])]
+            return _Mapped()
+
+    # sanitize_for_arrow is Spark-side; stub it to return our fake DF and prove it's applied first.
+    def _fake_sanitize(df):
+        captured["sanitized_in"] = df
+        return _FakeDF()
+    monkeypatch.setattr(bulk_mod, "sanitize_for_arrow", _fake_sanitize)
+
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="doc_id")
+    out = bulk_mod.bulk_write("original-df", cfg)
+
+    assert captured["sanitized_in"] == "original-df"       # sanitize applied to the caller's df
+    assert captured["schema"] == \
+        "written long, deleted long, errors long, total_input long, error_samples string"
+    # The collected partition rows are merged into the final result dict.
+    assert out["written"] == 4 and out["errors"] == 1 and out["total_input"] == 5
+    assert out["error_samples"][0]["_id"] == "b"

@@ -1,20 +1,42 @@
 # databricks-es-connector
 
-Serverless-safe bulk export from Databricks/Spark to Elasticsearch.
+Serverless-safe, bi-directional transfer between Databricks/Spark and Elasticsearch.
 
-Schema-agnostic Python library: given a Spark DataFrame and an `EsConfig`, it writes
-rows to an Elasticsearch index via the `elasticsearch-py` client, parallelized
-across executors with `mapInPandas` (serverless-safe), with gzip request compression
-and deterministic document IDs for idempotent upserts.
+Schema-agnostic Python library. **Write:** given a Spark DataFrame and an `EsWriteConfig`, it writes
+rows to an Elasticsearch index via the `elasticsearch-py` client, parallelized across executors with
+`mapInPandas` (serverless-safe), with gzip request compression and deterministic document IDs for
+idempotent upserts. **Read:** given an `EsReadConfig` and a declared Spark schema, `read_index` pulls
+an index back into a DataFrame, distributed across executors via a sliced Point-in-Time scroll.
 
 Built because the `elasticsearch-spark` connector cannot run on serverless compute
 (no third-party Spark JARs), has no Spark 4 / DBR 17+ build, and offers no request
 compression. The Python client has none of those limits.
 
-> **Maturity: 0.3.0.** The mechanism is proven and every valid Spark datatype is exportable with no
-> caller pre-processing; inserts, upserts, and deletes are supported. Production hardening items (TLS/CA trust,
-> API-key auth worked example, FIPS/FedRAMP, error dead-lettering, index templates/ILM) are not yet
-> built. See [HANDOFF.md](HANDOFF.md) for the known limitations and pre-production checklist.
+> **Maturity: 0.4.0.** The mechanism is proven for both directions: every valid Spark datatype is
+> exportable with no caller pre-processing (inserts, upserts, deletes), and an index can be read back
+> into a DataFrame against a declared schema with write→read fidelity (see
+> [Read fidelity](#read-fidelity-write--read)). Production hardening items (TLS/CA trust, API-key auth
+> worked example, FIPS/FedRAMP, error dead-lettering, index templates/ILM) are not yet built. See
+> [HANDOFF.md](HANDOFF.md) for the known limitations and pre-production checklist.
+
+## Contents
+
+- [Why this shape](#why-this-shape)
+- [Usage (batch)](#usage-batch)
+- [Usage (streaming)](#usage-streaming)
+- [Usage (deletes)](#usage-deletes)
+- [Usage (read)](#usage-read)
+- [Read fidelity (write → read)](#read-fidelity-write--read)
+- [Configuration (`EsWriteConfig` / `EsReadConfig`)](#configuration-eswriteconfig--esreadconfig)
+- [The write result (`bulk_write` return value)](#the-write-result-bulk_write-return-value)
+- [Datatype coverage](#datatype-coverage)
+  - [Arrow-hostile types: `variant` and `interval`](#arrow-hostile-types-variant-and-interval-handled-automatically)
+- [Developing the library](#developing-the-library)
+- [Distribution](#distribution)
+  - [Dependencies](#dependencies)
+  - [Building the wheel](#building-the-wheel)
+  - [Deploying to a workspace](#deploying-to-a-workspace)
+- [Repo layout](#repo-layout)
 
 ## Why this shape
 
@@ -32,6 +54,8 @@ compression. The Python client has none of those limits.
 > **First time in a workspace?** Install the library and create the ES secret scope before
 > running any of the snippets below — see [Deploying to a workspace](#deploying-to-a-workspace).
 > The `EsConfig` examples assume `databricks_es_connector` is importable and secrets exist.
+> (`EsConfig` is the write config; since 0.4.0 its canonical name is `EsWriteConfig` — `EsConfig`
+> remains as an alias. See [Configuration](#configuration-eswriteconfig--esreadconfig).)
 
 ```python
 from databricks_es_connector import EsConfig, bulk_write
@@ -127,14 +151,82 @@ newer doc. If your source can deliver out-of-order events across batches, make `
 authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 `version_type=external_gte`) so ES itself rejects stale writes regardless of batch order.
 
-## Configuration (`EsConfig`)
+## Usage (read)
 
-Every knob for both batch and streaming lives on the `EsConfig` dataclass
-(`src/databricks_es_connector/config.py`). It is frozen and serializable so it can be shipped
-to Spark executors; the Elasticsearch client is built from it *inside* each partition, never on
-the driver.
+Read an Elasticsearch index back into a Spark DataFrame. **You must declare the target Spark
+schema** — the reader does not infer it (see [Read fidelity](#read-fidelity-write--read) for why).
 
-**Connection**
+```python
+from databricks_es_connector import EsReadConfig, read_index
+from pyspark.sql.types import StructType, StructField, StringType, TimestampType, LongType
+
+schema = StructType([
+    StructField("doc_id", StringType()),
+    StructField("event_ts", TimestampType()),   # stored as epoch-millis, read back as timestamp
+    StructField("n", LongType()),
+])
+
+cfg = EsReadConfig(
+    hosts="https://es-host:9200",
+    api_key=dbutils.secrets.get("es", "api_key"),
+    index="my-index",
+    id_field="doc_id",               # filled from the ES _id if absent from _source
+    query={"term": {"region": "us"}},  # optional raw ES query DSL; omit for match_all
+    pit_keep_alive="5m",             # must outlive the whole downstream job (see note)
+)
+df = read_index(spark, cfg, schema)  # distributed: one Spark task per shard/slice
+```
+
+**`read_index` is distributed** and serverless-safe: it opens one Elasticsearch Point-in-Time for a
+consistent snapshot, then fans out `spark.range(num_slices).mapInPandas(...)` — one task per PIT
+slice (defaulting to the index's shard count), each task paging its slice with `search_after`. The
+data stays across executors (never collected to the driver), so it scales for full-index export.
+
+- **PIT lifetime matters.** The returned DataFrame is **lazy** — Spark reads each slice when an
+  action runs, so the snapshot must outlive the whole downstream job. Set `pit_keep_alive`
+  accordingly (it can't be closed on the driver without killing the still-lazy read). The PIT
+  expires on its own after that window.
+- **For small/bounded reads** (lookups, reference data), `read_index_collect(spark, cfg, schema)`
+  is a simpler driver-side variant: it pages the whole result through the driver and closes its PIT
+  explicitly. No executors. Same values, same required schema.
+
+## Read fidelity (write → read)
+
+Reads honor the **same contract as writes**: `read_index(cfg, df.schema)` after `bulk_write(df,
+cfg)` reproduces the original DataFrame, **except** the deltas the
+[Datatype coverage](#datatype-coverage) table documents as one-way (decimal precision beyond
+~15–17 sig figs, sub-millisecond timestamp truncation, float32 widening). Each read coercion is the
+exact inverse of the write transform:
+
+| Declared Spark type | Stored in ES | Read back as |
+|---|---|---|
+| `timestamp` / `date` | epoch-millis integer | `datetime` / `date` (UTC) |
+| `binary` | base64 string | `bytes` |
+| `decimal(p,s)` | float | `Decimal` (precision already lost on write) |
+| `variant` / `interval` | JSON / interval string | string (re-parse with `parse_json` yourself) |
+| scalars / `struct` / `array` / `map` | same shape | same, recursively |
+
+**Why the schema is required:** an epoch-millis integer in `_source` could be a `timestamp`, a
+`date`, or a genuine `long`; a base64 string could be `binary` or a real `keyword`. The stored value
+alone is ambiguous, so the reader must be told the intended type. v0.4.0 has no mapping inference —
+declare the schema explicitly. (ES also has no array type: a field declared `array<T>` is read as a
+list even if ES returned a scalar.)
+
+## Configuration (`EsWriteConfig` / `EsReadConfig`)
+
+Configuration lives in three frozen, serializable dataclasses in
+`src/databricks_es_connector/config.py`, so they can be shipped to Spark executors (the
+Elasticsearch client is built *inside* each partition, never on the driver):
+
+- **`EsConnection`** — the shared connection + client tuning base (hosts, auth, TLS, timeouts, gzip).
+- **`EsWriteConfig(EsConnection)`** — connection + write behavior. Used by `bulk_write` /
+  `make_foreach_batch`.
+- **`EsReadConfig(EsConnection)`** — connection + read behavior. Used by `read_index`.
+
+> **`EsConfig` is a backward-compatible alias for `EsWriteConfig`** (its name before 0.4.0), so
+> existing write code keeps working unchanged. New code should name the config explicitly.
+
+**Connection** (shared by `EsWriteConfig` and `EsReadConfig`)
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
@@ -143,22 +235,22 @@ the driver.
 | `basic_auth` | `tuple \| None` | `None` | one-of\* | `("user", "pass")`. Sandbox/dev only; prefer `api_key` in prod. |
 | `verify_certs` | `bool` | `True` | No | Set `False` for self-signed sandbox boxes. Library default is secure. |
 | `ca_certs` | `str \| None` | `None` | No | Path to a CA bundle when pinning. Mutually exclusive with `verify_certs=False`. |
+| `http_compress` | `bool` | `True` | No | gzip the request body (the egress-cost lever on write). |
+| `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
+| `max_retries` | `int` | `3` | No | Client-side retries per request. |
+| `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
 raises (pick one).
 
-**Write behavior**
+**Write behavior** (`EsWriteConfig`)
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
 | `index` | `str` | `""` | **Yes** | Target index. `bulk_write`/`build_action` raise if empty. |
 | `id_field` | `str \| None` | `None` | No | Column used as the deterministic `_id` → idempotent upserts. If unset, ES assigns random IDs (replays duplicate). If set, the column must be non-null in every row. |
-| `http_compress` | `bool` | `True` | No | gzip the bulk request body (the egress-cost lever). |
 | `chunk_size` | `int` | `500` | No | Docs per bulk request. |
-| `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
-| `max_retries` | `int` | `3` | No | Client-side retries per request. |
-| `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
 **Doc shaping**
 
@@ -185,6 +277,18 @@ other status on a delete, is still counted in `errors`.
 
 See [Usage (deletes)](#usage-deletes) above for the recommended Change-Data-Feed pattern and the
 cross-batch ordering caveat.
+
+**Read behavior** (`EsReadConfig`)
+
+| Field | Type | Default | Required | Notes |
+|-------|------|---------|----------|-------|
+| `index` | `str` | `""` | **Yes** | Source index. `read_index` raises if empty. |
+| `id_field` | `str \| None` | `None` | No | If the declared schema names this column, it is filled from the ES `_id` when absent from `_source`. |
+| `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read (e.g. `{"term": {...}}`). `None` = `match_all`. v1 accepts a raw DSL dict only — no Spark-predicate pushdown. |
+| `num_slices` | `int \| None` | `None` | No | Parallelism for the distributed read. `None` defaults to the index's shard count. One slice per Spark task. |
+| `batch_size` | `int` | `1000` | No | Docs per scroll/PIT page. Must be positive. |
+| `pit_keep_alive` | `str` | `"1m"` | No | Point-in-Time lifetime. For `read_index` (lazy), set this long enough to cover the whole downstream job — see below. |
+| `include_id` | `bool` | `True` | No | Expose the ES `_id` via the `id_field` column when the schema declares it. |
 
 ## The write result (`bulk_write` return value)
 
@@ -356,17 +460,20 @@ through Delta Share — no code changes, only the `EsConfig` endpoint/auth diffe
 
 ```
 src/databricks_es_connector/   # the library (this is what ships in the .whl)
-  config.py                    #   EsConfig: connection + write behavior (see Configuration above)
-  transform.py                 #   pure-Python row shaping (timestamps, numpy/arrays, decimal, binary, pruning)
+  config.py                    #   EsConnection base + EsWriteConfig / EsReadConfig (EsConfig alias)
+  transform.py                 #   pure-Python row shaping on WRITE (timestamps, numpy/arrays, decimal, binary, pruning)
   bulk.py                      #   executor-side mapInPandas bulk write (batch entry point)
   stream.py                    #   foreachBatch helper for Structured Streaming
   spark_prep.py                #   sanitize_for_arrow: Arrow-hostile types (VARIANT/INTERVAL) -> JSON string
+  read_transform.py            #   pure-Python inverse coercion on READ (ES value + type -> Spark value)
+  read.py                      #   read_index (distributed sliced-scroll) / read_index_collect (driver-side)
 tests/                         # unit tests for the pure-Python layer (no Spark/ES needed)
 integration_tests/             # live-Spark/ES tests run on Databricks serverless via dbx_test
   test_datatype_coverage.py    #   every Spark datatype + edge cases, round-tripped through ES
   test_bulk_write_roundtrip.py #   the bulk_write result contract (counts, total_input, error_samples)
   test_deletes_roundtrip.py    #   has_deletes routing live: delete-by-id, delete-404 no-op
   test_streaming_sink.py       #   make_foreach_batch on real Structured Streaming + restart idempotency
+  test_read_roundtrip.py       #   write->read fidelity + distributed sliced read (multi-shard)
   test_sanitize_for_arrow.py   #   the Spark-side VARIANT/INTERVAL serialization, no ES
   config/test_config.yml       #   dbx_test config (profile, wheel, serverless env)
 ```

@@ -310,6 +310,11 @@ def test_map_none_key_becomes_json_null_key():
     assert _json_roundtrip({None: "a"}) == {"null": "a"}
 
 
+def test_map_bool_key_becomes_true_false_string():
+    # A bool map key renders to "true"/"false" (not "True"/"False"), matching JSON key semantics.
+    assert _json_roundtrip({True: "a", False: "b"}) == {"true": "a", "false": "b"}
+
+
 def test_nested_map_with_nonstring_keys_coerced():
     # A struct holding a map<int,timestamp> — keys AND values both need coercion, recursively.
     row = {"counts": {10: dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)}}
