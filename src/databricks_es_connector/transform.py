@@ -187,8 +187,16 @@ def _is_delete_flagged(v: Any) -> bool:
 
 
 def _require_id(row: dict, id_field: str) -> str:
-    if id_field not in row or row[id_field] is None:
-        raise KeyError(f"id_field '{id_field}' missing/None in row")
+    """Derive the deterministic _id from a row, rejecting null-ish ids.
+
+    Guards `_is_null` (None, NaN, NaT, pd.NA), not just `is None`: a pandas NaN in a
+    numeric id column is a float, so `is None` lets it through and `str(nan)` -> "nan"
+    would make EVERY NaN-id row collide on _id="nan" and silently overwrite into one
+    document (no error, counts still reconcile). Rejecting it fails the partition loudly
+    instead of losing rows. The id column must be non-null in every row (see EsWriteConfig).
+    """
+    if id_field not in row or _is_null(row[id_field]):
+        raise KeyError(f"id_field '{id_field}' missing/null (None/NaN/NaT) in row")
     return str(row[id_field])
 
 

@@ -408,6 +408,40 @@ def test_build_action_missing_id_raises():
         build_action({"x": 1}, index="idx", id_field="doc_id")
 
 
+def test_build_action_none_id_raises():
+    # id present but None must raise, not become _id="None".
+    with pytest.raises(KeyError):
+        build_action({"doc_id": None, "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_build_action_nan_id_raises():
+    # REGRESSION: a pandas NaN in a numeric id column is a float, not None. It must raise,
+    # not slip past the guard and become _id="nan" (which would collapse every NaN-id row
+    # onto one document, silently overwriting them). Guards the whole null-ish class.
+    with pytest.raises(KeyError):
+        build_action({"doc_id": float("nan"), "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_build_action_numpy_nan_id_raises():
+    np = pytest.importorskip("numpy")
+    with pytest.raises(KeyError):
+        build_action({"doc_id": np.float64("nan"), "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_build_action_nat_id_raises():
+    # A NaT in a timestamp id column is likewise null-ish and must raise.
+    pd = pytest.importorskip("pandas")
+    with pytest.raises(KeyError):
+        build_action({"doc_id": pd.NaT, "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_delete_flagged_row_nan_id_raises():
+    # Same guard on the delete path: a NaN id can't silently target _id="nan".
+    with pytest.raises(KeyError):
+        build_action({"doc_id": float("nan"), "d": True}, index="i", id_field="doc_id",
+                     has_deletes=True, delete_flag_column="d")
+
+
 def test_build_action_coerces_timestamp_in_source():
     row = {"doc_id": "1", "time": dt.datetime(2024, 1, 26, 11, 55, 23, tzinfo=dt.timezone.utc)}
     action = build_action(row, index="idx", id_field="doc_id")
