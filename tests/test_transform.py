@@ -37,6 +37,44 @@ def test_finite_floats_preserved():
     assert coerce_value(0.0) == 0.0
 
 
+# --- corner cases that a symmetric round-trip can hide (pinned so "probably fine" becomes proven) ---
+
+def test_negative_zero_preserved():
+    # -0.0 is finite, so it must NOT be nulled like NaN/inf; it passes through as a float.
+    # (ES may normalize -0.0 to 0.0 server-side; that's an ES concern, the connector must not lose it.)
+    out = coerce_value(-0.0)
+    assert out == 0.0
+    assert math.copysign(1.0, out) == -1.0   # sign bit preserved: genuinely -0.0, not 0.0
+
+def test_empty_string_is_not_null():
+    # "" is a real value, distinct from null. _is_null must not treat it as null.
+    assert coerce_value("") == ""
+
+def test_very_long_string_passes_through():
+    s = "x" * 100_000
+    assert coerce_value(s) == s
+
+def test_empty_dict_and_list_pass_through():
+    # An empty struct (struct<>) arrives as {} and an empty array as []; both preserved.
+    assert coerce_value({}) == {}
+    assert coerce_value([]) == []
+
+def test_nested_array_of_arrays_coerced():
+    # array<array<int>>: recursion must descend both levels (values coerced, shape preserved).
+    assert coerce_value([[1, 2], [3], []]) == [[1, 2], [3], []]
+    # with a null element inside the inner arrays
+    assert coerce_value([[float("nan"), 2], None]) == [[None, 2], None]
+
+def test_complex_typed_id_is_stringified():
+    # A struct/array id_field is uncommon but must not crash: _require_id stringifies the raw value
+    # deterministically. Documents the behavior (stable within a fixed shape) rather than asserting
+    # it's a good idea -- the README steers callers to a scalar id.
+    a1 = build_action({"doc_id": {"a": 1}, "x": 1}, index="i", id_field="doc_id")
+    assert a1["_id"] == "{'a': 1}"
+    a2 = build_action({"doc_id": [1, 2], "x": 1}, index="i", id_field="doc_id")
+    assert a2["_id"] == "[1, 2]"
+
+
 # --- non-finite floats: inf/-inf have no JSON representation. json.dumps emits the bare
 # tokens `Infinity`/`-Infinity`, which ES's strict parser rejects, so the doc fails to index
 # and is silently lost to the error count. Must coerce to None, mirroring NaN. The strict

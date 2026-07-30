@@ -24,7 +24,7 @@ from databricks_es_connector import (
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, BooleanType, LongType, IntegerType, DoubleType,
-    DecimalType, DateType, TimestampType, BinaryType, ArrayType,
+    DecimalType, DateType, TimestampType, TimestampNTZType, BinaryType, ArrayType,
 )
 
 SCOPE = "es_poc"
@@ -46,6 +46,15 @@ SCHEMA = StructType([
     StructField("s_decimal", DecimalType(10, 2)),
     StructField("s_date", DateType()),
     StructField("s_ts", TimestampType()),
+    # A sub-millisecond timestamp: proves the documented microsecond->millisecond floor survives a
+    # full live round-trip (the unit test asserts the floor offline; this asserts it through ES).
+    StructField("s_ts_subms", TimestampType()),
+    # timestamp_ntz: the read inverse added alongside this work. Reads back NAIVE (no tzinfo),
+    # exercising read_coerce's timestamp_ntz branch end-to-end, not just in the unit oracle.
+    StructField("s_ts_ntz", TimestampNTZType()),
+    # A high-precision decimal CAST TO STRING in Spark: the documented workaround to preserve
+    # exactness past double's ~15-17 sig figs. Declared StringType on read, must equal the digits.
+    StructField("s_decimal_exact_str", StringType()),
     StructField("s_binary", BinaryType()),
     StructField("s_array", ArrayType(IntegerType())),
     StructField("s_struct", StructType([
@@ -75,13 +84,21 @@ class TestReadRoundtrip(NotebookTestFixture):
               'r1' AS doc_id, true AS s_bool, CAST(70000 AS INT) AS s_int,
               CAST(9223372036854775807 AS BIGINT) AS s_long, CAST(1.5 AS DOUBLE) AS s_double,
               CAST(1.50 AS DECIMAL(10,2)) AS s_decimal, DATE'2021-01-01' AS s_date,
-              TIMESTAMP'2021-01-01 12:30:00Z' AS s_ts, CAST(X'0102' AS BINARY) AS s_binary,
+              TIMESTAMP'2021-01-01 12:30:00Z' AS s_ts,
+              TIMESTAMP'2021-01-01 00:00:00.123456Z' AS s_ts_subms,
+              TIMESTAMP_NTZ'2021-06-01 12:00:00' AS s_ts_ntz,
+              CAST(CAST(123456789012345678 AS DECIMAL(38,0)) AS STRING) AS s_decimal_exact_str,
+              CAST(X'0102' AS BINARY) AS s_binary,
               array(1,2,3) AS s_array,
               named_struct('ip','10.0.0.1','port',443,'weight',CAST(1.25 AS DECIMAL(10,2))) AS s_struct
             UNION ALL
               SELECT 'r2', false, CAST(-5 AS INT), CAST(0 AS BIGINT), CAST(2.25 AS DOUBLE),
               CAST(99.99 AS DECIMAL(10,2)), DATE'1999-12-31',
-              TIMESTAMP'2000-01-01 00:00:00Z', CAST(X'FF' AS BINARY),
+              TIMESTAMP'2000-01-01 00:00:00Z',
+              TIMESTAMP'1969-12-31 23:59:59.999999Z',
+              TIMESTAMP_NTZ'1999-12-31 23:59:58',
+              CAST(CAST(-98765432109876543 AS DECIMAL(38,0)) AS STRING),
+              CAST(X'FF' AS BINARY),
               array(), named_struct('ip','192.168.0.1','port',8080,'weight',CAST(9.99 AS DECIMAL(10,2)))
         """)
 
@@ -94,6 +111,9 @@ class TestReadRoundtrip(NotebookTestFixture):
                     "doc_id": {"type": "keyword"},
                     "s_date": {"type": "date", "format": "epoch_millis"},
                     "s_ts": {"type": "date", "format": "epoch_millis"},
+                    "s_ts_subms": {"type": "date", "format": "epoch_millis"},
+                    "s_ts_ntz": {"type": "date", "format": "epoch_millis"},
+                    "s_decimal_exact_str": {"type": "keyword"},   # exact-decimal-as-string
                 }}}
         requests.put(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30,
                      headers={"Content-Type": "application/json"}, data=json.dumps(body))
@@ -173,6 +193,32 @@ class TestReadRoundtrip(NotebookTestFixture):
             s, o = self.src_rows[did], self.out_rows[did]
             assert o["s_date"] == s["s_date"], f"{did}.s_date: {o['s_date']!r} != {s['s_date']!r}"
             assert o["s_ts"] == s["s_ts"], f"{did}.s_ts: {o['s_ts']!r} != {s['s_ts']!r}"
+
+    def test_timestamp_ntz_roundtrip_naive(self):
+        # timestamp_ntz reads back NAIVE (no tzinfo) and equal to the source wall-clock. Proves the
+        # read_coerce timestamp_ntz branch works against real ES, not just in the unit oracle.
+        for did in ("r1", "r2"):
+            s, o = self.src_rows[did], self.out_rows[did]
+            assert o["s_ts_ntz"] == s["s_ts_ntz"], f"{did}.s_ts_ntz: {o['s_ts_ntz']!r} != {s['s_ts_ntz']!r}"
+            assert o["s_ts_ntz"].tzinfo is None, f"{did}.s_ts_ntz should be naive, got {o['s_ts_ntz']!r}"
+
+    def test_subms_timestamp_floors_to_ms(self):
+        # DOCUMENTED delta: microsecond precision is floored to the millisecond on write. The round-
+        # trip must equal the source FLOORED to ms (not the original micros), proven through live ES.
+        for did in ("r1", "r2"):
+            s, o = self.src_rows[did], self.out_rows[did]
+            src_ts = s["s_ts_subms"]
+            floored = src_ts.replace(microsecond=(src_ts.microsecond // 1000) * 1000)
+            assert o["s_ts_subms"] == floored, \
+                f"{did}.s_ts_subms: {o['s_ts_subms']!r} != floored {floored!r} (src {src_ts!r})"
+
+    def test_high_precision_decimal_via_string_is_exact(self):
+        # DOCUMENTED workaround: casting a high-precision decimal to STRING in Spark before writing
+        # preserves exactness past double's ~15-17 sig figs. Read back as StringType, the 18-digit
+        # value must be exact -- unlike s_decimal_hi in test_datatype_coverage, which loses low digits
+        # because it goes through float. This proves the mitigation the README recommends.
+        assert self.out_rows["r1"]["s_decimal_exact_str"] == "123456789012345678"
+        assert self.out_rows["r2"]["s_decimal_exact_str"] == "-98765432109876543"
 
     def test_binary_roundtrip(self):
         for did in ("r1", "r2"):

@@ -104,7 +104,10 @@ class TestDatatypeCoverage(NotebookTestFixture):
               array(parse_json('{"n":1}'),
                     parse_json('{"n":2}'))                     AS s_array_variant, -- VARIANT in array
               INTERVAL '1 02:03:04' DAY TO SECOND             AS s_interval_dt,   -- INTERVAL day-time
-              INTERVAL '2-3' YEAR TO MONTH                    AS s_interval_ym    -- INTERVAL year-month
+              INTERVAL '2-3' YEAR TO MONTH                    AS s_interval_ym,   -- INTERVAL year-month
+              CAST('' AS STRING)                              AS s_empty_string,  -- "" is a value, not null
+              array(array(1,2), array(3), CAST(array() AS ARRAY<INT>))
+                                                              AS s_array_array    -- nested array<array>
         """)
         # All-NULL row (same schema) to prove the null-of-every-type contract. Explicit CASTs because
         # touching df.schema on a VARIANT column throws on Spark Connect.
@@ -146,7 +149,9 @@ class TestDatatypeCoverage(NotebookTestFixture):
               CAST(NULL AS STRUCT<v:VARIANT,label:STRING>)   AS s_struct_variant,
               CAST(NULL AS ARRAY<VARIANT>)                   AS s_array_variant,
               CAST(NULL AS INTERVAL DAY TO SECOND)           AS s_interval_dt,
-              CAST(NULL AS INTERVAL YEAR TO MONTH)           AS s_interval_ym
+              CAST(NULL AS INTERVAL YEAR TO MONTH)           AS s_interval_ym,
+              CAST(NULL AS STRING)                           AS s_empty_string,
+              CAST(NULL AS ARRAY<ARRAY<INT>>)                AS s_array_array
         """)
         df = full.unionByName(null)
 
@@ -309,6 +314,14 @@ class TestDatatypeCoverage(NotebookTestFixture):
         self._assert("s_interval_dt", "INTERVAL '1 02:03:04' DAY TO SECOND")
         self._assert("s_interval_ym", "INTERVAL '2-3' YEAR TO MONTH")
 
+    # --- corner cases pinned end-to-end (empty string is a value; nested array<array> preserved) ---
+    def test_empty_string_is_a_value_not_null(self):
+        # "" must survive as an empty string, distinct from null. (ES stores "" in _source.)
+        self._assert("s_empty_string", "")
+
+    def test_nested_array_of_arrays(self):
+        self._assert("s_array_array", [[1, 2], [3], []])
+
     # --- null contract: every field present as JSON null (NOT absent, NOT non-null) ---
     def test_null_row_fields_present_as_null(self):
         absent, non_null = [], []
@@ -331,7 +344,7 @@ class TestDatatypeCoverage(NotebookTestFixture):
             "s_empty_map", "s_map_null_val", "s_array", "s_array_struct", "s_empty_array",
             "s_array_null_el", "s_struct_null_fld", "s_nested_struct", "s_pos_inf", "s_neg_inf",
             "s_nan", "s_variant", "s_struct_variant", "s_array_variant", "s_interval_dt",
-            "s_interval_ym",
+            "s_interval_ym", "s_empty_string", "s_array_array",
         }
         # ES omits explicit nulls and an empty array from _source, so the full row may legitimately
         # have FEWER keys than expected, but never MORE. Only extras are a leak.

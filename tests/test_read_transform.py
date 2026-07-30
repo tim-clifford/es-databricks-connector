@@ -126,6 +126,15 @@ def test_array_of_timestamps_roundtrip():
     ts = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
     assert _roundtrip([ts], "array<timestamp>") == [ts]
 
+def test_nested_array_of_arrays_roundtrip():
+    # array<array<int>>: the token splitter must keep the inner array<...> intact and recurse both
+    # levels. Empty inner array preserved; null inner element preserved.
+    assert _roundtrip([[1, 2], [3], []], "array<array<int>>") == [[1, 2], [3], []]
+    assert read_coerce([[1, 2], None], "array<array<int>>") == [[1, 2], None]
+
+def test_empty_string_roundtrip():
+    assert _roundtrip("", "string") == ""
+
 def test_es_scalar_read_as_single_element_array():
     # ES has no array type: a field declared array<int> may come back as a bare scalar. Wrap it.
     assert read_coerce(5, "array<int>") == [5]
@@ -144,6 +153,10 @@ def test_struct_missing_field_is_none():
     # A field absent from _source (ES omits some) reads as None, not a KeyError.
     out = read_coerce({"a": 1}, "struct<a:int,b:string>")
     assert out == {"a": 1, "b": None}
+
+def test_empty_struct_reads_as_empty_dict():
+    # struct<> (zero-field) has no fields to fill: an empty _source object reads back as {}.
+    assert read_coerce({}, "struct<>") == {}
 
 def test_nested_struct_roundtrip():
     row = {"inner": {"x": 1, "ts": dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)}}
