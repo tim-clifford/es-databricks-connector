@@ -20,6 +20,7 @@ pyspark is imported lazily so the pure-Python layers stay importable without Spa
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 from .config import EsReadConfig
@@ -28,6 +29,8 @@ from .read_transform import read_coerce
 if TYPE_CHECKING:  # pragma: no cover
     from pyspark.sql import DataFrame, SparkSession
     from pyspark.sql.types import DataType, StructType
+
+_log = logging.getLogger(__name__)
 
 
 # --- pure helpers (no Spark) -----------------------------------------------------------------
@@ -106,7 +109,14 @@ def _resolve_num_slices(es, index: str, configured: Optional[int]) -> int:
         one = next(iter(settings.values()))
         shards = int(one["settings"]["index.number_of_shards"])
         return max(1, shards)
-    except Exception:
+    except Exception as exc:
+        # Couldn't read the shard count (permissions, alias spanning indices, transient error).
+        # Falling back to a single unsliced reader is CORRECT but SERIAL — for a large index that
+        # silently forfeits the parallelism this reader exists for, so warn rather than hide it.
+        # Pass an explicit num_slices to skip this lookup entirely.
+        _log.warning(
+            "read_index: could not read shard count for index %r (%s); falling back to a single "
+            "unsliced slice. Pass num_slices explicitly to parallelize.", index, exc)
         return 1
 
 
@@ -209,7 +219,11 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
     pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
 
     reader = _make_slice_reader(cfg, pit_id, query, field_tokens, num_slices)
-    # One row per slice, one partition per slice, so each task handles exactly one slice. The result
-    # is a lazy distributed DataFrame — data never crosses the driver.
-    slices_df = spark.range(num_slices).repartition(num_slices)
+    # One row per slice, one partition per slice, so each task handles exactly one slice. `range`
+    # splits its contiguous id space [0, num_slices) into `numPartitions` equal chunks — with
+    # num_slices rows in num_slices partitions that is deterministically one row each, and needs no
+    # shuffle. (repartition() would round-robin, which only *tends* toward an even spread and could
+    # co-locate two slices on one task under skew.) The result is a lazy distributed DataFrame —
+    # data never crosses the driver.
+    slices_df = spark.range(num_slices, numPartitions=num_slices)
     return slices_df.mapInPandas(reader, schema)

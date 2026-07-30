@@ -103,6 +103,23 @@ def test_resolve_num_slices_falls_back_to_one_on_error():
     es = _FakeES(settings=None)   # get_settings raises
     assert _resolve_num_slices(es, "i", None) == 1
 
+def test_resolve_num_slices_warns_on_fallback(caplog):
+    # The serial single-slice fallback must not be silent — it forfeits parallelism.
+    import logging
+    es = _FakeES(settings=None)   # get_settings raises
+    with caplog.at_level(logging.WARNING, logger="databricks_es_connector.read"):
+        assert _resolve_num_slices(es, "my_index", None) == 1
+    assert any("my_index" in r.message and "single" in r.message.lower()
+               for r in caplog.records), "expected a WARNING naming the index on fallback"
+
+def test_resolve_num_slices_does_not_warn_when_configured(caplog):
+    # An explicit num_slices skips the shard lookup entirely — no warning even if get_settings would fail.
+    import logging
+    es = _FakeES(settings=None)
+    with caplog.at_level(logging.WARNING, logger="databricks_es_connector.read"):
+        assert _resolve_num_slices(es, "my_index", 4) == 4
+    assert caplog.records == []
+
 def test_resolve_num_slices_floors_configured_at_one():
     es = _FakeES(settings={"i": {"settings": {"index.number_of_shards": "3"}}})
     assert _resolve_num_slices(es, "i", 0) == 1   # never < 1
@@ -230,7 +247,7 @@ def test_slice_hits_follows_refreshed_pit_id():
 
 class _FakeSpark:
     """Minimal SparkSession stand-in. createDataFrame records (rows, schema) and echoes them back;
-    range(n) returns a fake DF whose repartition/mapInPandas record how they were called."""
+    range(n, numPartitions=n) returns a fake DF whose mapInPandas records how it was called."""
     def __init__(self):
         self.created = None
         self.range_n = None
@@ -238,16 +255,14 @@ class _FakeSpark:
     def createDataFrame(self, rows, schema):
         self.created = (list(rows), schema)
         return ("collected-df", self.created)
-    def range(self, n):
+    def range(self, n, numPartitions=None):
         self.range_n = n
-        return _FakeRangeDF(self)
+        return _FakeRangeDF(self, nparts=numPartitions)
 
 class _FakeRangeDF:
     def __init__(self, spark, nparts=None):
         self._spark = spark
         self._nparts = nparts
-    def repartition(self, n):
-        return _FakeRangeDF(self._spark, nparts=n)
     def mapInPandas(self, fn, schema):
         self._spark.mapped = {"fn": fn, "schema": schema, "nparts": self._nparts}
         return ("lazy-distributed-df", self._spark.mapped)
@@ -310,9 +325,10 @@ def test_read_index_distributed_opens_pit_and_fans_out(monkeypatch):
     schema = _Schema([("doc_id", "string")])
 
     df = read_mod.read_index(spark, _rcfg(), schema)
-    # Distributed: spark.range(num_slices) + mapInPandas(reader, schema); NOT createDataFrame.
+    # Distributed: spark.range(num_slices, numPartitions=num_slices) + mapInPandas(reader, schema);
+    # NOT createDataFrame.
     assert spark.range_n == 4
-    assert spark.mapped["nparts"] == 4                 # repartitioned to one part per slice
+    assert spark.mapped["nparts"] == 4                 # one partition per slice, straight from range
     assert spark.mapped["schema"] is schema
     assert callable(spark.mapped["fn"])                # the slice reader
     assert spark.created is None                        # data never collected to the driver

@@ -148,6 +148,16 @@ def test_array_of_structs_roundtrip():
     stored = coerce_value(rows)
     assert read_coerce(stored, "array<struct<k:string,v:int>>") == rows
 
+def test_map_non_string_keys_stay_stringified():
+    # Non-string map keys are a DOCUMENTED one-way transform: writes stringify keys (JSON object
+    # keys must be strings), so the read side can only ever see string keys and MUST keep them as
+    # such — even when the declared key type is int. This is not lossy re-parsing; it's the contract.
+    stored = coerce_value({1: "x", 2: "y"})     # map<int,string> -> {"1": "x", "2": "y"} on write
+    assert stored == {"1": "x", "2": "y"}
+    out = read_coerce(stored, "map<int,string>")
+    assert out == {"1": "x", "2": "y"}           # keys stay strings; values coerced by valtype
+    assert all(isinstance(k, str) for k in out)
+
 
 # --- token parser edge cases (nested commas must not split fields) ---------------------------
 
