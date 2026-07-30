@@ -57,6 +57,13 @@ _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 def _to_epoch_millis(v: Any) -> int:
     """Coerce a datetime/date to epoch milliseconds. Naive values are assumed UTC.
 
+    The naive==UTC assumption is correct, NOT a latent session-timezone bug (verified on a live
+    serverless runtime under UTC, America/New_York, and Asia/Kolkata): Spark's Arrow export already
+    normalizes a `timestamp` to a UTC wall-clock naive pandas Timestamp before `mapInPandas` hands
+    it here, independent of `spark.sql.session.timeZone`. A `timestamp_ntz` arrives as its own
+    zoneless wall-clock. So reading a naive value as UTC yields the right epoch in every session tz;
+    the integration datatype test runs under a non-UTC session to keep that guarantee red-able.
+
     Floors to the containing millisecond (sub-millisecond precision is dropped, ES `date` is
     millisecond-resolution by default). Uses integer `timedelta` arithmetic rather than
     `v.timestamp() * 1000`: the float multiply loses sub-ms resolution at large magnitudes and
