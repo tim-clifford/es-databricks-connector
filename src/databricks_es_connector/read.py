@@ -1,9 +1,10 @@
 """Read an Elasticsearch index into a Spark DataFrame.
 
 Two entry points, both requiring an explicit Spark `StructType` (v0.4.0 does no mapping inference —
-several write transforms are one-way and can't be inverted from `_source` without the declared type,
-see READ_DESIGN.md). Both share the coercion oracle `read_transform.read_coerce`, so they return
-identical values; only the transport differs.
+several write transforms are one-way and can't be inverted from `_source` without the declared type;
+see the README "Reading from Elasticsearch" section for the ambiguity rationale). Both share the
+coercion oracle `read_transform.read_coerce`, so they return identical values; only the transport
+differs.
 
   - `read_index`         — DISTRIBUTED (Option B). Opens a Point-in-Time on the driver, fans out
                            `spark.range(num_slices).mapInPandas(...)`, one task per PIT slice, each
