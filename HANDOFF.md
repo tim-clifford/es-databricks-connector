@@ -1,9 +1,10 @@
 # Production Readiness / Known Limitations (0.4.0)
 
-`databricks-es-connector` proves the **mechanism**: serverless Databricks can bulk-write
-to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
-deterministic IDs, and every Spark datatype is exportable. This document lists what a production
-customer deployment still needs, so the gaps are explicit rather than assumed.
+`databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
+bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
+deterministic IDs (every Spark datatype is exportable), and can read an index back into a DataFrame
+against a declared schema with write→read fidelity. This document lists what a production customer
+deployment still needs, so the gaps are explicit rather than assumed.
 
 Treat everything under "Open items" as **not yet addressed** — work to be scoped and tracked
 before a customer relies on it.

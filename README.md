@@ -2,11 +2,13 @@
 
 Serverless-safe, bi-directional transfer between Databricks/Spark and Elasticsearch.
 
-Schema-agnostic Python library. **Write:** given a Spark DataFrame and an `EsWriteConfig`, it writes
-rows to an Elasticsearch index via the `elasticsearch-py` client, parallelized across executors with
+Python library. **Write:** given a Spark DataFrame and an `EsWriteConfig`, it writes rows to an
+Elasticsearch index via the `elasticsearch-py` client, parallelized across executors with
 `mapInPandas` (serverless-safe), with gzip request compression and deterministic document IDs for
-idempotent upserts. **Read:** given an `EsReadConfig` and a declared Spark schema, `read_index` pulls
-an index back into a DataFrame, distributed across executors via a sliced Point-in-Time scroll.
+idempotent upserts. The writer is schema-agnostic — hand it any DataFrame, no pre-processing.
+**Read:** given an `EsReadConfig` and a *declared* Spark schema (the reader does not infer one),
+`read_index` pulls an index back into a DataFrame, distributed across executors via a sliced
+Point-in-Time scroll.
 
 Built because the `elasticsearch-spark` connector cannot run on serverless compute
 (no third-party Spark JARs), has no Spark 4 / DBR 17+ build, and offers no request
