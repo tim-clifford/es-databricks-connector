@@ -52,13 +52,15 @@ compression. The Python client has none of those limits.
 - **Serverless works.** Both the write and the read path use `mapInPandas`, not RDD APIs
   (`foreachPartition` and custom `DataSource`/RDD readers are blocked on serverless). Work still
   fans out across executors — writes partition the DataFrame, reads fan out one task per index slice.
+- **Egress-minimized.** `http_compress=True` gzips both directions (~5–10x on JSON): the request
+  body on write, and the ES response on read. A lever for cross-cloud cost either way.
 
 **Writing** (`bulk_write` / `make_foreach_batch`):
 
-- **Egress-minimized.** `http_compress=True` gzips the bulk body (~5–10x on JSON); field
-  pruning drops columns you don't need indexed. Both are levers for cross-cloud cost.
 - **Idempotent.** Deterministic `_id` (from a configurable column) means checkpoint
   replays and backfills upsert instead of duplicating.
+- **Field pruning.** `drop_fields` drops columns you don't need indexed before the write — a further
+  write-side egress lever on top of compression.
 - **Schema-agnostic on write.** The writer knows nothing about your schema or data model — you
   hand it any DataFrame and a target index, and every Spark datatype is exportable with no
   pre-processing (see [Datatype coverage](#datatype-coverage-write-transforms--read-inverse)).
@@ -303,7 +305,7 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `basic_auth` | `tuple \| None` | `None` | one-of\* | `("user", "pass")`. Sandbox/dev only; prefer `api_key` in prod. |
 | `verify_certs` | `bool` | `True` | No | Set `False` for self-signed sandbox boxes. Library default is secure. |
 | `ca_certs` | `str \| None` | `None` | No | Path to a CA bundle when pinning. Mutually exclusive with `verify_certs=False`. |
-| `http_compress` | `bool` | `True` | No | gzip the request body (the egress-cost lever on write). |
+| `http_compress` | `bool` | `True` | No | gzip both directions: compresses the request body on write and asks ES to gzip the response on read (`content-encoding` + `accept-encoding`). The egress-cost lever. |
 | `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
 | `max_retries` | `int` | `3` | No | Client-side retries per request. |
 | `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |

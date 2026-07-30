@@ -36,7 +36,7 @@ class EsConnection:
     ca_certs: Optional[str] = None          # path to CA bundle when pinning
 
     # --- client tuning (apply to both read and write requests) ---
-    http_compress: bool = True              # gzip the request body (egress lever on write)
+    http_compress: bool = True              # gzip both ways: request body on write, ES response on read
     request_timeout: int = 60
     max_retries: int = 3
     retry_on_timeout: bool = True
