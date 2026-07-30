@@ -49,6 +49,10 @@ SCHEMA = StructType([
     StructField("s_struct", StructType([
         StructField("ip", StringType()),
         StructField("port", IntegerType()),
+        # A DECIMAL nested inside a struct: its simpleString() is decimal(10,2), whose inner comma
+        # regression-tests the DDL token splitter (a nested decimal previously corrupted struct
+        # field parsing — see tests/test_read_transform.py::test_struct_with_nested_decimal...).
+        StructField("weight", DecimalType(10, 2)),
     ])),
 ])
 
@@ -70,12 +74,13 @@ class TestReadRoundtrip(NotebookTestFixture):
               CAST(9223372036854775807 AS BIGINT) AS s_long, CAST(1.5 AS DOUBLE) AS s_double,
               CAST(1.50 AS DECIMAL(10,2)) AS s_decimal, DATE'2021-01-01' AS s_date,
               TIMESTAMP'2021-01-01 12:30:00Z' AS s_ts, CAST(X'0102' AS BINARY) AS s_binary,
-              array(1,2,3) AS s_array, named_struct('ip','10.0.0.1','port',443) AS s_struct
+              array(1,2,3) AS s_array,
+              named_struct('ip','10.0.0.1','port',443,'weight',CAST(1.25 AS DECIMAL(10,2))) AS s_struct
             UNION ALL
               SELECT 'r2', false, CAST(-5 AS INT), CAST(0 AS BIGINT), CAST(2.25 AS DOUBLE),
               CAST(99.99 AS DECIMAL(10,2)), DATE'1999-12-31',
               TIMESTAMP'2000-01-01 00:00:00Z', CAST(X'FF' AS BINARY),
-              array(), named_struct('ip','192.168.0.1','port',8080)
+              array(), named_struct('ip','192.168.0.1','port',8080,'weight',CAST(9.99 AS DECIMAL(10,2)))
         """)
 
         # Fresh index. Map the types ES needs: doc_id keyword, dates as epoch_millis, binary/struct
