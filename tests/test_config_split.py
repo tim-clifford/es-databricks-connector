@@ -57,7 +57,7 @@ def test_read_only_fields_absent_from_write_config():
 
 
 def test_write_delete_validation_still_enforced_on_write_config():
-    # The delete-routing validation moved with the fields onto EsWriteConfig — still enforced.
+    # The delete-routing validation moved with the fields onto EsWriteConfig, still enforced.
     with pytest.raises(ValueError, match="delete_flag_column"):
         EsWriteConfig(hosts="https://h:9200", api_key="k", index="i",
                       id_field="doc_id", has_deletes=True)

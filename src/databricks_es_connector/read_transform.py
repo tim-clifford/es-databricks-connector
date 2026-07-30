@@ -1,9 +1,9 @@
 """Pure-Python inverse of `transform.coerce_value`: ES `_source` value -> the value Spark expects
-for a declared target type. No Spark, no ES client — unit-testable, and the single coercion oracle
+for a declared target type. No Spark, no ES client: unit-testable, and the single coercion oracle
 shared by the driver-side reader (read.py) and the future distributed reader.
 
 The read path requires the caller to declare a Spark schema (v0.4.0). That is deliberate: several
-write transforms are documented as one-way and are NOT invertible from `_source` alone —
+write transforms are documented as one-way and are NOT invertible from `_source` alone:
   - a `date`/`timestamp` is stored as an epoch-millis integer (indistinguishable from a plain long),
   - a `decimal` is stored as a float,
   - `binary` is stored as a base64 string,
@@ -11,7 +11,7 @@ write transforms are documented as one-way and are NOT invertible from `_source`
 so only the caller's declared type tells us how to turn the stored value back. Each branch here is
 the exact inverse of a `transform.coerce_value` branch; the accepted round-trip deltas are precisely
 those the README datatype table documents (decimal precision, sub-millisecond timestamp, float32
-widening) — reads introduce no new lossiness.
+widening): reads introduce no new lossiness.
 
 Target types are given as Spark type *tokens* (short lowercase strings like "timestamp", "long",
 "struct<...>") rather than pyspark objects, so this module stays importable without Spark for local
@@ -28,7 +28,7 @@ from typing import Any
 
 def _is_null(v: Any) -> bool:
     """True for JSON null / missing. (ES omits nothing we send as explicit null; a missing field
-    also arrives as None from the reader.) Kept simple — the read side never sees NaN/NaT."""
+    also arrives as None from the reader.) Kept simple, the read side never sees NaN/NaT."""
     return v is None
 
 
@@ -108,7 +108,7 @@ def read_coerce(value: Any, target: str) -> Any:
         return [read_coerce(x, elem) for x in seq]
 
     if t.startswith("map<"):
-        # map<keytype,valtype> — JSON object keys are always strings; coerce values by valtype.
+        # map<keytype,valtype>: JSON object keys are always strings; coerce values by valtype.
         _k, valtype = _split_map(t)
         return {k: read_coerce(v, valtype) for k, v in dict(value).items()}
 
@@ -124,14 +124,14 @@ def read_coerce(value: Any, target: str) -> Any:
 # --- token parsing helpers (a minimal Spark DDL-type-string parser, depth-aware) -----------------
 
 def _inner(token: str, prefix: str) -> str:
-    """The single inner type of array<INNER> — strips the prefix and the trailing '>'."""
+    """The single inner type of array<INNER>, strips the prefix and the trailing '>'."""
     return token[len(prefix):-1].strip()
 
 
 def _split_top_level(body: str):
     """Split a struct/map body on top-level commas only.
 
-    Ignores commas nested inside `<...>` (nested struct/array/map) AND inside `(...)` — the latter
+    Ignores commas nested inside `<...>` (nested struct/array/map) AND inside `(...)`: the latter
     matters because a `decimal(p,s)` token carries a comma between its precision and scale, e.g.
     `struct<a:decimal(10,2),b:int>`. Tracking angle-bracket depth alone would wrongly split on that
     inner comma; we track paren depth too.

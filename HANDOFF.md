@@ -6,16 +6,16 @@ deterministic IDs (every Spark datatype is exportable), and can read an index ba
 against a declared schema with write→read fidelity. This document lists what a production customer
 deployment still needs, so the gaps are explicit rather than assumed.
 
-Treat everything under "Open items" as **not yet addressed** — work to be scoped and tracked
+Treat everything under "Open items" as **not yet addressed**: work to be scoped and tracked
 before a customer relies on it.
 
 ---
 
-## Open items — cross-cloud & networking
+## Open items: cross-cloud & networking
 
 - **Cross-partition connectivity (e.g. commercial AWS → AWS GovCloud).** GovCloud is a separate
   AWS partition (`aws-us-gov`). **PrivateLink does not cross partitions**, so a commercial→GovCloud
-  hop cannot be a private VPC endpoint — it traverses the public internet or a customer-operated
+  hop cannot be a private VPC endpoint: it traverses the public internet or a customer-operated
   proxy/transit path. **Validate the actual network path in the customer environment before
   promising anything.**
 - **Serverless egress IPs are a shifting NAT range, not a stable IP.** Do **not** allowlist a
@@ -26,7 +26,7 @@ before a customer relies on it.
   cross-partition **data-transfer-out cost** and whether the path even works are not. Close the
   business case with a real cross-cloud test.
 
-## Open items — security & compliance
+## Open items: security & compliance
 
 - **Ship secure configuration, not the sandbox posture.** The library defaults are secure
   (`verify_certs=True`). Production must use `verify_certs=True` with the customer's CA
@@ -36,10 +36,10 @@ before a customer relies on it.
   stored in a Databricks secret scope (`EsConfig(api_key=...)` is supported; no worked example
   ships yet).
 - **FIPS / FedRAMP.** Unaddressed. GovCloud security workloads frequently require FIPS-validated
-  crypto and FIPS endpoints — potentially a hard compliance gate, not a tuning knob. Confirm the
+  crypto and FIPS endpoints: potentially a hard compliance gate, not a tuning knob. Confirm the
   `elasticsearch-py`/OpenSSL posture and TLS floor required.
 
-## Open items — data durability & operations (deferred hardening)
+## Open items: data durability & operations (deferred hardening)
 
 These were consciously deferred to keep 0.1.0 focused. Needed before production for SIEM/audit data:
 
@@ -48,7 +48,7 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   (≤20) of per-doc failure diagnostics (`_id`, op, status, ES reason), and `total_input` lets a
   caller reconcile `written+deleted+errors` against rows-in to detect below-per-doc loss. This makes
   a failed write diagnosable and detectable. **Still deferred:** a durable **dead-letter path** that
-  captures *every* failed row (not just a sample) — for SIEM/audit, silent loss of the un-sampled
+  captures *every* failed row (not just a sample): for SIEM/audit, silent loss of the un-sampled
   failures beyond the cap is still a correctness gap. Route failures to a Delta table / DLQ.
 - **Backpressure / concurrency cap.** `mapInPandas` opens one ES client per Spark partition; a
   large Databricks cluster can overrun a modest ES cluster (429s). No coordinated throttle exists.
@@ -60,30 +60,30 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   Spark Connect is unreliable: `query.start()` can intermittently hang, and `awaitTermination(timeout)`
   does not honor its timeout there. Do not certify the interactive path.
 - **Streaming freshness expectations.** On serverless only `availableNow`/`Once` triggers work, so
-  end-to-end latency is job-cadence (≈30s–2min), not seconds. If a SIEM needs near-real-time, use a
+  end-to-end latency is job-cadence (≈30s to 2min), not seconds. If a SIEM needs near-real-time, use a
   classic job cluster with `processingTime`, or a Kafka bridge. Set this expectation explicitly.
 - **Per-run counts on serverless.** `query.recentProgress` read after an `availableNow` query
   terminates is empty client-side (Spark Connect), and a driver-local list mutated inside
-  `on_batch` does not propagate back (`foreachBatch` runs server-side) — so neither is a reliable
+  `on_batch` does not propagate back (`foreachBatch` runs server-side), so neither is a reliable
   "rows written this run" counter. Measure the ES doc-count delta, or push metrics from inside the
   batch (StatsD, a Delta audit table).
 - **Monitoring.** The `on_batch` hook is a seam for metrics but nothing sinks throughput / error
   rate / lag.
 - **Updates & deletes.** Inserts/upserts via deterministic `_id` shipped in 0.1.0; **deletes shipped
   in 0.2.0** (`has_deletes` + `delete_flag_column`, emitting delete-by-`_id` bulk actions with
-  scoped 404 no-op suppression). The connector deletes exactly the rows the caller flags — it does
+  scoped 404 no-op suppression). The connector deletes exactly the rows the caller flags: it does
   **not** dedup or order Change Data Feed rows itself. That is deliberate: dedup needs the caller's
   business sequencing column and should run distributed in Spark, not in executor memory (see the
   Change-Data-Feed pattern in the README). **Known limitation:** a caller that dedups per
-  micro-batch is only correct within a batch — late-arriving data whose `event_ts` is older than a
+  micro-batch is only correct within a batch: late-arriving data whose `event_ts` is older than a
   doc already in ES, but committed in a *later* batch, can clobber the newer doc. The memory-free
   fix is ES external versioning (`version` = `event_ts` epoch-millis, `version_type=external_gte`),
   deferred to keep the 0.2.0 API surface minimal.
 
-## Open items — read path (`read_index`, shipped 0.4.0)
+## Open items: read path (`read_index`, shipped 0.4.0)
 
 - **Explicit schema required; no mapping inference.** `read_index` requires the caller to declare a
-  Spark `StructType`. This is deliberate — several write transforms are one-way (epoch-millis,
+  Spark `StructType`. This is deliberate: several write transforms are one-way (epoch-millis,
   decimal→float, base64, variant/interval→string) and can't be inverted from `_source` alone. A
   best-effort `GET /_mapping` inference for the unambiguous types is a candidate for a later version,
   but must never silently guess the ambiguous ones.
@@ -101,7 +101,7 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   once, across shards) but has no throughput/large-index benchmark. `num_slices` defaults to the
   shard count; the optimal slice count and `batch_size` for a large export are untuned.
 
-## Open items — packaging & portability
+## Open items: packaging & portability
 
 - **Wheel install path is per-environment.** Notebooks `%pip install` from a specific UC Volume
   path; `%pip` cannot read a widget, so this line is edited per workspace. Documented in the
@@ -111,16 +111,16 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   `decimal`→float, `binary`→base64, `date`/`timestamp`→epoch-millis, array/map/struct, non-finite
   floats→null, plus a str fallback for anything unforeseen); `sanitize_for_arrow` (called by
   `bulk_write`) serializes the types that can't cross Arrow at all (`variant`, `interval`, at any
-  nesting depth) to a string — `variant`→JSON string, scalar `interval`→its Spark string form.
+  nesting depth) to a string: `variant`→JSON string, scalar `interval`→its Spark string form.
   Field pruning
   (`drop_fields`) is a client opt-out to shrink payload, never a capability limit. Non-string
   `map` keys are rendered to strings via the same value transform (0.3.1); Spark maps are
   homogeneously typed so keys stay distinct. Caveats to raise with a customer: (1) `decimal`→float
-  loses precision beyond ~15-17 sig figs — cast to string in Spark if exact decimals matter
+  loses precision beyond ~15-17 sig figs: cast to string in Spark if exact decimals matter
   (money/IDs); (2) added fields need matching ES mapping entries or ES dynamic-maps and guesses the
   type; (3) a Spark `FLOAT` (32-bit) stores its exact widened value (`0.1`→`0.10000000149011612`),
-  not the source literal — use `DOUBLE` if that matters; (4) `timestamp`→epoch-millis is floored to
-  the millisecond (sub-ms precision dropped; ES `date` is ms-resolution — use `date_nanos` for finer).
+  not the source literal: use `DOUBLE` if that matters; (4) `timestamp`→epoch-millis is floored to
+  the millisecond (sub-ms precision dropped; ES `date` is ms-resolution: use `date_nanos` for finer).
 - **ES version compatibility.** The client is pinned `elasticsearch>=8,<9`; the 8.x client refuses a
   9.x cluster. Confirm the customer's ES major version and adjust.
 

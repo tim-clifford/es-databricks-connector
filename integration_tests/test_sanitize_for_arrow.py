@@ -2,8 +2,8 @@
 # MAGIC %md
 # MAGIC # Integration: sanitize_for_arrow on real VARIANT / INTERVAL (live Spark)
 # MAGIC The pure-Python suite (`tests/test_spark_prep.py`) only covers the regex/parsing helpers; the
-# MAGIC actual Spark behavior of `sanitize_for_arrow` — `to_json` on VARIANT, `cast(string)` on scalar
-# MAGIC INTERVAL, and the fact that `df.schema` THROWS on a VARIANT column under Spark Connect — can
+# MAGIC actual Spark behavior of `sanitize_for_arrow`: `to_json` on VARIANT, `cast(string)` on scalar
+# MAGIC INTERVAL, and the fact that `df.schema` THROWS on a VARIANT column under Spark Connect, can
 # MAGIC only be exercised on a real serverless session. That is what this fixture does.
 # MAGIC
 # MAGIC No Elasticsearch needed: this tests only the Spark-side transform, not the write.
@@ -37,21 +37,21 @@ class TestSanitizeForArrow(NotebookTestFixture):
         """)
         self.out = sanitize_for_arrow(self.df)
         # Materialize the sanitized rows once. If sanitize missed a hostile column, .collect()
-        # (Arrow conversion) would raise here — so a clean collect is itself part of the contract.
+        # (Arrow conversion) would raise here, so a clean collect is itself part of the contract.
         self.rows = self.out.collect()
         self.row = self.rows[0].asDict()
 
     def test_raw_variant_df_schema_throws_on_connect(self):
         # The constraint that forces sanitize_for_arrow to use DESCRIBE instead of df.schema:
         # touching .schema on a VARIANT-bearing DataFrame raises under Spark Connect. If this ever
-        # STOPS throwing, the connector's DESCRIBE workaround could be simplified — so we assert it.
+        # STOPS throwing, the connector's DESCRIBE workaround could be simplified, so we assert it.
         err = None
         try:
             _ = self.df.schema  # VARIANT column present -> UNSUPPORTED_OPERATION on Connect
         except Exception as e:
             err = e
-        assert err is not None, "df.schema unexpectedly succeeded on a VARIANT column — revisit spark_prep"
-        # Assert it's specifically the unsupported-type error, not just any failure — a DIFFERENT
+        assert err is not None, "df.schema unexpectedly succeeded on a VARIANT column, revisit spark_prep"
+        # Assert it's specifically the unsupported-type error, not just any failure, a DIFFERENT
         # error would mean something else broke and this test should not quietly pass. Match on the
         # stable error-class token rather than a version-specific exception type.
         assert "UNSUPPORTED_OPERATION" in str(err), \
@@ -75,7 +75,7 @@ class TestSanitizeForArrow(NotebookTestFixture):
 
     def test_variant_nested_in_struct_serializes_whole_column(self):
         # A struct CONTAINING a variant is serialized whole (DESCRIBE can't navigate to the inner
-        # field), so the entire column lands as one JSON string — documented behavior.
+        # field), so the entire column lands as one JSON string, documented behavior.
         v = self.row["v_in_struct"]
         assert isinstance(v, str)
         assert json.loads(v) == {"v": {"a": True}, "label": "hi"}

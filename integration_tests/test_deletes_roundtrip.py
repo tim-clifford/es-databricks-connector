@@ -3,11 +3,11 @@
 # MAGIC # Integration: delete propagation (has_deletes) live through mapInPandas + ES
 # MAGIC Owns the **delete-routing** contract end-to-end: with `has_deletes=True` and a
 # MAGIC `delete_flag_column`, rows whose flag is truthy are sent to ES as delete-by-`_id` while every
-# MAGIC other row indexes as usual. Proves — against real serverless Spark + ES, not a stub — that:
+# MAGIC other row indexes as usual. Proves (against real serverless Spark + ES, not a stub) that:
 # MAGIC   - flagged `_id`s are removed from ES and unflagged rows are indexed;
 # MAGIC   - `result["deleted"]` counts successful deletes exactly, and the flag column is not indexed;
 # MAGIC   - a delete of an `_id` that isn't in ES is a **404 no-op** (counted as neither delete nor
-# MAGIC     error) — the connector's most subtle documented rule (`classify_bulk_result`'s scoped
+# MAGIC     error), the connector's most subtle documented rule (`classify_bulk_result`'s scoped
 # MAGIC     404 suppression), which unit tests cover in isolation but has never run live.
 # MAGIC
 # MAGIC The pure-Python suite covers `build_action` delete routing and `classify_bulk_result` with
@@ -67,7 +67,7 @@ class TestDeletesRoundtrip(NotebookTestFixture):
         self.count_after_mixed = self._count()
         self.ids_after_mixed = self._ids()
 
-        # --- phase 3: idempotent re-delete — deleting k1 again is another 404 no-op ---
+        # --- phase 3: idempotent re-delete, deleting k1 again is another 404 no-op ---
         redelete = spark.sql("""
             SELECT 'k1' AS doc_id, CAST(NULL AS INT) AS n, true AS _is_delete
         """)
@@ -110,7 +110,7 @@ class TestDeletesRoundtrip(NotebookTestFixture):
         # The scoped-suppression rule, proven live: k_absent was flagged for delete but never
         # existed. total_input=4, but only 3 ops "count" (2 deletes + 1 index); the 4th (absent
         # delete) is an ignored no-op. So written+deleted+errors = 3 < total_input = 4, with
-        # errors=0 — the reconciliation gap here is the EXPECTED delete-404, not lost data.
+        # errors=0: the reconciliation gap here is the EXPECTED delete-404, not lost data.
         r = self.res_mixed
         assert r["total_input"] == 4, r
         assert r["errors"] == 0, r

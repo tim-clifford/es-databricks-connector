@@ -1,4 +1,4 @@
-"""Unit tests for read.py's pure seams — EsReadConfig validation and the hit->row coercion — that
+"""Unit tests for read.py's pure seams (EsReadConfig validation and the hit->row coercion) that
 don't need Spark or a live ES. The scroll/PIT loop and createDataFrame are exercised live in the
 integration tier; here we cover the logic around them.
 """
@@ -23,7 +23,7 @@ def _rcfg(**kw):
 def test_read_config_defaults():
     c = _rcfg()
     assert c.query is None and c.num_slices is None
-    assert c.batch_size == 1000 and c.pit_keep_alive == "1m" and c.include_id is True
+    assert c.batch_size == 1000 and c.pit_keep_alive == "5m" and c.include_id is True
     assert "hosts" in c.client_kwargs()   # connection fields are shared from EsConnection
 
 def test_read_config_requires_hosts():
@@ -104,7 +104,7 @@ def test_resolve_num_slices_falls_back_to_one_on_error():
     assert _resolve_num_slices(es, "i", None) == 1
 
 def test_resolve_num_slices_warns_on_fallback(caplog):
-    # The serial single-slice fallback must not be silent — it forfeits parallelism.
+    # The serial single-slice fallback must not be silent: it forfeits parallelism.
     import logging
     es = _FakeES(settings=None)   # get_settings raises
     with caplog.at_level(logging.WARNING, logger="databricks_es_connector.read"):
@@ -113,7 +113,7 @@ def test_resolve_num_slices_warns_on_fallback(caplog):
                for r in caplog.records), "expected a WARNING naming the index on fallback"
 
 def test_resolve_num_slices_does_not_warn_when_configured(caplog):
-    # An explicit num_slices skips the shard lookup entirely — no warning even if get_settings would fail.
+    # An explicit num_slices skips the shard lookup entirely, no warning even if get_settings would fail.
     import logging
     es = _FakeES(settings=None)
     with caplog.at_level(logging.WARNING, logger="databricks_es_connector.read"):
@@ -247,6 +247,21 @@ def test_slice_hits_follows_refreshed_pit_id():
     assert es.calls[1]["pit"]["id"] == "pit-2"   # second uses the refreshed id
 
 
+def test_slice_hits_resends_keep_alive_on_every_page():
+    # The lazy-read PIT lifecycle documents `pit_keep_alive` as a SLIDING window: it need only cover
+    # the gap between consecutive reads, NOT the whole job, BECAUSE every page re-sends keep_alive
+    # and so resets the PIT's expiry. Guard that contract, a regression that sent keep_alive only on
+    # the first page (or dropped it after the initial open) would silently make the PIT expire
+    # mid-read under exactly the lazy/backpressure conditions the docs say are safe.
+    from databricks_es_connector.read import _slice_hits
+    es = _FakeSearchES([_page("a"), _page("b"), _page("c"), _page()])  # 3 data pages + terminator
+    list(_slice_hits(es, "pit-1", {"match_all": {}}, 500, "7m"))
+    # Every search call, first, middle, and the empty terminating one, carries keep_alive.
+    assert len(es.calls) == 4
+    for c in es.calls:
+        assert c["pit"]["keep_alive"] == "7m", c
+
+
 # --- entry-point orchestration + PIT lifecycle (fake Spark + stubbed ES) ---------------------
 
 class _FakeSpark:
@@ -339,7 +354,7 @@ def test_read_index_distributed_opens_pit_and_fans_out(monkeypatch):
     assert callable(spark.mapped["fn"])                # the slice reader
     assert spark.created is None                        # data never collected to the driver
     # The driver client is closed before returning (executors build their own), but the PIT is NOT
-    # closed here — the lazy DataFrame's executors read it later.
+    # closed here: the lazy DataFrame's executors read it later.
     assert es.client_closed == 1
     # Deliberately does NOT close the PIT (lazy DF must outlive this call).
     assert es.closed == []
@@ -355,7 +370,7 @@ def test_read_index_validates_before_touching_es(monkeypatch):
         read_mod.read_index(_FakeSpark(), _rcfg(index=""), _Schema([("doc_id", "string")]))
 
 def test_read_index_collect_swallows_pit_close_failure(monkeypatch):
-    # A failure closing the PIT OR the client must not fail the read — the rows are already
+    # A failure closing the PIT OR the client must not fail the read: the rows are already
     # collected, and the PIT will expire on its own. (Covers both defensive excepts in the finally.)
     import databricks_es_connector.read as read_mod
     class _CloseBoomES(_FakeSearchES):

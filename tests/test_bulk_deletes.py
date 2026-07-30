@@ -36,7 +36,7 @@ def test_config_has_deletes_requires_id_field():
 
 
 def test_config_flag_column_without_has_deletes_raises():
-    # A flag column with deletes off would silently do nothing — reject it.
+    # A flag column with deletes off would silently do nothing, reject it.
     with pytest.raises(ValueError, match="has_deletes is False"):
         _cfg(id_field="doc_id", delete_flag_column="d")
 
@@ -64,7 +64,7 @@ def test_delete_404_is_ignored_not_error():
 
 
 def test_index_404_is_still_an_error():
-    # A 404 on a NON-delete op must NOT be suppressed — suppression is scoped to deletes only.
+    # A 404 on a NON-delete op must NOT be suppressed: suppression is scoped to deletes only.
     assert classify_bulk_result(False, "index", 404) == ERROR
     assert classify_bulk_result(False, "update", 404) == ERROR
 
@@ -96,7 +96,7 @@ def test_partition_writer_counts_and_schema(monkeypatch):
         (True,  {"index":  {"status": 201}}),
         (True,  {"index":  {"status": 200}}),
         (True,  {"delete": {"status": 200}}),
-        (False, {"delete": {"status": 404}}),   # no-op — must NOT count
+        (False, {"delete": {"status": 404}}),   # no-op, must NOT count
         (False, {"index":  {"status": 409}}),   # real error
         (False, {"delete": {"status": 409}}),   # real error (non-404 delete)
     ]
@@ -265,7 +265,7 @@ def test_merge_empty_is_all_zero():
 # --- bulk_write orchestration wiring (fake Spark; symmetry with read_index's unit test) --------
 # bulk_write is linear glue: sanitize_for_arrow(df) -> df.mapInPandas(writer, schema).collect() ->
 # _merge_partition_results. Real Arrow/Spark behavior is covered live in the integration tier; here
-# we only assert the wiring — sanitize is applied, the mapInPandas result schema is the 5-field
+# we only assert the wiring: sanitize is applied, the mapInPandas result schema is the 5-field
 # contract, and the collected partition rows are merged into the final dict.
 
 def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
