@@ -3,14 +3,16 @@
 # MAGIC # Integration: write → read round-trip (bulk_write then read_index) live on Spark + ES
 # MAGIC The payoff test for the read path: take a Spark DataFrame, write it to ES with `bulk_write`,
 # MAGIC read it back with `read_index` using the **same schema**, and assert the round-tripped rows
-# MAGIC equal the originals — **except** the deltas the README documents as one-way (decimal
+# MAGIC equal the originals, **except** the deltas the README documents as one-way (decimal
 # MAGIC precision, sub-millisecond timestamp, float32 widening). This proves the read coercion layer
 # MAGIC (`read_coerce`) is the true inverse of the write transform against real Elasticsearch, not
 # MAGIC just in the offline unit oracle.
 # MAGIC
-# MAGIC v0.4.0 spike: uses the DRIVER-SIDE reader (Option A). The distributed sliced-scroll reader
-# MAGIC (Option B) will reuse the same coercion layer, so this round-trip stays the acceptance bar.
-# MAGIC Live ES + the `es_poc` scope required. Throwaway index, dropped per run.
+# MAGIC Exercises BOTH readers: the distributed sliced-scroll `read_index` (Option B, the at-scale
+# MAGIC path) and the driver-side `read_index_collect` (Option A, bounded reads); they share the
+# MAGIC coercion oracle and must agree. Also drives multi-slice fan-out and multi-PAGE paging (the
+# MAGIC sliding-window PIT keep-alive) against real ES. Live ES + the `es_poc` scope required.
+# MAGIC Throwaway indices, dropped per run.
 
 # COMMAND ----------
 import json, base64, datetime, requests, urllib3
@@ -32,7 +34,7 @@ ES_HOSTS = dbutils.secrets.get(SCOPE, "hosts")
 ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "password"))
 
 # The declared schema the reader must be given (v0.4.0: no inference). Covers the invertible types
-# and the documented-lossy ones. VARIANT/INTERVAL are excluded here — they read back as strings and
+# and the documented-lossy ones. VARIANT/INTERVAL are excluded here: they read back as strings and
 # are covered by test_datatype_coverage / test_sanitize_for_arrow; this fixture is about the typed
 # write->read inverse.
 SCHEMA = StructType([
@@ -51,7 +53,7 @@ SCHEMA = StructType([
         StructField("port", IntegerType()),
         # A DECIMAL nested inside a struct: its simpleString() is decimal(10,2), whose inner comma
         # regression-tests the DDL token splitter (a nested decimal previously corrupted struct
-        # field parsing — see tests/test_read_transform.py::test_struct_with_nested_decimal...).
+        # field parsing, see tests/test_read_transform.py::test_struct_with_nested_decimal...).
         StructField("weight", DecimalType(10, 2)),
     ])),
 ])
@@ -84,8 +86,8 @@ class TestReadRoundtrip(NotebookTestFixture):
         """)
 
         # Fresh index. Map the types ES needs: doc_id keyword, dates as epoch_millis, binary/struct
-        # dynamic. (An explicit date mapping isn't strictly required — the connector sends
-        # epoch-millis integers — but it makes the index self-describing.)
+        # dynamic. (An explicit date mapping isn't strictly required, the connector sends
+        # epoch-millis integers, but it makes the index self-describing.)
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
         body = {"settings": {"index": {"number_of_shards": 1, "number_of_replicas": 0}},
                 "mappings": {"properties": {
@@ -100,8 +102,8 @@ class TestReadRoundtrip(NotebookTestFixture):
         requests.post(f"{ES_HOSTS}/{INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
 
         # Read back with the SAME schema via BOTH entry points:
-        #   read_index         — distributed (mapInPandas fan-out); the primary at-scale path.
-        #   read_index_collect — driver-side; the bounded-read path.
+        #   read_index: distributed (mapInPandas fan-out); the primary at-scale path.
+        #   read_index_collect: driver-side; the bounded-read path.
         # Both must return identical rows (they share the coercion oracle); we assert the
         # distributed result against the source and cross-check the two agree.
         self.out = read_index(spark, self.read_cfg, SCHEMA)
@@ -129,6 +131,19 @@ class TestReadRoundtrip(NotebookTestFixture):
                                    StructField("n", IntegerType())])
         multi_out = read_index(spark, multi_read, multi_schema)
         self.multi_ids = {r["doc_id"] for r in multi_out.collect()}
+
+        # --- multi-PAGE read: force search_after paging over ONE PIT (sliding-window keep_alive) ---
+        # The reads above each fit in a single page (default/large batch_size), so they never page.
+        # Read the same 50-doc index with batch_size=5 and a single slice: ~10 sequential pages over
+        # one Point-in-Time. Each page re-sends pit_keep_alive and follows the refreshed pit_id, so a
+        # complete, gap-free, duplicate-free result proves the paging + sliding-window PIT extension
+        # (unit-guarded in tests/test_read.py) actually holds against real ES. A short keep_alive is
+        # deliberate: it must survive across pages BECAUSE each page extends it, not because it's long.
+        paged_read = EsReadConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
+                                  index=MULTI_INDEX, id_field="doc_id",
+                                  num_slices=1, batch_size=5, pit_keep_alive="1m")
+        paged_out = read_index(spark, paged_read, multi_schema)
+        self.paged_ids = [r["doc_id"] for r in paged_out.collect()]
 
     def run_cleanup(self):
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
@@ -187,6 +202,15 @@ class TestReadRoundtrip(NotebookTestFixture):
         assert self.multi_write_result["written"] == 50, self.multi_write_result
         expected = {f"m{i}" for i in range(50)}
         assert self.multi_ids == expected, (len(self.multi_ids), len(expected))
+
+    # --- multi-page: search_after paging over one PIT reads every doc once, across ~10 pages ---
+    def test_multipage_paging_reads_all_docs_once(self):
+        # 50 docs at batch_size=5 => ~10 sequential pages on one PIT. The result must be exactly the
+        # 50 ids with NO duplicates (a broken search_after or an expired PIT mid-read would drop or
+        # repeat docs). len == set size asserts no duplication; the set equality asserts no loss.
+        expected = {f"m{i}" for i in range(50)}
+        assert len(self.paged_ids) == 50, f"expected 50 docs across pages, got {len(self.paged_ids)}"
+        assert set(self.paged_ids) == expected, set(self.paged_ids) ^ expected
 
 
 # COMMAND ----------
