@@ -220,6 +220,22 @@ def test_epoch_millis_floors_consistently_across_epoch():
     assert _json_roundtrip(dt.datetime(1969, 12, 31, 23, 59, 59, tzinfo=dt.timezone.utc)) == -1000
 
 
+def test_epoch_millis_exact_for_far_future_dates():
+    # REGRESSION: v.timestamp() * 1000 loses ms precision at large magnitudes — a far-future
+    # instant drifts by 1ms (first divergence ~year 2106). Integer arithmetic must be exact.
+    # Compute the expected millis by exact integer math and assert the connector matches.
+    from databricks_es_connector.transform import _to_epoch_millis
+    epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    for v in (
+        dt.datetime(2106, 6, 15, 12, 34, 56, 789_000, tzinfo=dt.timezone.utc),
+        dt.datetime(2200, 1, 1, 0, 0, 0, 123_000, tzinfo=dt.timezone.utc),
+        dt.datetime(2299, 12, 31, 23, 59, 59, 999_000, tzinfo=dt.timezone.utc),
+    ):
+        expected = (v - epoch) // dt.timedelta(milliseconds=1)   # exact integer millis, floored
+        assert _to_epoch_millis(v) == expected, f"{v}: {_to_epoch_millis(v)} != {expected}"
+        assert _json_roundtrip(v) == expected                    # and via the public coerce path
+
+
 def test_dtype_binary_to_base64():    # Spark binary (bytes) -> base64 str (reversible)
     import base64
     out = _json_roundtrip(b"abc")

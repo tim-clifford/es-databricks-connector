@@ -51,21 +51,29 @@ def _is_null(v: Any) -> bool:
         return False          # e.g. numpy arrays — not a scalar null
 
 
+_EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+
+
 def _to_epoch_millis(v: Any) -> int:
     """Coerce a datetime/date to epoch milliseconds. Naive values are assumed UTC.
 
     Floors to the containing millisecond (sub-millisecond precision is dropped — ES `date` is
-    millisecond-resolution by default). `math.floor`, not `int()`: `int()` truncates toward zero,
-    which would round pre-epoch (negative) timestamps the OPPOSITE direction from post-epoch ones.
-    Flooring is consistent across the epoch boundary and matches Spark/Java `unix_millis`.
+    millisecond-resolution by default). Uses integer `timedelta` arithmetic rather than
+    `v.timestamp() * 1000`: the float multiply loses sub-ms resolution at large magnitudes and
+    drifts by ~1ms for far-future dates (first divergence ~year 2106). Python's `//` floors toward
+    negative infinity, which keeps the flooring consistent across the epoch boundary (pre-epoch
+    negatives round the same direction as post-epoch) and matches Spark/Java `unix_millis` — the
+    reason we floor rather than truncate toward zero.
     """
     if isinstance(v, _dt.datetime):
         if v.tzinfo is None:
             v = v.replace(tzinfo=_dt.timezone.utc)
-        return _math.floor(v.timestamp() * 1000)
-    # date without time -> midnight UTC
-    d = _dt.datetime(v.year, v.month, v.day, tzinfo=_dt.timezone.utc)
-    return _math.floor(d.timestamp() * 1000)
+    else:
+        # date without time -> midnight UTC
+        v = _dt.datetime(v.year, v.month, v.day, tzinfo=_dt.timezone.utc)
+    delta = v - _EPOCH_UTC
+    # timedelta // timedelta is exact integer division, floored toward -inf.
+    return delta // _dt.timedelta(milliseconds=1)
 
 
 def _coerce_key(k: Any) -> str:
