@@ -153,8 +153,14 @@ def read_index_collect(spark: "SparkSession", cfg: EsReadConfig, schema: "Struct
             for h in _slice_hits(es, pit_id, query, cfg.batch_size, cfg.pit_keep_alive)
         ]
     finally:
+        # Close the PIT and the driver client. Both are best-effort: the rows are already collected,
+        # and a leaked PIT expires on its own — a close failure must not fail the read.
         try:
             es.close_point_in_time(id=pit_id)
+        except Exception:
+            pass
+        try:
+            es.close()
         except Exception:
             pass
     return spark.createDataFrame(rows, schema)
@@ -215,8 +221,17 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
 
     from elasticsearch import Elasticsearch
     es = Elasticsearch(**cfg.client_kwargs())
-    num_slices = _resolve_num_slices(es, cfg.index, cfg.num_slices)
-    pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
+    try:
+        num_slices = _resolve_num_slices(es, cfg.index, cfg.num_slices)
+        pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
+    finally:
+        # The driver client's only jobs are resolving the slice count and opening the PIT; each
+        # executor builds its own client. Close this one now (best-effort) so it doesn't leak — but
+        # do NOT close the PIT: the returned DataFrame is lazy and the executors read it later.
+        try:
+            es.close()
+        except Exception:
+            pass
 
     reader = _make_slice_reader(cfg, pit_id, query, field_tokens, num_slices)
     # One row per slice, one partition per slice, so each task handles exactly one slice. `range`

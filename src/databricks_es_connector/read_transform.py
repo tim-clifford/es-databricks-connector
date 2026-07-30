@@ -32,14 +32,20 @@ def _is_null(v: Any) -> bool:
     return v is None
 
 
+_EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
+
+
 def _epoch_millis_to_datetime(v: Any) -> _dt.datetime:
     """Inverse of transform._to_epoch_millis for a timestamp: epoch-millis int -> aware UTC datetime.
 
     Mirrors the write side's UTC treatment: writes floor to the millisecond in UTC, so we read back
     in UTC. Sub-millisecond precision was dropped on write (documented), so this is exact to the ms.
+
+    Uses integer timedelta arithmetic (epoch + timedelta(milliseconds=ms)) rather than
+    `fromtimestamp(ms / 1000)`: the float division loses sub-ms resolution at large magnitudes and
+    introduces a spurious ~1µs error for far-future dates (~year 2245+). timedelta keeps it exact.
     """
-    ms = int(v)
-    return _dt.datetime.fromtimestamp(ms / 1000, tz=_dt.timezone.utc)
+    return _EPOCH_UTC + _dt.timedelta(milliseconds=int(v))
 
 
 def _epoch_millis_to_date(v: Any) -> _dt.date:
@@ -123,12 +129,18 @@ def _inner(token: str, prefix: str) -> str:
 
 
 def _split_top_level(body: str):
-    """Split a struct/map body on top-level commas only (ignoring commas inside nested <...>)."""
+    """Split a struct/map body on top-level commas only.
+
+    Ignores commas nested inside `<...>` (nested struct/array/map) AND inside `(...)` — the latter
+    matters because a `decimal(p,s)` token carries a comma between its precision and scale, e.g.
+    `struct<a:decimal(10,2),b:int>`. Tracking angle-bracket depth alone would wrongly split on that
+    inner comma; we track paren depth too.
+    """
     parts, depth, start = [], 0, 0
     for i, ch in enumerate(body):
-        if ch == "<":
+        if ch in "<(":
             depth += 1
-        elif ch == ">":
+        elif ch in ">)":
             depth -= 1
         elif ch == "," and depth == 0:
             parts.append(body[start:i]); start = i + 1
@@ -144,8 +156,10 @@ def _split_map(token: str):
 
 
 def _struct_fields(token: str):
-    """struct<name:type,name:type,...> -> [(name, type), ...], depth-aware on the field split
-    and on the first ':' (field name never contains '<' or ':')."""
+    """struct<name:type,name:type,...> -> [(name, type), ...]. The field split (_split_top_level) is
+    depth-aware over both <...> and (...) so a decimal(p,s)'s inner comma doesn't split a field. The
+    name/type split is a plain first-':' partition: a Spark field name contains no ':' (or brackets),
+    so the first ':' always separates name from type, even when the type is a decimal or a struct."""
     body = token[len("struct<"):-1]
     out = []
     for field in _split_top_level(body):

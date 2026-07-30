@@ -175,3 +175,37 @@ def test_struct_with_nested_container_fields_parses():
     src = {"m": {"x": 1}, "a": [1, 2], "n": 5}
     out = read_coerce(src, tok)
     assert out == {"m": {"x": 1}, "a": [1, 2], "n": 5}
+
+def test_struct_with_nested_decimal_field_parses():
+    # REGRESSION: a decimal(p,s) token carries a comma INSIDE its parens. The field splitter must
+    # ignore that comma (paren-aware), or the struct gains a spurious "2)" field and following
+    # fields shift. This is exactly Spark's simpleString() form: struct<a:decimal(10,2),b:int>.
+    tok = "struct<a:decimal(10,2),b:int>"
+    out = read_coerce({"a": 1.5, "b": 3}, tok)
+    assert out == {"a": Decimal("1.5"), "b": 3}
+    assert set(out.keys()) == {"a", "b"}      # no spurious "2)" key
+
+def test_map_value_decimal_parses():
+    # REGRESSION: map<string,decimal(10,2)> — the inner comma must not split the key/value types.
+    out = read_coerce({"k": 2.5}, "map<string,decimal(10,2)>")
+    assert out == {"k": Decimal("2.5")}
+
+def test_array_of_decimal_parses():
+    # REGRESSION: array<decimal(10,2)> — element type must be the full decimal token, not "decimal(10".
+    out = read_coerce([1.5, 2.5], "array<decimal(10,2)>")
+    assert out == [Decimal("1.5"), Decimal("2.5")]
+
+def test_struct_of_array_of_decimal_parses():
+    # Nested paren + angle brackets together: the two depth counters must not interfere.
+    tok = "struct<vals:array<decimal(5,2)>,n:int>"
+    out = read_coerce({"vals": [1.1, 2.2], "n": 7}, tok)
+    assert out == {"vals": [Decimal("1.1"), Decimal("2.2")], "n": 7}
+
+def test_far_future_timestamp_exact_to_ms():
+    # REGRESSION: fromtimestamp(ms/1000) float division introduced a spurious ~1us error for
+    # far-future dates (~2245+). Integer timedelta arithmetic must round-trip exact-to-the-ms.
+    far = dt.datetime(2250, 5, 16, 4, 36, 8, 915000, tzinfo=dt.timezone.utc)
+    ms = int(far.timestamp() * 1000)
+    back = read_coerce(ms, "timestamp")
+    assert back == far
+    assert back.microsecond == 915000    # not 915001
