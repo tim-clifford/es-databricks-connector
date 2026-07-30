@@ -288,12 +288,6 @@ the driver. Each one takes the same **connection fields** (hosts, auth, TLS, cli
 fields specific to its direction. So a config is `connection + write behavior` or
 `connection + read behavior`; the three tables below split exactly along that line.
 
-> **Where `EsConnection` fits:** the shared connection fields are defined once on a base class,
-> `EsConnection`, that `EsWriteConfig` and `EsReadConfig` both inherit. **You never instantiate
-> `EsConnection` directly** — it has no `index` and issues no requests; it exists only so the
-> connection fields aren't duplicated across the two real configs. Pass those fields straight to
-> `EsWriteConfig` / `EsReadConfig`.
-
 > **`EsConfig` is a backward-compatible alias for `EsWriteConfig`** (its name before the config
 > split), so existing write code keeps working unchanged. New code should use `EsWriteConfig`.
 
