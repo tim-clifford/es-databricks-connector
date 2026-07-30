@@ -146,19 +146,25 @@ def read_index_collect(spark: "SparkSession", cfg: EsReadConfig, schema: "Struct
 
     from elasticsearch import Elasticsearch
     es = Elasticsearch(**cfg.client_kwargs())
-    pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
+    pit_id = None
     try:
+        # open_point_in_time is INSIDE the try so a failure here still closes the client below (no
+        # PIT exists yet to close — pit_id stays None). Keeping it outside would leak the client on
+        # a PIT-open failure.
+        pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
         rows = [
             _coerce_hit(h.get("_source", {}), h.get("_id"), field_tokens, cfg.id_field, cfg.include_id)
             for h in _slice_hits(es, pit_id, query, cfg.batch_size, cfg.pit_keep_alive)
         ]
     finally:
-        # Close the PIT and the driver client. Both are best-effort: the rows are already collected,
-        # and a leaked PIT expires on its own — a close failure must not fail the read.
-        try:
-            es.close_point_in_time(id=pit_id)
-        except Exception:
-            pass
+        # Close the PIT (only if one was opened) and the driver client. Both are best-effort: the
+        # rows are already collected, and a leaked PIT expires on its own — a close failure must not
+        # fail the read.
+        if pit_id is not None:
+            try:
+                es.close_point_in_time(id=pit_id)
+            except Exception:
+                pass
         try:
             es.close()
         except Exception:

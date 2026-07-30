@@ -186,17 +186,21 @@ def test_struct_with_nested_decimal_field_parses():
     assert set(out.keys()) == {"a", "b"}      # no spurious "2)" key
 
 def test_map_value_decimal_parses():
-    # REGRESSION: map<string,decimal(10,2)> — the inner comma must not split the key/value types.
+    # Guard (not red-before-green): a map valtype's decimal comma. This survived the pre-fix bug by
+    # luck — the truncated "decimal(10" still hit the startswith("decimal") branch — but pin it so
+    # the paren-aware split stays correct here too.
     out = read_coerce({"k": 2.5}, "map<string,decimal(10,2)>")
     assert out == {"k": Decimal("2.5")}
 
 def test_array_of_decimal_parses():
-    # REGRESSION: array<decimal(10,2)> — element type must be the full decimal token, not "decimal(10".
+    # Guard: array element decimal. array<...> uses _inner (never splits on commas), so this passed
+    # pre-fix too; kept to pin the contract.
     out = read_coerce([1.5, 2.5], "array<decimal(10,2)>")
     assert out == [Decimal("1.5"), Decimal("2.5")]
 
 def test_struct_of_array_of_decimal_parses():
-    # Nested paren + angle brackets together: the two depth counters must not interfere.
+    # Guard: nested paren + angle brackets together — the decimal comma is shielded by the inner
+    # array<>, so this also passed pre-fix; kept so the two depth counters can't regress and interfere.
     tok = "struct<vals:array<decimal(5,2)>,n:int>"
     out = read_coerce({"vals": [1.1, 2.2], "n": 7}, tok)
     assert out == {"vals": [Decimal("1.1"), Decimal("2.2")], "n": 7}

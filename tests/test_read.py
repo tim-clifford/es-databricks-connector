@@ -370,6 +370,20 @@ def test_read_index_collect_swallows_pit_close_failure(monkeypatch):
     rows, _ = spark.created
     assert [r["doc_id"] for r in rows] == ["a"]   # read succeeded despite both close failures
 
+def test_read_index_collect_closes_client_when_pit_open_fails(monkeypatch):
+    # If open_point_in_time raises, the driver client must still be closed (no leak), and NO
+    # PIT-close should be attempted (none was opened). Guards the open-inside-try fix.
+    import databricks_es_connector.read as read_mod
+    class _OpenBoomES(_FakeSearchES):
+        def open_point_in_time(self, index, keep_alive):
+            raise RuntimeError("pit open failed")
+    es = _OpenBoomES([])
+    _install_fake_es(monkeypatch, es)
+    with pytest.raises(RuntimeError, match="pit open failed"):
+        read_mod.read_index_collect(_FakeSpark(), _rcfg(), _Schema([("doc_id", "string")]))
+    assert es.client_closed == 1   # client closed despite the open failure
+    assert es.closed == []         # no PIT was opened, so none was closed
+
 def test_read_index_distributed_swallows_client_close_failure(monkeypatch):
     # In the distributed path the driver client close is best-effort too: a failure must not stop
     # us returning the lazy DataFrame. (Covers the except around es.close() in read_index.)
