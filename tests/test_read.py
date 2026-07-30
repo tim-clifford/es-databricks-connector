@@ -328,3 +328,17 @@ def test_read_index_validates_before_touching_es(monkeypatch):
         read_mod.read_index(_FakeSpark(), _rcfg(), _Schema([]))
     with pytest.raises(ValueError, match="index is required"):
         read_mod.read_index(_FakeSpark(), _rcfg(index=""), _Schema([("doc_id", "string")]))
+
+def test_read_index_collect_swallows_pit_close_failure(monkeypatch):
+    # A failure closing the PIT must not fail the read — the rows are already collected, and the
+    # PIT will expire on its own. (Covers the defensive except around close_point_in_time.)
+    import databricks_es_connector.read as read_mod
+    class _CloseBoomES(_FakeSearchES):
+        def close_point_in_time(self, id):
+            raise RuntimeError("close failed")
+    es = _CloseBoomES([_page("a"), _page()])
+    _install_fake_es(monkeypatch, es)
+    spark = _FakeSpark()
+    out = read_mod.read_index_collect(spark, _rcfg(), _Schema([("doc_id", "string")]))
+    rows, _ = spark.created
+    assert [r["doc_id"] for r in rows] == ["a"]   # read succeeded despite the close failure

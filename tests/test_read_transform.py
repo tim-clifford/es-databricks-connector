@@ -151,6 +151,13 @@ def test_array_of_structs_roundtrip():
 
 # --- token parser edge cases (nested commas must not split fields) ---------------------------
 
+def test_unknown_token_passes_value_through():
+    # An unrecognized type token must not crash — the value passes through unchanged (a defensive
+    # fallback; the caller declared the schema, so this is a last resort, not the normal path).
+    assert read_coerce({"anything": 1}, "somefuturetype") == {"anything": 1}
+    assert read_coerce(42, "geo_point") == 42
+
+
 def test_struct_with_nested_container_fields_parses():
     # A struct whose fields are themselves containers: the top-level split must ignore the inner
     # commas of map<string,int> / array<int>.

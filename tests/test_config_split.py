@@ -26,6 +26,15 @@ def test_connection_validation_is_shared():
             cls(hosts="https://h:9200", basic_auth=("u", "p"), verify_certs=False, ca_certs="/x")
 
 
+def test_client_kwargs_includes_ca_certs_when_pinned():
+    # ca_certs (CA-bundle pinning) must be passed through to the ES client kwargs.
+    w = EsWriteConfig(hosts="https://h:9200", api_key="k", index="i", ca_certs="/etc/ca.pem")
+    kw = w.client_kwargs()
+    assert kw["ca_certs"] == "/etc/ca.pem"
+    # And omitted (not None) when not set, so the client uses its default trust store.
+    assert "ca_certs" not in EsWriteConfig(hosts="https://h:9200", api_key="k", index="i").client_kwargs()
+
+
 def test_client_kwargs_identical_for_same_connection():
     # The client kwargs come from the shared base, so a read and write config with the same
     # connection produce the same client configuration.
