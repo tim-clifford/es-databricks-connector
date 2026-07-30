@@ -165,7 +165,7 @@ def test_numpy_array_nested_nulls_and_timestamps_coerced():
 # --- explicit coverage: every Spark datatype that reaches coerce_value must become
 # JSON-serializable and land as usable data. The Python object each case uses is what
 # mapInPandas actually produces for that Spark type (verified empirically on serverless).
-# The contract under test is json.dumps() succeeding — that is exactly what breaks in
+# The contract under test is json.dumps() succeeding, that is exactly what breaks in
 # helpers.bulk when a type is not coerced.
 
 def _json_roundtrip(v):
@@ -207,7 +207,7 @@ def test_dtype_decimal_to_float():    # Spark decimal -> float (numeric + querya
 
 
 def test_epoch_millis_floors_consistently_across_epoch():
-    # epoch-millis must FLOOR to the containing millisecond, not truncate toward zero — otherwise
+    # epoch-millis must FLOOR to the containing millisecond, not truncate toward zero, otherwise
     # pre-epoch (negative) timestamps round the wrong direction vs post-epoch, an inconsistency.
     # Matches Spark/Java unix_millis floor semantics.
     # 0.5 ms AFTER epoch -> floors to 0.
@@ -221,7 +221,7 @@ def test_epoch_millis_floors_consistently_across_epoch():
 
 
 def test_epoch_millis_exact_for_far_future_dates():
-    # REGRESSION: v.timestamp() * 1000 loses ms precision at large magnitudes — a far-future
+    # REGRESSION: v.timestamp() * 1000 loses ms precision at large magnitudes, a far-future
     # instant drifts by 1ms (first divergence ~year 2106). Integer arithmetic must be exact.
     # Compute the expected millis by exact integer math and assert the connector matches.
     from databricks_es_connector.transform import _to_epoch_millis
@@ -259,7 +259,7 @@ def test_dtype_empty_map():           # Spark map() -> {} (sibling of the empty-
 
 # --- nulls INSIDE containers (not just a fully-null row) ---
 # A client with sparse nested data relies on a null map value / array element / struct field
-# landing as JSON null, recursively — the _is_null guard must fire inside the dict/list recursion,
+# landing as JSON null, recursively, the _is_null guard must fire inside the dict/list recursion,
 # not only at the top level.
 
 def test_null_map_value_becomes_json_null():
@@ -332,7 +332,7 @@ def test_map_bool_key_becomes_true_false_string():
 
 
 def test_nested_map_with_nonstring_keys_coerced():
-    # A struct holding a map<int,timestamp> — keys AND values both need coercion, recursively.
+    # A struct holding a map<int,timestamp>: keys AND values both need coercion, recursively.
     row = {"counts": {10: dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc)}}
     assert _json_roundtrip(row) == {"counts": {"10": 1704067200000}}
 
@@ -343,7 +343,7 @@ def test_dtype_interval_as_string():  # INTERVAL can't cross Arrow; sanitize_for
 
 
 def test_dtype_unknown_object_falls_back_to_string():
-    # Total fallback: an unforeseen non-JSON-native object must not crash the write —
+    # Total fallback: an unforeseen non-JSON-native object must not crash the write,
     # it lands as its string form. (Guards the helpers.bulk failure mode generically.)
     class Weird:
         def __str__(self):

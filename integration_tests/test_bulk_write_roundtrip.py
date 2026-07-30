@@ -53,10 +53,10 @@ class TestBulkWriteResultContract(NotebookTestFixture):
             f"{ES_HOSTS}/{INDEX}/_count", auth=ES_AUTH, verify=False, timeout=30).json()["count"]
 
         # A batch with one doc ES will reject. n is a STRING column (both rows cast to string, so the
-        # UNION's common type is string — otherwise Spark coerces to BIGINT and 'not-an-int' fails to
+        # UNION's common type is string, otherwise Spark coerces to BIGINT and 'not-an-int' fails to
         # cast inside Spark before the connector ever runs). The connector sends both as JSON strings;
         # under the integer mapping ES coerces "10" to the int 10 (indexes) but rejects "not-an-int"
-        # (mapper_parsing_exception) — the deterministic ES-side error this test wants.
+        # (mapper_parsing_exception), the deterministic ES-side error this test wants.
         mixed = spark.sql("""
             SELECT 'ok1' AS doc_id, CAST('10' AS STRING) AS n UNION ALL
             SELECT 'bad1', CAST('not-an-int' AS STRING)
@@ -67,7 +67,7 @@ class TestBulkWriteResultContract(NotebookTestFixture):
         # makes the second upsert OVER the first. Every op succeeds (written == total_input == 3)
         # and the reconciliation identity holds, yet ES ends up with FEWER docs than rows fed in.
         # A client exporting a table with non-unique id_field values sees a lower doc count with no
-        # error signal — this pins that documented behavior. Fresh index so the count is unambiguous.
+        # error signal: this pins that documented behavior. Fresh index so the count is unambiguous.
         requests.delete(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
         dup_cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
                            index=DUP_INDEX, id_field="doc_id", http_compress=True)
@@ -83,7 +83,7 @@ class TestBulkWriteResultContract(NotebookTestFixture):
 
     def run_cleanup(self):
         # Reference the module constants (not setup-time instance state) so cleanup runs correctly
-        # even if run_setup raised before finishing — no masking AttributeError on self.dup_index.
+        # even if run_setup raised before finishing, no masking AttributeError on self.dup_index.
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
         requests.delete(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
 
@@ -117,7 +117,7 @@ class TestBulkWriteResultContract(NotebookTestFixture):
         assert (self.res_dup["written"] + self.res_dup["deleted"] + self.res_dup["errors"]
                 == self.res_dup["total_input"])
         # ...yet ES holds only 2 docs: the duplicate id upserted over itself. This is the client
-        # gotcha — fewer docs than input rows, with no error to signal it.
+        # gotcha: fewer docs than input rows, with no error to signal it.
         assert self.dup_es_count == 2, self.dup_es_count
 
     # --- error path: a rejected doc must be counted AND sampled, good docs still written ---

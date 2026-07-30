@@ -5,7 +5,7 @@ Serverless-safe, bi-directional transfer between Databricks/Spark and Elasticsea
 Python library. **Write:** given a Spark DataFrame and an `EsWriteConfig`, it writes rows to an
 Elasticsearch index via the `elasticsearch-py` client, parallelized across executors with
 `mapInPandas` (serverless-safe), with gzip request compression and deterministic document IDs for
-idempotent upserts. The writer is schema-agnostic — hand it any DataFrame, no pre-processing.
+idempotent upserts. The writer is schema-agnostic: hand it any DataFrame, no pre-processing.
 **Read:** given an `EsReadConfig` and a *declared* Spark schema (the reader does not infer one),
 `read_index` pulls an index back into a DataFrame, distributed across executors via a sliced
 Point-in-Time scroll.
@@ -51,17 +51,17 @@ compression. The Python client has none of those limits.
 
 - **Serverless works.** Both the write and the read path use `mapInPandas`, not RDD APIs
   (`foreachPartition` and custom `DataSource`/RDD readers are blocked on serverless). Work still
-  fans out across executors — writes partition the DataFrame, reads fan out one task per index slice.
-- **Egress-minimized.** `http_compress=True` gzips both directions (~5–10x on JSON): the request
+  fans out across executors: writes partition the DataFrame, reads fan out one task per index slice.
+- **Egress-minimized.** `http_compress=True` gzips both directions (~5-10x on JSON): the request
   body on write, and the ES response on read. A lever for cross-cloud cost either way.
 
 **Writing** (`bulk_write` / `make_foreach_batch`):
 
 - **Idempotent.** Deterministic `_id` (from a configurable column) means checkpoint
   replays and backfills upsert instead of duplicating.
-- **Field pruning.** `drop_fields` drops columns you don't need indexed before the write — a further
+- **Field pruning.** `drop_fields` drops columns you don't need indexed before the write, a further
   write-side egress lever on top of compression.
-- **Schema-agnostic on write.** The writer knows nothing about your schema or data model — you
+- **Schema-agnostic on write.** The writer knows nothing about your schema or data model, you
   hand it any DataFrame and a target index, and every Spark datatype is exportable with no
   pre-processing (see [Datatype coverage](#datatype-coverage-write-transforms--read-inverse)).
 
@@ -69,7 +69,7 @@ compression. The Python client has none of those limits.
 
 - **Distributed snapshot read.** One Elasticsearch Point-in-Time gives a consistent snapshot, and a
   sliced scroll fans out across executors (one task per shard/slice) so a full-index export scales.
-- **Explicit schema required.** Unlike the writer, the reader must be handed a Spark schema — several
+- **Explicit schema required.** Unlike the writer, the reader must be handed a Spark schema: several
   stored values are ambiguous and can't be inverted from `_source` alone, so the caller declares the
   intended types. This is the deliberate trade-off for exact write→read fidelity; see
   [Read fidelity](#read-fidelity-write--read).
@@ -82,7 +82,7 @@ configured with an [`EsWriteConfig`](#write-behavior-eswriteconfig).
 ### Batch (`bulk_write`)
 
 > **First time in a workspace?** Install the library and create the ES secret scope before
-> running any of the snippets below — see [Deploying to a workspace](#deploying-to-a-workspace).
+> running any of the snippets below, see [Deploying to a workspace](#deploying-to-a-workspace).
 > The examples assume `databricks_es_connector` is importable and secrets exist.
 
 ```python
@@ -141,7 +141,7 @@ are sent to ES as a delete-by-`_id`; all other rows index as usual.
 ```python
 cfg = EsWriteConfig(
     hosts=..., api_key=..., index="my-index",
-    id_field="doc_id",              # required for deletes — you delete by _id
+    id_field="doc_id",              # required for deletes: you delete by _id
     has_deletes=True,
     delete_flag_column="_is_delete",  # truthy row => delete that _id from ES
 )
@@ -149,7 +149,7 @@ result = bulk_write(prepared_df, cfg)   # -> {"written": N, "deleted": D, "error
 ```
 
 The connector is schema-agnostic about *how* you decide the latest state of a row: it deletes
-exactly the rows you flag and indexes the rest. A common source is a Delta **Change Data Feed** —
+exactly the rows you flag and indexes the rest. A common source is a Delta **Change Data Feed**:
 you dedup to one record per id in Spark and set the flag from `_change_type == 'delete'`. That
 ordering/dedup work stays in your pipeline, not in the connector, because it needs your business
 sequencing column (e.g. `event_ts`) and the sort should run distributed in Spark rather than in
@@ -174,7 +174,7 @@ def upsert_latest(batch_df, batch_id):
 
 **Ordering caveat:** dedup like the above is only authoritative *within* one micro-batch. Across
 batches, Elasticsearch applies writes in arrival/commit order, so a late-arriving row whose
-`event_ts` is older than a doc already in ES — but committed in a later batch — can overwrite the
+`event_ts` is older than a doc already in ES, but committed in a later batch, can overwrite the
 newer doc. If your source can deliver out-of-order events across batches, make `event_ts` globally
 authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 `version_type=external_gte`) so ES itself rejects stale writes regardless of batch order.
@@ -199,17 +199,17 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 - **Reconcile with `total_input`.** `written + deleted + errors` should equal `total_input` minus
   any delete-404 no-ops. If it is **less**, some rows were lost below the per-document level (for
   example a chunk-level serialization/transport error), which the per-doc `errors` count cannot
-  see — so check this equality if exactness matters.
+  see, so check this equality if exactness matters.
 - **`error_samples` is a breadcrumb, not a dead-letter queue.** It retains up to the first 20
   failures (id, op, HTTP status, ES reason) so a failed write is diagnosable instead of an opaque
   count. The `errors` count is always exact; only the retained sample list is capped, so a batch
   that fails wholesale can't exhaust memory. If you need every failed row durably, capture them
-  from your own pipeline — the connector does not persist them.
-- **Duplicate `id_field` values collapse — and reconciliation won't flag it.** If `id_field` is
+  from your own pipeline, the connector does not persist them.
+- **Duplicate `id_field` values collapse, and reconciliation won't flag it.** If `id_field` is
   set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
   over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
   success (`written` counts each op, not each surviving doc), so `written + deleted + errors` still
-  equals `total_input` — the reconciliation identity passes even though the ES doc count is lower.
+  equals `total_input`: the reconciliation identity passes even though the ES doc count is lower.
   This is the same idempotency that makes replays safe, but if you expect a 1:1 row→document
   mapping, ensure `id_field` is unique across the input (e.g. dedup upstream) or leave it unset to
   let ES assign random ids.
@@ -219,7 +219,7 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 ### `read_index` / `read_index_collect`
 
 Read an Elasticsearch index back into a Spark DataFrame. **You must declare the target Spark
-schema** — the reader does not infer it (see [Read fidelity](#read-fidelity-write--read) for why).
+schema**: the reader does not infer it (see [Read fidelity](#read-fidelity-write--read) for why).
 
 ```python
 from databricks_es_connector import EsReadConfig, read_index
@@ -243,11 +243,11 @@ df = read_index(spark, cfg, schema)  # distributed: one Spark task per shard/sli
 ```
 
 **`read_index` is distributed** and serverless-safe: it opens one Elasticsearch Point-in-Time for a
-consistent snapshot, then fans out `spark.range(num_slices).mapInPandas(...)` — one task per PIT
+consistent snapshot, then fans out `spark.range(num_slices).mapInPandas(...)`, one task per PIT
 slice (defaulting to the index's shard count), each task paging its slice with `search_after`. The
 data stays across executors (never collected to the driver), so it scales for full-index export.
 
-- **PIT lifetime is a sliding window, not a total budget.** The returned DataFrame is **lazy** —
+- **PIT lifetime is a sliding window, not a total budget.** The returned DataFrame is **lazy**:
   Spark reads each slice when an action runs, not when `read_index` returns. Every page request
   re-sends `pit_keep_alive` and resets the Point-in-Time's expiry, so `pit_keep_alive` only has to
   cover the longest gap *between* consecutive reads of the PIT, not the whole job's wall-clock: the
@@ -265,7 +265,7 @@ data stays across executors (never collected to the driver), so it scales for fu
 Reads honor the **same contract as writes**: `read_index(cfg, df.schema)` after `bulk_write(df,
 cfg)` reproduces the original DataFrame, **except** the deltas the
 [Datatype coverage](#datatype-coverage-write-transforms--read-inverse) table documents as one-way (decimal precision beyond
-~15–17 sig figs, sub-millisecond timestamp truncation, float32 widening). Each read coercion is the
+~15-17 sig figs, sub-millisecond timestamp truncation, float32 widening). Each read coercion is the
 exact inverse of the write transform:
 
 | Declared Spark type | Stored in ES | Read back as |
@@ -278,7 +278,7 @@ exact inverse of the write transform:
 
 **Why the schema is required:** an epoch-millis integer in `_source` could be a `timestamp`, a
 `date`, or a genuine `long`; a base64 string could be `binary` or a real `keyword`. The stored value
-alone is ambiguous, so the reader must be told the intended type. There is no mapping inference —
+alone is ambiguous, so the reader must be told the intended type. There is no mapping inference:
 declare the schema explicitly. (ES also has no array type: a field declared `array<T>` is read as a
 list even if ES returned a scalar.)
 
@@ -286,11 +286,11 @@ list even if ES returned a scalar.)
 
 **You always create one of two config objects**, depending on the direction:
 
-- **`EsWriteConfig`** — for `bulk_write` / `make_foreach_batch`.
-- **`EsReadConfig`** — for `read_index` / `read_index_collect`.
+- **`EsWriteConfig`**: for `bulk_write` / `make_foreach_batch`.
+- **`EsReadConfig`**: for `read_index` / `read_index_collect`.
 
 Both are frozen, serializable dataclasses (in `src/databricks_es_connector/config.py`) so they can
-be shipped to Spark executors — the Elasticsearch client is built *inside* each partition, never on
+be shipped to Spark executors: the Elasticsearch client is built *inside* each partition, never on
 the driver. Each one takes the same **connection fields** (hosts, auth, TLS, client tuning) plus the
 fields specific to its direction. So a config is `connection + write behavior` or
 `connection + read behavior`; the three tables below split exactly along that line.
@@ -305,7 +305,7 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
-| `hosts` | `str` | — | **Yes** | e.g. `"https://host:9200"`. Empty string raises `ValueError`. |
+| `hosts` | `str` | - | **Yes** | e.g. `"https://host:9200"`. Empty string raises `ValueError`. |
 | `api_key` | `str \| None` | `None` | one-of\* | Preferred auth. Base64 `id:key` or an encoded key. |
 | `basic_auth` | `tuple \| None` | `None` | one-of\* | `("user", "pass")`. Sandbox/dev only; prefer `api_key` in prod. |
 | `verify_certs` | `bool` | `True` | No | Set `False` for self-signed sandbox boxes. Library default is secure. |
@@ -344,11 +344,11 @@ raises (pick one).
 
 When `has_deletes=True` the constructor requires both `id_field` (you cannot delete without an
 `_id`) and `delete_flag_column`, and raises `ValueError` otherwise. Setting `delete_flag_column`
-while `has_deletes=False` also raises — a flag column that does nothing is a misconfiguration, not
+while `has_deletes=False` also raises: a flag column that does nothing is a misconfiguration, not
 a silent no-op.
 
 Delete idempotency: deleting a doc that isn't in ES returns a 404, which the connector treats as
-an expected no-op (not an error) — so checkpoint replays, filtered rows, and re-processed deletes
+an expected no-op (not an error), so checkpoint replays, filtered rows, and re-processed deletes
 stay clean. This suppression is scoped strictly to `delete` + `404`; a 404 on an index, or any
 other status on a delete, is still counted in `errors`.
 
@@ -363,10 +363,10 @@ cross-batch ordering caveat.
 |-------|------|---------|----------|-------|
 | `index` | `str` | `""` | **Yes** | Source index. `read_index` raises if empty. |
 | `id_field` | `str \| None` | `None` | No | If the declared schema names this column, it is filled from the ES `_id` when absent from `_source`. |
-| `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read (e.g. `{"term": {...}}`). `None` = `match_all`. v1 accepts a raw DSL dict only — no Spark-predicate pushdown. |
+| `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read (e.g. `{"term": {...}}`). `None` = `match_all`. v1 accepts a raw DSL dict only, no Spark-predicate pushdown. |
 | `num_slices` | `int \| None` | `None` | No | Parallelism for the distributed read. `None` defaults to the index's shard count. One slice per Spark task. |
 | `batch_size` | `int` | `1000` | No | Docs per scroll/PIT page. Must be positive. |
-| `pit_keep_alive` | `str` | `"5m"` | No | Point-in-Time lifetime, as a **sliding window** — each page re-sends it and resets the PIT's expiry, so it need only cover the longest gap between consecutive reads of the PIT (for `read_index`, the lazy open-to-first-page scheduling gap), not the whole job. See the Reading section. |
+| `pit_keep_alive` | `str` | `"5m"` | No | Point-in-Time lifetime, as a **sliding window**: each page re-sends it and resets the PIT's expiry, so it need only cover the longest gap between consecutive reads of the PIT (for `read_index`, the lazy open-to-first-page scheduling gap), not the whole job. See the Reading section. |
 | `include_id` | `bool` | `True` | No | Expose the ES `_id` via the `id_field` column when the schema declares it. |
 
 ## Datatype coverage (write transforms + read inverse)
@@ -375,7 +375,7 @@ This table is the **write** transform (Spark → ES `_source`); the
 [Read fidelity](#read-fidelity-write--read) table above is its inverse (ES `_source` → Spark) and
 lists which of these transforms are one-way. Both directions share this one contract.
 
-Every valid Spark column can be exported with **no caller pre-processing** — hand `bulk_write` any
+Every valid Spark column can be exported with **no caller pre-processing**: hand `bulk_write` any
 DataFrame. Values are transformed on the way to Elasticsearch as follows. These transforms are
 **by design**: they are the deltas to expect between the Spark row and the ES `_source`, not bugs.
 
@@ -384,8 +384,8 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | `string`, `boolean` | unchanged | `"hi"` → `"hi"`; `true` → `true` |
 | `byte`/`short`/`int`/`long` | unchanged (all integer widths become one JSON number; width not preserved) | `5` → `5` |
 | `double` | unchanged; non-finite values (`Infinity`/`-Infinity`/`NaN`) become `null` (no JSON representation) | `1.5` → `1.5`; `Infinity` → `null` |
-| `float` (32-bit) | its **exact 32-bit value widened to double** — the stored number shows the float32 rounding, not the literal you typed (see note) | `0.1` (float) → `0.10000000149011612` |
-| `decimal(p,s)` | **float** (precision lost beyond ~15–17 sig figs) | `Decimal("1.50")` → `1.5` |
+| `float` (32-bit) | its **exact 32-bit value widened to double**, the stored number shows the float32 rounding, not the literal you typed (see note) | `0.1` (float) → `0.10000000149011612` |
+| `decimal(p,s)` | **float** (precision lost beyond ~15-17 sig figs) | `Decimal("1.50")` → `1.5` |
 | `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
 | `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
@@ -394,7 +394,7 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
 | `interval` | **string** (see below) | `INTERVAL '1 02:03:04' DAY TO SECOND` → `"INTERVAL '1 02:03:04' DAY TO SECOND"` |
 
-**Why `float` looks "changed":** a Spark `FLOAT` is 32-bit and can't represent `0.1` exactly — it
+**Why `float` looks "changed":** a Spark `FLOAT` is 32-bit and can't represent `0.1` exactly, it
 holds the nearest float32, whose true value is `0.10000000149011612`. The connector stores that
 exact value (widened to a 64-bit double) rather than reformatting it back to `0.1`, so the stored
 number is faithful to what Spark actually held, not to the source literal. Use `DOUBLE` if you need
@@ -407,7 +407,7 @@ is not preserved. Map the field as `date_nanos` and send nanos yourself if you n
 
 **`timestamp` vs `timestamp_ntz`:** a regular Spark `timestamp` is an instant and converts to its
 true epoch-millis. A `timestamp_ntz` (no time zone) carries a wall-clock value with no zone, so the
-connector interprets it as **UTC** — deterministically, since executors can be in different zones.
+connector interprets it as **UTC**, deterministically, since executors can be in different zones.
 The stored epoch-millis is that wall-clock time read as UTC, not as the cluster's local zone. If
 your NTZ values are really in some other zone, convert them to a zoned `timestamp` in Spark before
 export so the epoch is correct.
@@ -415,7 +415,7 @@ export so the epoch is correct.
 ### Arrow-hostile types: `variant` and `interval` (handled automatically)
 
 `VARIANT` and `INTERVAL` have no Apache Arrow representation, so they cannot cross into
-`mapInPandas` directly. `bulk_write` handles this for you — any column whose type **contains** one
+`mapInPandas` directly. `bulk_write` handles this for you: any column whose type **contains** one
 of these at **any nesting depth** is serialized to a **string** before export, so no caller action
 is required; hand `bulk_write` the raw DataFrame. The string form depends on the type:
 
@@ -426,14 +426,14 @@ is required; hand `bulk_write` the raw DataFrame. The string form depends on the
   `INTERVAL '1 02:03:04' DAY TO SECOND` is stored as the string `"INTERVAL '1 02:03:04' DAY TO SECOND"`.
 
 Round-trip consequence to expect: such a column lands in ES as a **string**, not a queryable nested
-object — so map it as `keyword`/`text`, not `object`.
+object, so map it as `keyword`/`text`, not `object`.
 
 When adding fields, add a matching entry to the ES index mapping or ES will dynamic-map (and guess)
 the type.
 
 ## Developing the library
 
-Work on the library locally (on your machine, not Databricks) — set up an environment
+Work on the library locally (on your machine, not Databricks): set up an environment
 and run the unit tests:
 
 ```bash
@@ -454,7 +454,7 @@ installed in a notebook with `%pip install /Volumes/.../databricks_es_connector-
 
 The wheel's only direct runtime dependency is `elasticsearch>=8,<9` (declared in
 `pyproject.toml`). [`requirements.txt`](requirements.txt) lists the full resolved
-dependency tree with pinned versions — direct and transitive — for security scanning
+dependency tree with pinned versions (direct and transitive) for security scanning
 (SCA / vulnerability review). Spark/pandas are provided by the Databricks runtime and
 are not bundled.
 
@@ -473,7 +473,7 @@ The version comes from `[project].version` in `pyproject.toml`; bump it there be
 building a new release. The wheel lands in `dist/` (git-ignored).
 
 **When cutting a release, regenerate [`requirements.txt`](requirements.txt).** The build does
-*not* read that file — the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
+*not* read that file: the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
 fresh install resolves transitive versions at install time and drifts from the pinned snapshot.
 `requirements.txt` is a point-in-time closure for security scanning; keep it matched to the
 release by regenerating it (see the command in its header) whenever dependencies or the pin
@@ -502,7 +502,7 @@ Then install it in a notebook and restart Python:
 ```
 
 For customer hand-off, share the same `.whl` via a UC Volume in their workspace or
-through Delta Share — no code changes, only the `EsWriteConfig` / `EsReadConfig` endpoint/auth differ.
+through Delta Share: no code changes, only the `EsWriteConfig` / `EsReadConfig` endpoint/auth differ.
 
 ## Repo layout
 
@@ -528,14 +528,14 @@ integration_tests/             # live-Spark/ES tests run on Databricks serverles
 
 Two test tiers: `tests/` is the fast, infra-free gate (pure-Python, run with `pytest`);
 `integration_tests/` runs on a live serverless workspace + Elasticsearch to cover the Spark-side
-code the unit tests can't reach — see [`integration_tests/README.md`](integration_tests/README.md).
+code the unit tests can't reach, see [`integration_tests/README.md`](integration_tests/README.md).
 
 The built wheel contains only `databricks_es_connector`; neither `tests/` nor `integration_tests/`
 is part of the customer artifact.
 
 ## License & Attribution
 
-**Copyright © Databricks, Inc.** — Developed and maintained by Databricks Forward Deployed Engineering. Available to support customers and the broader community in connecting Databricks to Elasticsearch. For production support and customization, contact your Databricks account team.
+**Copyright © Databricks, Inc.**: Developed and maintained by Databricks Forward Deployed Engineering. Available to support customers and the broader community in connecting Databricks to Elasticsearch. For production support and customization, contact your Databricks account team.
 
 ---
 

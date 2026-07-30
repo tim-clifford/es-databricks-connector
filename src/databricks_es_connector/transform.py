@@ -1,8 +1,8 @@
-"""Pure-Python row shaping for Elasticsearch. No Spark, no ES client — unit-testable.
+"""Pure-Python row shaping for Elasticsearch. No Spark, no ES client: unit-testable.
 
 `coerce_value` makes any value that `mapInPandas` can hand us JSON/ES-serializable, so
 EVERY exportable column lands as usable data (field pruning via `drop_fields` is a client
-opt-out to shrink payload — never the reason a column can't be exported). It handles every
+opt-out to shrink payload, never the reason a column can't be exported). It handles every
 Spark type that survives Arrow -> pandas conversion:
   - ES `date` fields reject str(pandas.Timestamp) (no 'T'); send epoch-millis instead.
   - Naive datetimes are treated as UTC so epochs are deterministic across executors
@@ -19,7 +19,7 @@ Spark type that survives Arrow -> pandas conversion:
     never silently pass through and crash `helpers.bulk` (it lands as a string, not a crash).
 
 NOT handled here (cannot be): types that fail Spark's Arrow conversion BEFORE reaching this
-code — VARIANT and INTERVAL. `spark_prep.sanitize_for_arrow` serializes those to a JSON string
+code: VARIANT and INTERVAL. `spark_prep.sanitize_for_arrow` serializes those to a JSON string
 in Spark before the export (called automatically by `bulk_write`), so they never reach here.
 """
 from __future__ import annotations
@@ -41,14 +41,14 @@ def _is_null(v: Any) -> bool:
     """
     if v is None:
         return True
-    # pandas.NA: `NA != NA` returns NA, and bool(NA) raises — identify it by type name
+    # pandas.NA: `NA != NA` returns NA, and bool(NA) raises, identify it by type name
     # (avoids a hard pandas import in this pure-Python module).
     if type(v).__name__ in ("NAType", "NaTType"):
         return True
     try:
         return bool(v != v)   # float NaN (and NaT) satisfy v != v with a real bool
     except (ValueError, TypeError):
-        return False          # e.g. numpy arrays — not a scalar null
+        return False          # e.g. numpy arrays, not a scalar null
 
 
 _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
@@ -57,12 +57,12 @@ _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 def _to_epoch_millis(v: Any) -> int:
     """Coerce a datetime/date to epoch milliseconds. Naive values are assumed UTC.
 
-    Floors to the containing millisecond (sub-millisecond precision is dropped — ES `date` is
+    Floors to the containing millisecond (sub-millisecond precision is dropped, ES `date` is
     millisecond-resolution by default). Uses integer `timedelta` arithmetic rather than
     `v.timestamp() * 1000`: the float multiply loses sub-ms resolution at large magnitudes and
     drifts by ~1ms for far-future dates (first divergence ~year 2106). Python's `//` floors toward
     negative infinity, which keeps the flooring consistent across the epoch boundary (pre-epoch
-    negatives round the same direction as post-epoch) and matches Spark/Java `unix_millis` — the
+    negatives round the same direction as post-epoch) and matches Spark/Java `unix_millis`, the
     reason we floor rather than truncate toward zero.
     """
     if isinstance(v, _dt.datetime):
@@ -111,7 +111,7 @@ def coerce_value(v: Any) -> Any:
     """
     if _is_null(v):                                   # must precede datetime: NaT is a datetime
         return None
-    if isinstance(v, bool):                           # bool is a subclass of int — keep as-is
+    if isinstance(v, bool):                           # bool is a subclass of int, keep as-is
         return v
     if isinstance(v, (_dt.datetime, _dt.date)):
         return _to_epoch_millis(v)
@@ -156,7 +156,7 @@ def to_es_source(
 ) -> dict:
     """Turn one row (dict) into the ES _source document.
 
-    - drops `drop_fields` (egress pruning; also drops id_field from _source is NOT done —
+    - drops `drop_fields` (egress pruning; also drops id_field from _source is NOT done,
       the id is kept in _source by default so the doc is self-describing).
     - coerces values (timestamps -> epoch millis, nested structs preserved).
 
@@ -171,7 +171,7 @@ def _is_delete_flagged(v: Any) -> bool:
     """True if a delete-flag column value means 'delete this row'.
 
     The flag arrives from Spark via mapInPandas, so it may be a Python bool, a numpy
-    bool_, 0/1, or a string. Nulls (None/NaN/NaT/pd.NA) mean 'not a delete' — a missing
+    bool_, 0/1, or a string. Nulls (None/NaN/NaT/pd.NA) mean 'not a delete', a missing
     flag must never be read as a delete. Strings are parsed leniently
     ('true'/'t'/'1'/'yes'/'y', case-insensitive).
     """
@@ -207,7 +207,7 @@ def build_action(
     overwrite the same doc instead of duplicating.
 
     When has_deletes is True and the row's delete_flag_column is truthy, emit a
-    delete-by-id action ({"_op_type": "delete", "_index", "_id"} — no _source) instead
+    delete-by-id action ({"_op_type": "delete", "_index", "_id"}, no _source) instead
     of an index. Deletes require id_field. The flag column itself is dropped from the
     _source of kept (non-delete) rows so it never pollutes the indexed document.
     """
@@ -220,7 +220,7 @@ def build_action(
         if id_field is None:
             raise ValueError("has_deletes=True requires id_field (deletes target a doc _id)")
         if _is_delete_flagged(row.get(delete_flag_column)):
-            # Delete action: id-only, no body. Idempotent — deleting an absent doc is a no-op
+            # Delete action: id-only, no body. Idempotent, deleting an absent doc is a no-op
             # (the 404 is suppressed in the bulk layer).
             return {"_op_type": "delete", "_index": index, "_id": _require_id(row, id_field)}
 

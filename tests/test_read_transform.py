@@ -1,7 +1,7 @@
 """Unit tests for the read coercion layer (read_transform.read_coerce). No Spark, no ES.
 
 The headline test is the ROUND-TRIP oracle: for every datatype, read_coerce(coerce_value(x), type)
-must reproduce x — except the deltas the README documents as one-way (decimal precision, sub-ms
+must reproduce x, except the deltas the README documents as one-way (decimal precision, sub-ms
 timestamp, float32 widening). This is the acceptance bar for the read path: it proves the read
 inverse matches the write transform we already test in test_transform.py.
 """
@@ -16,7 +16,7 @@ from databricks_es_connector.read_transform import read_coerce
 
 
 def _roundtrip(x, target):
-    """write transform, then read transform — the value a client would get back for `target`."""
+    """write transform, then read transform: the value a client would get back for `target`."""
     return read_coerce(coerce_value(x), target)
 
 
@@ -62,7 +62,7 @@ def test_preepoch_timestamp_roundtrip():
 
 def test_timestamp_subms_is_documented_loss():
     # Sub-millisecond precision is dropped on write (documented). Round-trip equals the value
-    # FLOORED to the ms, not the original microseconds — assert the documented delta, not equality.
+    # FLOORED to the ms, not the original microseconds, assert the documented delta, not equality.
     ts = dt.datetime(2021, 1, 1, 0, 0, 0, 123_456, tzinfo=dt.timezone.utc)  # 123456 us
     out = _roundtrip(ts, "timestamp")
     assert out == dt.datetime(2021, 1, 1, 0, 0, 0, 123_000, tzinfo=dt.timezone.utc)  # floored to ms
@@ -85,7 +85,7 @@ def test_decimal_roundtrip_within_double_precision():
 
 def test_decimal_precision_loss_is_documented():
     # 18 sig figs: write->float loses the low digits (README). Read reconstructs from the lossy
-    # float, so it does NOT equal the original — assert the documented lossy value.
+    # float, so it does NOT equal the original, assert the documented lossy value.
     out = _roundtrip(Decimal("123456789012345678"), "decimal(38,0)")
     assert out == Decimal("123456789012345680")   # low digits gone, per the write contract
     assert out != Decimal("123456789012345678")
@@ -151,7 +151,7 @@ def test_array_of_structs_roundtrip():
 def test_map_non_string_keys_stay_stringified():
     # Non-string map keys are a DOCUMENTED one-way transform: writes stringify keys (JSON object
     # keys must be strings), so the read side can only ever see string keys and MUST keep them as
-    # such — even when the declared key type is int. This is not lossy re-parsing; it's the contract.
+    # such, even when the declared key type is int. This is not lossy re-parsing; it's the contract.
     stored = coerce_value({1: "x", 2: "y"})     # map<int,string> -> {"1": "x", "2": "y"} on write
     assert stored == {"1": "x", "2": "y"}
     out = read_coerce(stored, "map<int,string>")
@@ -162,7 +162,7 @@ def test_map_non_string_keys_stay_stringified():
 # --- token parser edge cases (nested commas must not split fields) ---------------------------
 
 def test_unknown_token_passes_value_through():
-    # An unrecognized type token must not crash — the value passes through unchanged (a defensive
+    # An unrecognized type token must not crash: the value passes through unchanged (a defensive
     # fallback; the caller declared the schema, so this is a last resort, not the normal path).
     assert read_coerce({"anything": 1}, "somefuturetype") == {"anything": 1}
     assert read_coerce(42, "geo_point") == 42
@@ -187,7 +187,7 @@ def test_struct_with_nested_decimal_field_parses():
 
 def test_map_value_decimal_parses():
     # Guard (not red-before-green): a map valtype's decimal comma. This survived the pre-fix bug by
-    # luck — the truncated "decimal(10" still hit the startswith("decimal") branch — but pin it so
+    # luck, the truncated "decimal(10" still hit the startswith("decimal") branch, but pin it so
     # the paren-aware split stays correct here too.
     out = read_coerce({"k": 2.5}, "map<string,decimal(10,2)>")
     assert out == {"k": Decimal("2.5")}
@@ -199,7 +199,7 @@ def test_array_of_decimal_parses():
     assert out == [Decimal("1.5"), Decimal("2.5")]
 
 def test_struct_of_array_of_decimal_parses():
-    # Guard: nested paren + angle brackets together — the decimal comma is shielded by the inner
+    # Guard: nested paren + angle brackets together, the decimal comma is shielded by the inner
     # array<>, so this also passed pre-fix; kept so the two depth counters can't regress and interfere.
     tok = "struct<vals:array<decimal(5,2)>,n:int>"
     out = read_coerce({"vals": [1.1, 2.2], "n": 7}, tok)

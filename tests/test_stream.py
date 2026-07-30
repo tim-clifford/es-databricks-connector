@@ -2,7 +2,7 @@
 
 make_foreach_batch is thin glue: skip empty micro-batches, otherwise delegate to bulk_write
 and (optionally) report the result to on_batch. We stub bulk_write and use a fake DataFrame
-with a controllable isEmpty(), so the glue — empty-skip, delegation, and the callback contract —
+with a controllable isEmpty(), so the glue (empty-skip, delegation, and the callback contract)
 is testable without a session.
 
 The key contract under test: the dict handed to on_batch has the SAME keys whether the batch

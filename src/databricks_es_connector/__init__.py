@@ -4,7 +4,7 @@ and Elasticsearch.
 Write: given a Spark DataFrame and an EsWriteConfig, `bulk_write` writes rows to an
 Elasticsearch index via the `elasticsearch-py` client, parallelized across executors with
 `mapInPandas` (serverless-safe; RDD APIs are not used), with gzip request compression and
-deterministic document IDs. Schema-agnostic on write — every Spark datatype is exportable
+deterministic document IDs. Schema-agnostic on write, every Spark datatype is exportable
 with no caller pre-processing.
 
 Read: given an EsReadConfig and a declared Spark schema, `read_index` pulls an index back into

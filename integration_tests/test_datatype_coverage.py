@@ -279,7 +279,7 @@ class TestDatatypeCoverage(NotebookTestFixture):
 
     # --- decimal precision loss at the documented boundary ---
     def test_decimal_precision_loss(self):
-        # An 18-sig-fig decimal widened to a double loses its low digits — the connector's
+        # An 18-sig-fig decimal widened to a double loses its low digits, the connector's
         # documented decimal->float behavior. Proves the README caveat end-to-end, not just in a
         # unit test: what a client sends (…678) is NOT what ES holds (…680).
         got = self._got("s_decimal_hi")
@@ -327,7 +327,7 @@ class TestDatatypeCoverage(NotebookTestFixture):
             "s_interval_ym",
         }
         # ES omits explicit nulls and an empty array from _source, so the full row may legitimately
-        # have FEWER keys than expected — but never MORE. Only extras are a leak.
+        # have FEWER keys than expected, but never MORE. Only extras are a leak.
         extra = set(self.full) - expected_cols
         assert not extra, f"connector emitted unexpected field(s): {sorted(extra)}"
 

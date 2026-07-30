@@ -1,8 +1,8 @@
 """Unit tests for spark_prep's Arrow-hostile-column detection.
 
 The Spark-touching parts (createOrReplaceTempView / DESCRIBE / to_json) need a session and are
-exercised by the OCSF round-trip demo on a live cluster. Here we test the PURE logic —
-_hostile_columns_from_describe — which is where the detection rules and edge cases live, using
+exercised by the OCSF round-trip demo on a live cluster. Here we test the PURE logic,
+_hostile_columns_from_describe, which is where the detection rules and edge cases live, using
 synthetic DESCRIBE output. This is the regression guard for the VARIANT/INTERVAL export bug:
 before the fix, a DataFrame with a VARIANT column crashed bulk_write; the fix detects such columns
 here and serializes them.
@@ -22,13 +22,13 @@ def _rows(*pairs):
 
 
 def _names(describe_rows):
-    """Just the detected column names — most tests assert on names, not the carried type text."""
+    """Just the detected column names: most tests assert on names, not the carried type text."""
     return [name for name, _type in _hostile_columns_from_describe(describe_rows)]
 
 
 # --- _type_is_arrow_hostile: the type-string classifier ---------------------------------------
 # A DESCRIBE type string interleaves type names with struct FIELD names, so detection must match
-# VARIANT/INTERVAL in TYPE position only — never as a substring of a field name.
+# VARIANT/INTERVAL in TYPE position only, never as a substring of a field name.
 
 _SHOULD_DETECT = [
     "variant",                                          # top-level variant
@@ -129,7 +129,7 @@ def test_stops_at_partition_information_section():
         ("", ""),
         ("# Partition Information", ""),
         ("# col_name", "data_type"),
-        ("part_variant_col", "variant"),  # after the marker — must be ignored
+        ("part_variant_col", "variant"),  # after the marker, must be ignored
     )
     assert _names(rows) == ["raw_data"]
 

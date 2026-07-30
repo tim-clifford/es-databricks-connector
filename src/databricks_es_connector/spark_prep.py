@@ -2,7 +2,7 @@
 
 Most Spark types survive the Arrow -> pandas conversion inside `bulk_write` and are made
 JSON-safe by `transform.coerce_value`. A few types fail Arrow conversion *before* any Python
-code runs, so they cannot be fixed on the executor — they must be rewritten in Spark first:
+code runs, so they cannot be fixed on the executor: they must be rewritten in Spark first:
 
   - VARIANT. Arrow has no VARIANT type. A column whose type contains VARIANT at ANY nesting
     depth (e.g. `variant`, `struct<...,v:variant>`, `array<struct<...,v:variant>>`) cannot be
@@ -12,21 +12,21 @@ code runs, so they cannot be fixed on the executor — they must be rewritten in
 
 `sanitize_for_arrow(df)` rewrites those columns to a string so the whole DataFrame can be exported,
 picking the serialization by type: a struct/array/map/variant goes through `to_json` (a JSON
-string), while a scalar (top-level) INTERVAL is `cast(... as string)` — because Spark's `to_json`
+string), while a scalar (top-level) INTERVAL is `cast(... as string)`, because Spark's `to_json`
 REJECTS a scalar interval (`[DATATYPE_MISMATCH.INVALID_JSON_SCHEMA] Input schema must be a struct,
 an array, a map or a variant`). It is called automatically by `bulk_write`, so callers do NOT need
-to pre-process anything — any valid Spark DataFrame just works. Only Arrow-hostile columns are
+to pre-process anything, any valid Spark DataFrame just works. Only Arrow-hostile columns are
 touched; every other column is left exactly as-is (and handled downstream by `coerce_value`).
 
 Serverless / Spark Connect constraint (this is why the implementation looks the way it does):
-On Spark Connect, ANY schema accessor that builds Python type objects throws on a VARIANT column
-— `df.schema`, `df.schema.jsonValue()`, `df.dtypes`, and even `df.columns` all raise
+On Spark Connect, ANY schema accessor that builds Python type objects throws on a VARIANT column:
+`df.schema`, `df.schema.jsonValue()`, `df.dtypes`, and even `df.columns` all raise
 `UNSUPPORTED_OPERATION`. The ONLY way to read the schema of a VARIANT-bearing DataFrame is a SQL
 `DESCRIBE` over a temp view. So we register the DataFrame as a temp view and DESCRIBE it to get
 the column type strings, rather than touching `df.schema`.
 
 Because DESCRIBE gives us top-level column *type strings* (not a navigable typed schema), a column
-with a hostile type nested inside a struct/array is serialized *whole* to a JSON string — we cannot
+with a hostile type nested inside a struct/array is serialized *whole* to a JSON string, we cannot
 surgically cast just the inner field. Data is preserved; the column lands in ES as a string.
 
 This module imports pyspark lazily (inside functions) so the pure-Python transform/config layers
@@ -51,7 +51,7 @@ if TYPE_CHECKING:  # pragma: no cover
 # and would silently JSON-stringify a valid struct/array column. So:
 #   - the token must be bounded by non-identifier chars (not part of a longer word like
 #     `polling_interval` / `invariant`), and
-#   - it must NOT be immediately followed by ':' — a field name is always `name:type`, so a token
+#   - it must NOT be immediately followed by ':', a field name is always `name:type`, so a token
 #     followed by ':' is a field name, whereas a real type is followed by '>', ',', whitespace, or
 #     end of string.
 # Types appear at start-of-string or after '<' ':' ',' (array element / struct field type / map
@@ -69,7 +69,7 @@ def _is_scalar_interval_type(type_text: str) -> bool:
     contains one). Scalar interval type strings begin with `interval` (e.g. `interval day to second`,
     `interval year to month`).
 
-    Why this matters for serialization: Spark's `to_json` REJECTS a scalar interval —
+    Why this matters for serialization: Spark's `to_json` REJECTS a scalar interval,
     `to_json(<interval>)` raises `[DATATYPE_MISMATCH.INVALID_JSON_SCHEMA] Input schema must be a
     struct, an array, a map or a variant`. So a top-level interval must be serialized with
     `cast(... as string)` instead. A struct/array/map that *contains* an interval has a top-level
@@ -103,7 +103,7 @@ def _hostile_columns_from_describe(describe_rows) -> List[Tuple[str, str]]:
 def _hostile_columns(df: "DataFrame") -> List[Tuple[str, str]]:
     """Return (name, type_text) for top-level columns whose type contains an Arrow-hostile type.
 
-    Uses DESCRIBE over a temp view — the only schema read that survives a VARIANT column on Spark
+    Uses DESCRIBE over a temp view, the only schema read that survives a VARIANT column on Spark
     Connect (see module docstring).
     """
     view = "_es_connector_sanitize_" + uuid.uuid4().hex

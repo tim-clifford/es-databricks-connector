@@ -9,7 +9,7 @@
 # MAGIC
 # MAGIC Proves:
 # MAGIC   - a stream over a Delta source lands exactly one ES doc per source row;
-# MAGIC   - **restart idempotency** — re-running the SAME stream from the SAME checkpoint after
+# MAGIC   - **restart idempotency**: re-running the SAME stream from the SAME checkpoint after
 # MAGIC     appending new rows writes only the new rows (deterministic `_id` upserts, no duplicates),
 # MAGIC     and a re-run with no new source rows is a clean no-op.
 # MAGIC
@@ -35,7 +35,7 @@ ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "p
 
 # A throwaway Delta source table + a checkpoint dir on a UC Volume. These mirror where the demos
 # live so the fixture runs in the same workspace, but nothing here is shared with a demo (distinct
-# names) — both are dropped in cleanup.
+# names), both are dropped in cleanup.
 CATALOG = "tim_clifford_classic_dsl_lite_catalog"
 SCHEMA = "es_poc"
 SRC_TABLE = f"{CATALOG}.{SCHEMA}.connector_it_streaming_src"
@@ -49,7 +49,7 @@ class TestStreamingSink(NotebookTestFixture):
         self.cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
                             index=INDEX, id_field="doc_id", http_compress=True)
 
-        # Fresh ES index, fresh checkpoint, fresh source table — a clean slate so counts are
+        # Fresh ES index, fresh checkpoint, fresh source table: a clean slate so counts are
         # unambiguous. (A stale checkpoint would make availableNow think it had already consumed
         # the source and write nothing.)
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
@@ -77,7 +77,7 @@ class TestStreamingSink(NotebookTestFixture):
         self.count_after_run2 = self._count()
         self.ids_after_run2 = self._ids()
 
-        # --- run 3: no new rows, re-run again — must be a clean no-op (no new docs, no dupes) ---
+        # --- run 3: no new rows, re-run again, must be a clean no-op (no new docs, no dupes) ---
         self._run_stream()
         self.count_after_run3 = self._count()
 

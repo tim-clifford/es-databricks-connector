@@ -1,19 +1,19 @@
 """Read an Elasticsearch index into a Spark DataFrame.
 
-Two entry points, both requiring an explicit Spark `StructType` (v0.4.0 does no mapping inference —
+Two entry points, both requiring an explicit Spark `StructType` (v0.4.0 does no mapping inference:
 several write transforms are one-way and can't be inverted from `_source` without the declared type;
 see the README "Reading from Elasticsearch" section for the ambiguity rationale). Both share the
 coercion oracle `read_transform.read_coerce`, so they return identical values; only the transport
 differs.
 
-  - `read_index`         — DISTRIBUTED (Option B). Opens a Point-in-Time on the driver, fans out
+  - `read_index`: DISTRIBUTED (Option B). Opens a Point-in-Time on the driver, fans out
                            `spark.range(num_slices).mapInPandas(...)`, one task per PIT slice, each
                            task building its own ES client and paging its slice with `search_after`.
                            Serverless-safe (same mechanism as the write path); data stays distributed
                            (never collected to the driver). The returned DataFrame is lazy; the PIT is
                            self-extended by each page's `keep_alive` (see read_index docstring). For
                            full-index export.
-  - `read_index_collect` — DRIVER-SIDE (Option A). Pages the whole index through the driver and
+  - `read_index_collect`: DRIVER-SIDE (Option A). Pages the whole index through the driver and
                            `createDataFrame`s the result. No executors involved. For bounded reads
                            (lookups / reference data) and as the simple, proven fallback.
 
@@ -67,7 +67,7 @@ def _slice_hits(es, pit_id, query, batch_size, keep_alive, slice_spec=None):
     """Yield raw hits over an ALREADY-OPEN PIT, optionally restricted to one slice.
 
     Pages with `search_after` (no from/size deep-pagination limit). `slice_spec`, when given, is
-    `{"id": i, "max": n}` — an ES sliced scroll, so N parallel readers each pull a disjoint 1/N of
+    `{"id": i, "max": n}`, an ES sliced scroll, so N parallel readers each pull a disjoint 1/N of
     the index. Does NOT open or close the PIT (the caller owns its lifecycle), so it works both for
     the driver path (one local PIT) and the distributed path (one PIT shared across executors).
     """
@@ -112,7 +112,7 @@ def _resolve_num_slices(es, index: str, configured: Optional[int]) -> int:
         return max(1, shards)
     except Exception as exc:
         # Couldn't read the shard count (permissions, alias spanning indices, transient error).
-        # Falling back to a single unsliced reader is CORRECT but SERIAL — for a large index that
+        # Falling back to a single unsliced reader is CORRECT but SERIAL, for a large index that
         # silently forfeits the parallelism this reader exists for, so warn rather than hide it.
         # Pass an explicit num_slices to skip this lookup entirely.
         _log.warning(
@@ -124,13 +124,13 @@ def _resolve_num_slices(es, index: str, configured: Optional[int]) -> int:
 # --- shared validation -----------------------------------------------------------------------
 
 def _validate(cfg: EsReadConfig, schema) -> None:
-    # Duck-type the schema (a non-empty `.fields`) rather than isinstance(StructType) — this matches
+    # Duck-type the schema (a non-empty `.fields`) rather than isinstance(StructType), this matches
     # how _schema_field_tokens already reads the schema, and it keeps this module importable and
     # unit-testable without pyspark. A wrong type has no truthy `.fields` and hits the error; a real
     # StructType passes.
     if not getattr(schema, "fields", None):
         raise ValueError("read_index requires a non-empty Spark StructType schema (v0.4.0 has no "
-                         "mapping inference — declare the schema explicitly)")
+                         "mapping inference, declare the schema explicitly)")
     if not cfg.index:
         raise ValueError("EsReadConfig.index is required to read")
 
@@ -150,7 +150,7 @@ def read_index_collect(spark: "SparkSession", cfg: EsReadConfig, schema: "Struct
     pit_id = None
     try:
         # open_point_in_time is INSIDE the try so a failure here still closes the client below (no
-        # PIT exists yet to close — pit_id stays None). Keeping it outside would leak the client on
+        # PIT exists yet to close, pit_id stays None). Keeping it outside would leak the client on
         # a PIT-open failure.
         pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
         rows = [
@@ -159,7 +159,7 @@ def read_index_collect(spark: "SparkSession", cfg: EsReadConfig, schema: "Struct
         ]
     finally:
         # Close the PIT (only if one was opened) and the driver client. Both are best-effort: the
-        # rows are already collected, and a leaked PIT expires on its own — a close failure must not
+        # rows are already collected, and a leaked PIT expires on its own, a close failure must not
         # fail the read.
         if pit_id is not None:
             try:
@@ -178,7 +178,7 @@ def read_index_collect(spark: "SparkSession", cfg: EsReadConfig, schema: "Struct
 def _make_slice_reader(cfg: EsReadConfig, pit_id: str, query: dict, field_tokens, num_slices: int):
     """Return a mapInPandas function: for each slice id it receives (via spark.range), read that
     PIT slice and yield a pandas DataFrame of coerced rows. Captures only serializable values
-    (frozen cfg, the PIT id string, the query dict, the type tokens) — no Spark/ES objects."""
+    (frozen cfg, the PIT id string, the query dict, the type tokens), no Spark/ES objects."""
     col_names = [name for name, _ in field_tokens]
 
     def _read(iterator):
@@ -207,17 +207,17 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
     """Distributed read of an ES index into a Spark DataFrame against the caller-declared `schema`.
 
     Opens one Point-in-Time on the driver for a consistent snapshot, then fans out
-    `spark.range(num_slices).mapInPandas(...)` — one task per PIT slice, each task building its own
+    `spark.range(num_slices).mapInPandas(...)`, one task per PIT slice, each task building its own
     ES client and paging its slice with `search_after`, coercing via the documented inverse
     transforms. Serverless-safe (same `mapInPandas` mechanism as the write path); the data stays
     distributed across executors (never collected to the driver), so it scales for full-index export.
     `num_slices` defaults to the index's shard count.
 
-    PIT lifecycle: the returned DataFrame is LAZY — Spark reads each slice when an action runs, not
+    PIT lifecycle: the returned DataFrame is LAZY, Spark reads each slice when an action runs, not
     when this function returns. So we do NOT close the PIT here (a `finally` close would kill it
     before evaluation); it is left to expire via `pit_keep_alive`. Crucially, `pit_keep_alive` is a
     SLIDING window, not a total budget: `_slice_hits` re-sends it on every page and follows the
-    refreshed `pit_id`, so each read resets the PIT's expiry (per the ES PIT API — the value "just
+    refreshed `pit_id`, so each read resets the PIT's expiry (per the ES PIT API, the value "just
     needs to be long enough for the next request"). It therefore only has to cover the longest gap
     between consecutive touches of the PIT, NOT the whole job:
       - the open-PIT -> first-page gap (the read is lazy, so Spark may not schedule the tasks
@@ -240,7 +240,7 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
         pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
     finally:
         # The driver client's only jobs are resolving the slice count and opening the PIT; each
-        # executor builds its own client. Close this one now (best-effort) so it doesn't leak — but
+        # executor builds its own client. Close this one now (best-effort) so it doesn't leak, but
         # do NOT close the PIT: the returned DataFrame is lazy and the executors read it later.
         try:
             es.close()
@@ -249,10 +249,10 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
 
     reader = _make_slice_reader(cfg, pit_id, query, field_tokens, num_slices)
     # One row per slice, one partition per slice, so each task handles exactly one slice. `range`
-    # splits its contiguous id space [0, num_slices) into `numPartitions` equal chunks — with
+    # splits its contiguous id space [0, num_slices) into `numPartitions` equal chunks, with
     # num_slices rows in num_slices partitions that is deterministically one row each, and needs no
     # shuffle. (repartition() would round-robin, which only *tends* toward an even spread and could
-    # co-locate two slices on one task under skew.) The result is a lazy distributed DataFrame —
+    # co-locate two slices on one task under skew.) The result is a lazy distributed DataFrame,
     # data never crosses the driver.
     slices_df = spark.range(num_slices, numPartitions=num_slices)
     return slices_df.mapInPandas(reader, schema)

@@ -3,7 +3,7 @@
 Why mapInPandas and not foreachPartition: serverless compute blocks RDD APIs
 (df.rdd / foreachPartition raise INSUFFICIENT_PERMISSIONS). mapInPandas is the
 supported way to run per-partition code on serverless, and it parallelizes the
-bulk write across executors — throughput scales with the cluster like the old
+bulk write across executors, throughput scales with the cluster like the old
 Spark connector did.
 
 The Elasticsearch client is built INSIDE the partition function from EsConfig,
@@ -58,8 +58,8 @@ def classify_bulk_result(ok: bool, op_type: str, status: int) -> str:
 
     The one suppression: a *delete* that returns *404* is an expected no-op (the doc was
     never indexed, was filtered out, or a replay already deleted it). It is IGNORED, not an
-    error. Every other non-ok result — including a 404 on an index/create/update, or a
-    409/5xx on a delete — is an ERROR and must be counted. Suppression is scoped to the
+    error. Every other non-ok result (including a 404 on an index/create/update, or a
+    409/5xx on a delete) is an ERROR and must be counted. Suppression is scoped to the
     (op_type == 'delete' AND status == 404) pair only; nothing broader.
     """
     if ok:
@@ -120,7 +120,7 @@ def make_partition_writer(cfg: EsConfig):
                     errors += 1
                     if len(error_samples) < ERROR_SAMPLE_CAP:
                         error_samples.append(_extract_error_sample(op_type, item))
-                # IGNORED (delete-404) counts as nothing — an expected no-op.
+                # IGNORED (delete-404) counts as nothing, an expected no-op.
         # error_samples is JSON-encoded into a single string column: mapInPandas needs a flat,
         # typed schema and can't carry a nested list<struct> of varying content cleanly.
         yield pd.DataFrame({
@@ -159,19 +159,19 @@ def bulk_write(df, cfg: EsConfig) -> dict:
     """Write a Spark DataFrame to Elasticsearch.
 
     Returns {'written', 'deleted', 'errors', 'total_input', 'error_samples'}:
-      - 'written'  — index/upsert ops that succeeded.
-      - 'deleted'  — successful delete-by-id ops (only non-zero when cfg.has_deletes).
-      - 'errors'   — docs ES rejected (exact count).
-      - 'total_input' — rows handed to the writer. Reconcile: written+deleted+errors < total_input
+      - 'written': index/upsert ops that succeeded.
+      - 'deleted': successful delete-by-id ops (only non-zero when cfg.has_deletes).
+      - 'errors': docs ES rejected (exact count).
+      - 'total_input': rows handed to the writer. Reconcile: written+deleted+errors < total_input
         means some rows were lost below the per-doc level (e.g. a chunk-level exception); equality
         (accounting for delete-404 no-ops, which count as none) means every row was accounted for.
-      - 'error_samples' — up to ERROR_SAMPLE_CAP diagnostics ({_id, op_type, status, reason}) for
+      - 'error_samples': up to ERROR_SAMPLE_CAP diagnostics ({_id, op_type, status, reason}) for
         rejected docs, so a failure is actionable rather than an opaque count. Bounded, not a full
         dead-letter log.
     Batch entry point; for streaming, use stream.make_foreach_batch.
 
     Arrow-hostile columns (VARIANT / INTERVAL, at any nesting depth) are serialized to strings
-    automatically via sanitize_for_arrow before the mapInPandas export — mapInPandas cannot carry
+    automatically via sanitize_for_arrow before the mapInPandas export, mapInPandas cannot carry
     them otherwise (VARIANT -> JSON string, scalar INTERVAL -> its Spark string form). Callers do
     not need to pre-process; any valid Spark DataFrame works. Such columns land in ES as strings
     (map them as keyword/text, not object).
