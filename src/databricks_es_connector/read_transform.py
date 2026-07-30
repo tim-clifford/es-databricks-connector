@@ -48,6 +48,16 @@ def _epoch_millis_to_datetime(v: Any) -> _dt.datetime:
     return _EPOCH_UTC + _dt.timedelta(milliseconds=int(v))
 
 
+def _epoch_millis_to_naive_datetime(v: Any) -> _dt.datetime:
+    """Inverse of the write for a `timestamp_ntz`: epoch-millis int -> NAIVE datetime.
+
+    A Spark `timestamp_ntz` is a zoneless wall-clock; the write side reads that wall-clock as UTC
+    to pick a deterministic epoch (transform._to_epoch_millis). The symmetric read reconstructs the
+    same wall-clock and drops the zone, so the value declared `timestamp_ntz` comes back naive (as
+    Spark expects) rather than tz-aware. Exact to the ms, same as the aware path."""
+    return _epoch_millis_to_datetime(v).replace(tzinfo=None)
+
+
 def _epoch_millis_to_date(v: Any) -> _dt.date:
     """Inverse for a date: epoch-millis int -> date (UTC). Writes store a date as midnight-UTC
     epoch-millis, so reading the UTC date component round-trips the original date."""
@@ -58,8 +68,9 @@ def read_coerce(value: Any, target: str) -> Any:
     """Coerce one ES `_source` value to the Python value Spark expects for `target`.
 
     `target` is a Spark type token (lowercase), e.g. "string", "boolean", "byte"/"short"/"int"/
-    "long", "float"/"double", "decimal(10,2)", "date", "timestamp", "binary", "variant",
-    "interval ...", or a nested "struct<...>" / "array<...>" / "map<...>". Nested tokens recurse.
+    "long", "float"/"double", "decimal(10,2)", "date", "timestamp", "timestamp_ntz", "binary",
+    "variant", "interval ...", or a nested "struct<...>" / "array<...>" / "map<...>". Nested tokens
+    recurse.
 
     null/missing -> None for every type. Each non-null branch is the inverse of a coerce_value
     transform; anything already JSON-native (string/number/bool) passes through with the target's
@@ -73,6 +84,9 @@ def read_coerce(value: Any, target: str) -> Any:
     # --- temporal: stored as epoch-millis integers, reconstructed per the declared type ---
     if t == "timestamp":
         return _epoch_millis_to_datetime(value)
+    if t == "timestamp_ntz":
+        # Zoneless wall-clock: write read it as UTC to pick the epoch, read hands it back naive.
+        return _epoch_millis_to_naive_datetime(value)
     if t == "date":
         return _epoch_millis_to_date(value)
 

@@ -67,6 +67,20 @@ def test_timestamp_subms_is_documented_loss():
     out = _roundtrip(ts, "timestamp")
     assert out == dt.datetime(2021, 1, 1, 0, 0, 0, 123_000, tzinfo=dt.timezone.utc)  # floored to ms
 
+def test_timestamp_ntz_roundtrip_is_naive():
+    # REGRESSION: timestamp_ntz had no read branch, so it fell through to the unknown-token
+    # passthrough and returned the raw epoch-millis INT. It must invert to a NAIVE datetime
+    # (the wall-clock Spark expects for timestamp_ntz), symmetric with the UTC-read write side.
+    wall = dt.datetime(2021, 1, 1, 12, 30, 0)          # naive wall-clock
+    out = _roundtrip(wall, "timestamp_ntz")
+    assert out == wall                                  # exact to the ms
+    assert out.tzinfo is None                           # naive, not tz-aware
+    assert isinstance(out, dt.datetime)                 # not the raw epoch-millis int
+
+def test_timestamp_ntz_preepoch_naive():
+    wall = dt.datetime(1969, 12, 31, 23, 59, 59)
+    assert _roundtrip(wall, "timestamp_ntz") == wall
+
 
 # --- binary: base64 <-> bytes ----------------------------------------------------------------
 
