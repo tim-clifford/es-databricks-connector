@@ -7,9 +7,10 @@ description: >
   inverse, touching the write path (sanitize_for_arrow / timestamp normalization / coerce_value /
   bulk), the read path (read_index / read_coerce), debugging a data-fidelity or round-trip question,
   reasoning about Elasticsearch behavior (dynamic mapping, term/keyword, timezone, coercion), running
-  the integration tier on FEVM serverless, or cutting a release. Also use when the user mentions the
+  the integration tier on FEVM serverless, reviewing repo documentation for drift (README, HANDOFF,
+  RELEASING, the skill itself), or cutting a release. Also use when the user mentions the
   connector, bulk_write, read_index, EsConfig/EsWriteConfig/EsReadConfig, datatype fidelity, the
-  round-trip, or es-databricks-connector.
+  round-trip, doc review, or es-databricks-connector.
 ---
 
 # databricks-es-connector maintenance
@@ -91,6 +92,16 @@ Spark-side code in `spark_prep.py` can only be proven in the integration tier. R
 [references/4-release-and-tests.md](references/4-release-and-tests.md) for how to run each and the
 exact FEVM commands.
 
+## Documentation review (pre-change and at review time)
+
+The prose docs (README, `integration_tests/README.md`, `RELEASING.md`, `HANDOFF.md`, and THIS skill)
+are not executable, so nothing fails when they drift; `scripts/check_readme_sync.py` catches only
+missing file listings, not stale descriptions or wrong versions. Run the holistic doc-review
+checklist in [references/5-doc-review.md](references/5-doc-review.md) as a **pre-change step** when
+starting a session that will modify the repo, and as part of **code review** for any PR that changes
+behavior, the public API, datatype handling, the release process, or the file set. The skill itself
+is the doc most prone to silent drift (it restates the others), so it is explicitly in scope.
+
 ## Workflow (what to load, when)
 
 | Task | Load |
@@ -101,6 +112,7 @@ exact FEVM commands.
 | Touch the Spark-side write prep (`spark_prep.py`) | refs 1, 4 (only the integration tier can prove it) |
 | Run the integration tier on FEVM / cut a release | ref 4 + `RELEASING.md` |
 | Review a PR touching transforms | refs 1, 2 (verify the five-places rule held) |
+| Start a work session / review any behavior or file-set change | ref 5 (holistic doc-review checklist) |
 
 ## Critical rules
 
@@ -122,3 +134,8 @@ exact FEVM commands.
   live index. Distinguish proven-live from tested-offline from designed.
 - **Docs are part of the change.** Adding a module/fixture/script means updating the README(s);
   `scripts/check_readme_sync.py` gates it, but write the entry as you go.
+- **Review the docs holistically before changing the repo and at review time.** Run
+  [references/5-doc-review.md](references/5-doc-review.md): version consistency, public API, datatype
+  tables, release process, HANDOFF status, and this skill vs. the code. Fix drift in the same PR that
+  caused it, never in a deferred "docs catch-up" pass. This is the only backstop that keeps the prose
+  docs and the skill itself honest, since they have no failing test.
