@@ -57,6 +57,19 @@ _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 def _to_epoch_millis(v: Any) -> int:
     """Coerce a datetime/date to epoch milliseconds. Naive values are assumed UTC.
 
+    IMPORTANT: a Spark `TimestampType` (an instant) does NOT reach this function as a datetime.
+    Spark's Arrow export converts a `timestamp` to the session-LOCAL wall-clock (naive) using
+    `spark.sql.session.timeZone`, so treating that naive value as UTC would store an epoch shifted
+    by the session's offset -- a real bug (verified on serverless under America/New_York /
+    Asia/Kolkata; present since 0.1.0). It is fixed UPSTREAM in Spark by
+    `spark_prep.normalize_timestamps_for_utc`, which converts every `TimestampType` to its true
+    epoch-millis long via `unix_millis` (instant-based, session-tz-independent) BEFORE the Arrow
+    export -- so a `timestamp` arrives here already an int and skips this function entirely.
+    What still reaches this function as a naive datetime is genuinely UTC: a `date` (no
+    time-of-day) and a `timestamp_ntz` (a zoneless wall-clock the connector defines as UTC). For
+    those, naive==UTC is correct. The integration datatype test runs under a non-UTC session to
+    keep the whole guarantee red-able.
+
     Floors to the containing millisecond (sub-millisecond precision is dropped, ES `date` is
     millisecond-resolution by default). Uses integer `timedelta` arithmetic rather than
     `v.timestamp() * 1000`: the float multiply loses sub-ms resolution at large magnitudes and
@@ -187,8 +200,16 @@ def _is_delete_flagged(v: Any) -> bool:
 
 
 def _require_id(row: dict, id_field: str) -> str:
-    if id_field not in row or row[id_field] is None:
-        raise KeyError(f"id_field '{id_field}' missing/None in row")
+    """Derive the deterministic _id from a row, rejecting null-ish ids.
+
+    Guards `_is_null` (None, NaN, NaT, pd.NA), not just `is None`: a pandas NaN in a
+    numeric id column is a float, so `is None` lets it through and `str(nan)` -> "nan"
+    would make EVERY NaN-id row collide on _id="nan" and silently overwrite into one
+    document (no error, counts still reconcile). Rejecting it fails the partition loudly
+    instead of losing rows. The id column must be non-null in every row (see EsWriteConfig).
+    """
+    if id_field not in row or _is_null(row[id_field]):
+        raise KeyError(f"id_field '{id_field}' missing/null (None/NaN/NaT) in row")
     return str(row[id_field])
 
 

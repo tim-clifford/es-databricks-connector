@@ -271,7 +271,6 @@ def test_merge_empty_is_all_zero():
 def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
     import databricks_es_connector.bulk as bulk_mod
 
-    sanitized = {"marker": "post-sanitize"}
     captured = {}
 
     class _FakeDF:
@@ -292,10 +291,19 @@ def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
         return _FakeDF()
     monkeypatch.setattr(bulk_mod, "sanitize_for_arrow", _fake_sanitize)
 
+    # normalize_timestamps_for_utc is also Spark-side (walks df.schema + unix_millis); stub it and
+    # prove it runs on the sanitize OUTPUT (order matters: df.schema throws on a VARIANT column, so
+    # sanitize must strip those first).
+    def _fake_normalize(df):
+        captured["normalized_in"] = df
+        return df
+    monkeypatch.setattr(bulk_mod, "normalize_timestamps_for_utc", _fake_normalize)
+
     cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="doc_id")
     out = bulk_mod.bulk_write("original-df", cfg)
 
     assert captured["sanitized_in"] == "original-df"       # sanitize applied to the caller's df
+    assert isinstance(captured["normalized_in"], _FakeDF)  # normalize runs on sanitize's output
     assert captured["schema"] == \
         "written long, deleted long, errors long, total_input long, error_samples string"
     # The collected partition rows are merged into the final result dict.

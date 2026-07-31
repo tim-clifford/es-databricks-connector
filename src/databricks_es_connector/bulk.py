@@ -15,7 +15,7 @@ import json
 from typing import Iterator
 
 from .config import EsConfig
-from .spark_prep import sanitize_for_arrow
+from .spark_prep import sanitize_for_arrow, normalize_timestamps_for_utc
 from .transform import build_action
 
 # Per-document outcomes from classify_bulk_result. Kept as module constants so the
@@ -175,8 +175,14 @@ def bulk_write(df, cfg: EsConfig) -> dict:
     them otherwise (VARIANT -> JSON string, scalar INTERVAL -> its Spark string form). Callers do
     not need to pre-process; any valid Spark DataFrame works. Such columns land in ES as strings
     (map them as keyword/text, not object).
+
+    TimestampType columns are converted to epoch-millis longs in Spark (normalize_timestamps_for_utc)
+    so the stored instant is correct regardless of spark.sql.session.timeZone, without mutating the
+    caller's session. This runs AFTER sanitize_for_arrow because reading df.schema (which the
+    timestamp walk needs) throws on a VARIANT column under Spark Connect, and sanitize removes those.
     """
     df = sanitize_for_arrow(df)
+    df = normalize_timestamps_for_utc(df)
     writer = make_partition_writer(cfg)
     rows = df.mapInPandas(
         writer,

@@ -210,3 +210,62 @@ def test_scalar_interval_negative(type_text):
 def test_scalar_interval_handles_none():
     assert _is_scalar_interval_type(None) is False
     assert _is_scalar_interval_type("") is False
+
+
+# --- timestamp -> epoch-millis normalization (tz-safety) --------------------------------------
+# _type_has_timestamp / _epoch_struct_type are pure functions over pyspark DataType objects
+# (pyspark TYPES import without a JVM; only a live SESSION needs Java), so the detection + result-
+# type logic is unit-testable here. The Spark rewrite itself (unix_millis + transform/struct
+# rebuild) runs on a live session and is covered by the integration datatype test under a NON-UTC
+# session, which is the red-able regression guard for the tz-corruption bug.
+
+def _types():
+    from pyspark.sql.types import (ArrayType, MapType, StructType, StructField, TimestampType,
+                                   TimestampNTZType, DateType, LongType, StringType, IntegerType)
+    return dict(ArrayType=ArrayType, MapType=MapType, StructType=StructType, StructField=StructField,
+                TimestampType=TimestampType, TimestampNTZType=TimestampNTZType, DateType=DateType,
+                LongType=LongType, StringType=StringType, IntegerType=IntegerType)
+
+
+def test_type_has_timestamp_top_level():
+    from databricks_es_connector.spark_prep import _type_has_timestamp
+    t = _types()
+    assert _type_has_timestamp(t["TimestampType"]()) is True
+    # NTZ and Date are deliberately NOT matched: different, already-correct handling.
+    assert _type_has_timestamp(t["TimestampNTZType"]()) is False
+    assert _type_has_timestamp(t["DateType"]()) is False
+    assert _type_has_timestamp(t["StringType"]()) is False
+
+
+def test_type_has_timestamp_nested():
+    from databricks_es_connector.spark_prep import _type_has_timestamp
+    t = _types()
+    struct_ts = t["StructType"]([t["StructField"]("a", t["IntegerType"]()),
+                                 t["StructField"]("ts", t["TimestampType"]())])
+    assert _type_has_timestamp(struct_ts) is True
+    assert _type_has_timestamp(t["ArrayType"](t["TimestampType"]())) is True
+    assert _type_has_timestamp(t["MapType"](t["StringType"](), t["TimestampType"]())) is True
+    # a struct/array with NO timestamp (and only ntz/date) is not matched
+    clean = t["StructType"]([t["StructField"]("n", t["TimestampNTZType"]()),
+                             t["StructField"]("d", t["DateType"]())])
+    assert _type_has_timestamp(clean) is False
+    assert _type_has_timestamp(t["ArrayType"](t["StringType"]())) is False
+
+
+def test_epoch_struct_type_maps_timestamp_to_long_recursively():
+    from databricks_es_connector.spark_prep import _epoch_struct_type
+    t = _types()
+    # top-level timestamp -> long
+    assert isinstance(_epoch_struct_type(t["TimestampType"]()), t["LongType"])
+    # ntz/date unchanged
+    assert isinstance(_epoch_struct_type(t["TimestampNTZType"]()), t["TimestampNTZType"])
+    assert isinstance(_epoch_struct_type(t["DateType"]()), t["DateType"])
+    # nested: struct<ts:timestamp, n:ntz> -> struct<ts:long, n:ntz>
+    src = t["StructType"]([t["StructField"]("ts", t["TimestampType"]()),
+                           t["StructField"]("n", t["TimestampNTZType"]())])
+    out = _epoch_struct_type(src)
+    fields = {f.name: type(f.dataType).__name__ for f in out.fields}
+    assert fields == {"ts": "LongType", "n": "TimestampNTZType"}
+    # array<timestamp> -> array<long>; map<string,timestamp> -> map<string,long>
+    assert isinstance(_epoch_struct_type(t["ArrayType"](t["TimestampType"]())).elementType, t["LongType"])
+    assert isinstance(_epoch_struct_type(t["MapType"](t["StringType"](), t["TimestampType"]())).valueType, t["LongType"])

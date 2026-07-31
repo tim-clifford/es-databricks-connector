@@ -37,6 +37,44 @@ def test_finite_floats_preserved():
     assert coerce_value(0.0) == 0.0
 
 
+# --- corner cases that a symmetric round-trip can hide (pinned so "probably fine" becomes proven) ---
+
+def test_negative_zero_preserved():
+    # -0.0 is finite, so it must NOT be nulled like NaN/inf; it passes through as a float.
+    # (ES may normalize -0.0 to 0.0 server-side; that's an ES concern, the connector must not lose it.)
+    out = coerce_value(-0.0)
+    assert out == 0.0
+    assert math.copysign(1.0, out) == -1.0   # sign bit preserved: genuinely -0.0, not 0.0
+
+def test_empty_string_is_not_null():
+    # "" is a real value, distinct from null. _is_null must not treat it as null.
+    assert coerce_value("") == ""
+
+def test_very_long_string_passes_through():
+    s = "x" * 100_000
+    assert coerce_value(s) == s
+
+def test_empty_dict_and_list_pass_through():
+    # An empty struct (struct<>) arrives as {} and an empty array as []; both preserved.
+    assert coerce_value({}) == {}
+    assert coerce_value([]) == []
+
+def test_nested_array_of_arrays_coerced():
+    # array<array<int>>: recursion must descend both levels (values coerced, shape preserved).
+    assert coerce_value([[1, 2], [3], []]) == [[1, 2], [3], []]
+    # with a null element inside the inner arrays
+    assert coerce_value([[float("nan"), 2], None]) == [[None, 2], None]
+
+def test_complex_typed_id_is_stringified():
+    # A struct/array id_field is uncommon but must not crash: _require_id stringifies the raw value
+    # deterministically. Documents the behavior (stable within a fixed shape) rather than asserting
+    # it's a good idea -- the README steers callers to a scalar id.
+    a1 = build_action({"doc_id": {"a": 1}, "x": 1}, index="i", id_field="doc_id")
+    assert a1["_id"] == "{'a': 1}"
+    a2 = build_action({"doc_id": [1, 2], "x": 1}, index="i", id_field="doc_id")
+    assert a2["_id"] == "[1, 2]"
+
+
 # --- non-finite floats: inf/-inf have no JSON representation. json.dumps emits the bare
 # tokens `Infinity`/`-Infinity`, which ES's strict parser rejects, so the doc fails to index
 # and is silently lost to the error count. Must coerce to None, mirroring NaN. The strict
@@ -406,6 +444,40 @@ def test_build_action_requires_index():
 def test_build_action_missing_id_raises():
     with pytest.raises(KeyError):
         build_action({"x": 1}, index="idx", id_field="doc_id")
+
+
+def test_build_action_none_id_raises():
+    # id present but None must raise, not become _id="None".
+    with pytest.raises(KeyError):
+        build_action({"doc_id": None, "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_build_action_nan_id_raises():
+    # REGRESSION: a pandas NaN in a numeric id column is a float, not None. It must raise,
+    # not slip past the guard and become _id="nan" (which would collapse every NaN-id row
+    # onto one document, silently overwriting them). Guards the whole null-ish class.
+    with pytest.raises(KeyError):
+        build_action({"doc_id": float("nan"), "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_build_action_numpy_nan_id_raises():
+    np = pytest.importorskip("numpy")
+    with pytest.raises(KeyError):
+        build_action({"doc_id": np.float64("nan"), "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_build_action_nat_id_raises():
+    # A NaT in a timestamp id column is likewise null-ish and must raise.
+    pd = pytest.importorskip("pandas")
+    with pytest.raises(KeyError):
+        build_action({"doc_id": pd.NaT, "x": 1}, index="idx", id_field="doc_id")
+
+
+def test_delete_flagged_row_nan_id_raises():
+    # Same guard on the delete path: a NaN id can't silently target _id="nan".
+    with pytest.raises(KeyError):
+        build_action({"doc_id": float("nan"), "d": True}, index="i", id_field="doc_id",
+                     has_deletes=True, delete_flag_column="d")
 
 
 def test_build_action_coerces_timestamp_in_source():
