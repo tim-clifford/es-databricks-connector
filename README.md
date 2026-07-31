@@ -236,22 +236,16 @@ cfg = EsReadConfig(
     api_key=dbutils.secrets.get("es", "api_key"),
     index="my-index",
     id_field="doc_id",               # filled from the ES _id if absent from _source
-    query={"term": {"region.keyword": "us"}},  # raw ES query DSL; omit for match_all. Note .keyword (see below)
+    query={"term": {"region.keyword": "us"}},  # optional raw ES query DSL; omit for match_all (.keyword: see below)
     pit_keep_alive="5m",             # sliding window: covers the gap between PIT touches, not the whole job (see note)
 )
 df = read_index(spark, cfg, schema)  # distributed: one Spark task per shard/slice
 ```
 
-> **`query` gotcha: `term` on a string field needs `.keyword`.** The connector does not create an
-> ES mapping; it relies on ES **dynamic mapping**, which maps a string field as `text` (analyzed:
-> lowercased and tokenized at index time) with a `.keyword` sub-field (the exact, un-analyzed value).
-> A `term` query does **not** analyze its input, so `{"term": {"region": "us"}}` compares your raw
-> value against the analyzed tokens and typically returns **nothing**. Query the sub-field instead:
-> `{"term": {"region.keyword": "us"}}` (exact match), or use `{"match": {"region": "us"}}` (which
-> analyzes the query text the same way, so it lines up with the `text` field). If you mapped the
-> field explicitly as `keyword` yourself, query the bare field name. Check a field's mapping with
-> `GET /<index>/_mapping/field/<field>`. This is standard Elasticsearch text/keyword behavior, not a
-> connector-specific quirk; `match_all` (the default) is unaffected because it does no term matching.
+> **`term` gotcha:** dynamically-mapped string fields are `text` (analyzed), so a `term` query on
+> the bare field usually returns nothing. Query the exact `.keyword` sub-field
+> (`{"term": {"region.keyword": "us"}}`) or use `match`. Standard Elasticsearch behavior; check with
+> `GET /<index>/_mapping/field/<field>`.
 
 **`read_index` is distributed** and serverless-safe: it opens one Elasticsearch Point-in-Time for a
 consistent snapshot, then fans out `spark.range(num_slices).mapInPandas(...)`, one task per PIT
@@ -375,7 +369,7 @@ cross-batch ordering caveat.
 |-------|------|---------|----------|-------|
 | `index` | `str` | `""` | **Yes** | Source index. `read_index` raises if empty. |
 | `id_field` | `str \| None` | `None` | No | If the declared schema names this column, it is filled from the ES `_id` when absent from `_source`. |
-| `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read. `None` = `match_all`. v1 accepts a raw DSL dict only, no Spark-predicate pushdown. **`term` on a dynamically-mapped string field must target the `.keyword` sub-field** (e.g. `{"term": {"region.keyword": "us"}}`), or use `match` (see the query gotcha above). |
+| `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read. `None` = `match_all`. v1 accepts a raw DSL dict only, no Spark-predicate pushdown. (For `term` on string fields, note the `.keyword` gotcha in the Reading section.) |
 | `num_slices` | `int \| None` | `None` | No | Parallelism for the distributed read. `None` defaults to the index's shard count. One slice per Spark task. |
 | `batch_size` | `int` | `1000` | No | Docs per scroll/PIT page. Must be positive. |
 | `pit_keep_alive` | `str` | `"5m"` | No | Point-in-Time lifetime, as a **sliding window**: each page re-sends it and resets the PIT's expiry, so it need only cover the longest gap between consecutive reads of the PIT (for `read_index`, the lazy open-to-first-page scheduling gap), not the whole job. See the Reading section. |
