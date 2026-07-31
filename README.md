@@ -288,6 +288,16 @@ alone is ambiguous, so the reader must be told the intended type. There is no ma
 declare the schema explicitly. (ES also has no array type: a field declared `array<T>` is read as a
 list even if ES returned a scalar.)
 
+> **Dynamic-mapping gotcha:** if you don't pre-create an index mapping, ES infers each field's type
+> from the **first** document it sees and keeps it. A later doc whose value doesn't fit is silently
+> coerced for indexing (a `float` `1.5` into a field first seen as an integer indexes as `1`; a
+> keyword string past `ignore_above`, default 256 chars, isn't indexed). This does **not** affect the
+> connector round-trip: reads come from `_source`, which ES stores verbatim, so `read_index` returns
+> your original value regardless. It only bites when you **query ES directly** (aggregations, sort,
+> `term`), where you see the coerced/truncated *indexed* value, not `_source`. For heterogeneous or
+> long-string fields, pre-create an explicit mapping. (Same root cause as the `term`/`.keyword`
+> gotcha above.)
+
 ## Configuration
 
 **You always create one of two config objects**, depending on the direction:
@@ -489,6 +499,11 @@ python -m build --wheel                             # writes dist/databricks_es_
 
 The version comes from `[project].version` in `pyproject.toml`; bump it there before
 building a new release. The wheel lands in `dist/` (git-ignored).
+
+**Cutting a tagged release?** Follow [`RELEASING.md`](RELEASING.md): it enumerates the four required
+steps (integration tests, rebuild wheel, verify `requirements.txt` matches the wheel's closure via
+`scripts/check_requirements_match.py`, attach the wheel to the tag), with the requirements check as a
+hard gate.
 
 **When cutting a release, regenerate [`requirements.txt`](requirements.txt).** The build does
 *not* read that file: the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
