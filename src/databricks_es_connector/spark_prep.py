@@ -36,10 +36,11 @@ from __future__ import annotations
 
 import re
 import uuid
-from typing import TYPE_CHECKING, List, Tuple
+from typing import TYPE_CHECKING, Any, List, Tuple
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyspark.sql import DataFrame
+    from pyspark.sql.types import DataType
 
 # Arrow-hostile type names to find inside a column's DESCRIBE type string. VARIANT/INTERVAL have no
 # Arrow representation, so a column whose type CONTAINS one (top-level or nested) must be
@@ -137,4 +138,107 @@ def sanitize_for_arrow(df: "DataFrame") -> "DataFrame":
             out = out.withColumn(name, F.col(name).cast("string"))
         else:
             out = out.withColumn(name, F.to_json(F.col(name)))
+    return out
+
+
+# --- timestamp -> epoch-millis in Spark (timezone-safe) --------------------------------------
+# Why this exists: Spark's Arrow export converts a `TimestampType` (an instant) to a naive pandas
+# Timestamp using `spark.sql.session.timeZone`, i.e. the session-LOCAL wall-clock with the zone
+# dropped. Under any non-UTC session, `transform.coerce_value` (which reads a naive datetime as
+# UTC) then computes an epoch offset by the session's UTC offset -- silent timestamp corruption,
+# present since 0.1.0 and only surfaced by running the datatype test under a non-UTC session.
+#
+# Fix, mirroring how the elasticsearch-hadoop connector stays tz-safe: convert every `TimestampType`
+# to its epoch-millis long IN SPARK via `unix_millis`, which operates on the instant and is therefore
+# independent of session.timeZone (verified on serverless under UTC / America/New_York /
+# Asia/Kolkata; correct for pre-epoch and sub-millisecond flooring too). The value then reaches the
+# executor already an integer, so coerce_value passes it straight through and the READ path is
+# unchanged (it already reconstructs a `timestamp` from epoch-millis).
+#
+# Deliberately NOT touched:
+#   - TimestampNTZType: a zoneless wall-clock. The connector's contract is to read it AS UTC, which
+#     is exactly what the current path already produces (verified). `unix_millis` also REJECTS ntz.
+#   - DateType: has no time-of-day, converts to midnight-UTC epoch correctly already (verified).
+# Only `TimestampType` at any nesting depth is rewritten.
+
+
+def _type_has_timestamp(dt: "DataType") -> bool:
+    """True if `dt` is a TimestampType or contains one at any nesting depth (struct/array/map).
+
+    TimestampNTZType is intentionally NOT matched (different, already-correct handling)."""
+    from pyspark.sql.types import (ArrayType, MapType, StructType, TimestampType)
+
+    if isinstance(dt, TimestampType):
+        return True
+    if isinstance(dt, StructType):
+        return any(_type_has_timestamp(f.dataType) for f in dt.fields)
+    if isinstance(dt, ArrayType):
+        return _type_has_timestamp(dt.elementType)
+    if isinstance(dt, MapType):
+        # A timestamp map KEY can't occur in JSON output distinctly, but rewrite defensively so the
+        # value side is always handled; keys are coerced to strings downstream regardless.
+        return _type_has_timestamp(dt.keyType) or _type_has_timestamp(dt.valueType)
+    return False
+
+
+def _rewrite_timestamps(col: "Any", dt: "DataType") -> "Any":
+    """Return a Spark Column expression that rebuilds `col` with every TimestampType node replaced by
+    its `unix_millis` epoch-millis long, preserving struct/array/map structure. Non-timestamp leaves
+    and whole subtrees with no timestamp are returned unchanged (the caller only invokes this for
+    columns that _type_has_timestamp, and prunes clean subtrees below)."""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import (ArrayType, MapType, StructType, TimestampType)
+
+    if isinstance(dt, TimestampType):
+        return F.unix_millis(col)
+    if isinstance(dt, StructType):
+        # Rebuild the struct field-by-field; convert only fields that contain a timestamp, keep the
+        # rest as-is (and preserve field names/order). A null struct stays null: guard with when().
+        rebuilt = F.struct(*[
+            (_rewrite_timestamps(col[f.name], f.dataType) if _type_has_timestamp(f.dataType)
+             else col[f.name]).alias(f.name)
+            for f in dt.fields
+        ])
+        return F.when(col.isNull(), F.lit(None).cast(_epoch_struct_type(dt))).otherwise(rebuilt)
+    if isinstance(dt, ArrayType):
+        return F.transform(col, lambda e: _rewrite_timestamps(e, dt.elementType))
+    if isinstance(dt, MapType):
+        return F.transform_values(col, lambda k, v: _rewrite_timestamps(v, dt.valueType))
+    return col
+
+
+def _epoch_struct_type(dt: "DataType") -> "DataType":
+    """The post-rewrite type of `dt` (TimestampType -> LongType, recursively), used to type a null
+    struct literal so `when(null)` keeps the column's rewritten schema instead of collapsing it."""
+    from pyspark.sql.types import (ArrayType, LongType, MapType, StructField, StructType,
+                                   TimestampType)
+
+    if isinstance(dt, TimestampType):
+        return LongType()
+    if isinstance(dt, StructType):
+        return StructType([StructField(f.name, _epoch_struct_type(f.dataType), f.nullable)
+                           for f in dt.fields])
+    if isinstance(dt, ArrayType):
+        return ArrayType(_epoch_struct_type(dt.elementType), dt.containsNull)
+    if isinstance(dt, MapType):
+        return MapType(_epoch_struct_type(dt.keyType), _epoch_struct_type(dt.valueType),
+                       dt.valueContainsNull)
+    return dt
+
+
+def normalize_timestamps_for_utc(df: "DataFrame") -> "DataFrame":
+    """Return `df` with every `TimestampType` column (at any nesting depth) converted to its
+    epoch-millis long via `unix_millis`, so the epoch is correct regardless of
+    `spark.sql.session.timeZone`. See the section comment above for the why.
+
+    Does NOT mutate session state. Leaves TimestampNTZType, DateType, and all other types unchanged.
+    Idempotent-ish: a DataFrame with no TimestampType columns is returned unchanged. Must run AFTER
+    sanitize_for_arrow (VARIANT columns break df.schema on Spark Connect; sanitize removes them
+    first), which is how bulk_write orders the two.
+    """
+    out = df
+    for f in df.schema.fields:
+        if _type_has_timestamp(f.dataType):
+            from pyspark.sql import functions as F
+            out = out.withColumn(f.name, _rewrite_timestamps(F.col(f.name), f.dataType))
     return out

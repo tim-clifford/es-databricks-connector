@@ -54,11 +54,13 @@ class TestDatatypeCoverage(NotebookTestFixture):
     the documented transforms. One full row and one all-NULL row of the same schema."""
 
     def run_setup(self):
-        # Run under a NON-UTC session timezone on purpose. The connector treats naive timestamps as
-        # UTC; this proves that assumption holds regardless of spark.sql.session.timeZone (Spark's
-        # Arrow export normalizes a `timestamp` to a UTC wall-clock before it reaches the connector).
-        # Under a naive-as-local bug the s_timestamp / s_ts_preepoch epoch assertions would be off by
-        # the session's UTC offset and fail, so this is the red-able guard for that whole class.
+        # Run under a NON-UTC session timezone on purpose. Spark's Arrow export converts a
+        # `timestamp` to the session-LOCAL wall-clock, so without the fix
+        # (spark_prep.normalize_timestamps_for_utc, which converts timestamps to epoch-millis via
+        # unix_millis BEFORE the export) the stored epoch is shifted by the session's UTC offset.
+        # Under that bug the s_timestamp / s_ts_preepoch / nested-timestamp epoch assertions are off
+        # by -5h (America/New_York) and fail, so this is the red-able guard for the whole class.
+        # A companion UTC-session run (test_timezone_utc.py) pins that UTC behavior is unchanged.
         spark.conf.set("spark.sql.session.timeZone", "America/New_York")
 
         # FULL row: one column per Spark type / edge case. Explicit CASTs so the column TYPE is what
