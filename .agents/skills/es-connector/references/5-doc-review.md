@@ -31,19 +31,30 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
 2. **Public API.** Every name in `__init__.py`'s `__all__` is documented in the README, and the
    README names no function/config field that no longer exists. Config fields
    (`EsWriteConfig`/`EsReadConfig`) match `config.py`.
-3. **Datatype tables.** The README "Datatype coverage" (write) and "Read fidelity" (read) tables, and
+3. **Behavior and logic changes (the general case, easiest to miss).** Any change to what the code
+   *does*, not just its API surface, must be reflected wherever the docs describe that behavior. This
+   is broader than the datatype tables: a bug FIX to existing behavior, a changed default, a new or
+   newly-closed limitation, an altered ordering/guarantee, or a new ES-interaction gotcha. Ask: "what
+   did this change make true (or no longer true) that a doc states?" Then check every place that
+   states it, README prose (not just tables), `HANDOFF.md` limitations, `RELEASING.md`, and the
+   relevant skill reference. The timezone fix is the canonical example: it touched no public-API
+   signature and only one datatype-table row, but it changed a correctness guarantee that belongs in
+   the README timezone section, `references/3-es-gotchas.md`, AND HANDOFF, none of which a
+   table-only check would flag. Fixes are the sneakiest: a closed limitation left in HANDOFF
+   understates the connector, and a removed gotcha left in the docs misleads.
+4. **Datatype tables.** The README "Datatype coverage" (write) and "Read fidelity" (read) tables, and
    this skill's `references/1-fidelity-model.md`, all match `coerce_value` / `read_coerce`, and the
    one-way-delta list is exactly three (decimal, sub-ms timestamp, float32) unless a change
    deliberately added a fourth (which must be documented in all three places). See ref 2.
-4. **File enumeration.** `scripts/check_readme_sync.py` exits 0 (modules, fixtures, scripts are
+5. **File enumeration.** `scripts/check_readme_sync.py` exits 0 (modules, fixtures, scripts are
    listed). Then eyeball that each listed description is still ACCURATE, not just present.
-5. **Release process.** `RELEASING.md` steps match the actual scripts (`scripts/*.py`), the FEVM
+6. **Release process.** `RELEASING.md` steps match the actual scripts (`scripts/*.py`), the FEVM
    paths/profile are current, and the step order still has build+upload BEFORE the integration run.
-6. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
+7. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
    critical rules still hold (write-path order, the serverless constraints, the five-places rule),
    and that refs 1, 3, 4 don't cite a function, path, or behavior that changed. Because the skill
    duplicates the READMEs by design, it drifts first, treat it as guilty until checked.
-7. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
+8. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
    out of open items or annotated, so the readiness doc doesn't understate the connector.
 
 ## Output of a review

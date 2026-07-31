@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.4.0)
+# Production Readiness / Known Limitations (0.4.1)
 
 `databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
 bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -121,6 +121,12 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   type; (3) a Spark `FLOAT` (32-bit) stores its exact widened value (`0.1`→`0.10000000149011612`),
   not the source literal: use `DOUBLE` if that matters; (4) `timestamp`→epoch-millis is floored to
   the millisecond (sub-ms precision dropped; ES `date` is ms-resolution: use `date_nanos` for finer).
+  **`timestamp` timezone-independence (fixed 0.4.1):** a `timestamp`'s stored epoch is its true UTC
+  instant regardless of `spark.sql.session.timeZone` (the connector converts via Spark `unix_millis`
+  before export). Before 0.4.1 a non-UTC session silently shifted the stored epoch by the session
+  offset: any data written by a pre-0.4.1 build under a non-UTC session is suspect and should be
+  re-checked. `timestamp_ntz` (interpreted as UTC) gained its symmetric read inverse in 0.4.1
+  (reads back naive); `date` is unaffected.
 - **ES version compatibility.** The client is pinned `elasticsearch>=8,<9`; the 8.x client refuses a
   9.x cluster. Confirm the customer's ES major version and adjust.
 
