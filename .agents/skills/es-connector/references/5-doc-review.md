@@ -66,8 +66,8 @@ catch-up" pass later (that later pass is how drift accumulates in the first plac
 
 ## Why this isn't a script
 
-Items 1 and 4-presence are mechanizable (and item 4 already is). The rest, "is this description still
-accurate," is a judgment call that needs reading the code, exactly what a script can't do and a
-review can. If a check here becomes fully mechanical (e.g. version consistency), promote it to
+Item 1 (version consistency) and item 5's presence half are mechanizable (item 5 already is, via
+`check_readme_sync.py`). The rest, "is this description still accurate," is a judgment call that
+needs reading the code, exactly what a script can't do and a review can. If a check here becomes fully mechanical (e.g. version consistency), promote it to
 `scripts/` and cite it from RELEASING.md, don't leave it as a manual step. Keep the deterministic
 parts enforced and the judgment parts reviewed.
