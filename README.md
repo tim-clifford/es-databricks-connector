@@ -236,11 +236,22 @@ cfg = EsReadConfig(
     api_key=dbutils.secrets.get("es", "api_key"),
     index="my-index",
     id_field="doc_id",               # filled from the ES _id if absent from _source
-    query={"term": {"region": "us"}},  # optional raw ES query DSL; omit for match_all
+    query={"term": {"region.keyword": "us"}},  # raw ES query DSL; omit for match_all. Note .keyword (see below)
     pit_keep_alive="5m",             # sliding window: covers the gap between PIT touches, not the whole job (see note)
 )
 df = read_index(spark, cfg, schema)  # distributed: one Spark task per shard/slice
 ```
+
+> **`query` gotcha: `term` on a string field needs `.keyword`.** The connector does not create an
+> ES mapping; it relies on ES **dynamic mapping**, which maps a string field as `text` (analyzed:
+> lowercased and tokenized at index time) with a `.keyword` sub-field (the exact, un-analyzed value).
+> A `term` query does **not** analyze its input, so `{"term": {"region": "us"}}` compares your raw
+> value against the analyzed tokens and typically returns **nothing**. Query the sub-field instead:
+> `{"term": {"region.keyword": "us"}}` (exact match), or use `{"match": {"region": "us"}}` (which
+> analyzes the query text the same way, so it lines up with the `text` field). If you mapped the
+> field explicitly as `keyword` yourself, query the bare field name. Check a field's mapping with
+> `GET /<index>/_mapping/field/<field>`. This is standard Elasticsearch text/keyword behavior, not a
+> connector-specific quirk; `match_all` (the default) is unaffected because it does no term matching.
 
 **`read_index` is distributed** and serverless-safe: it opens one Elasticsearch Point-in-Time for a
 consistent snapshot, then fans out `spark.range(num_slices).mapInPandas(...)`, one task per PIT
@@ -271,6 +282,7 @@ exact inverse of the write transform:
 | Declared Spark type | Stored in ES | Read back as |
 |---|---|---|
 | `timestamp` / `date` | epoch-millis integer | `datetime` / `date` (UTC) |
+| `timestamp_ntz` | epoch-millis integer | naive `datetime` (no tzinfo, the UTC wall-clock) |
 | `binary` | base64 string | `bytes` |
 | `decimal(p,s)` | float | `Decimal` (precision already lost on write) |
 | `variant` / `interval` | JSON / interval string | string (re-parse with `parse_json` yourself) |
@@ -363,7 +375,7 @@ cross-batch ordering caveat.
 |-------|------|---------|----------|-------|
 | `index` | `str` | `""` | **Yes** | Source index. `read_index` raises if empty. |
 | `id_field` | `str \| None` | `None` | No | If the declared schema names this column, it is filled from the ES `_id` when absent from `_source`. |
-| `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read (e.g. `{"term": {...}}`). `None` = `match_all`. v1 accepts a raw DSL dict only, no Spark-predicate pushdown. |
+| `query` | `dict \| None` | `None` | No | Raw ES query DSL to filter the read. `None` = `match_all`. v1 accepts a raw DSL dict only, no Spark-predicate pushdown. **`term` on a dynamically-mapped string field must target the `.keyword` sub-field** (e.g. `{"term": {"region.keyword": "us"}}`), or use `match` (see the query gotcha above). |
 | `num_slices` | `int \| None` | `None` | No | Parallelism for the distributed read. `None` defaults to the index's shard count. One slice per Spark task. |
 | `batch_size` | `int` | `1000` | No | Docs per scroll/PIT page. Must be positive. |
 | `pit_keep_alive` | `str` | `"5m"` | No | Point-in-Time lifetime, as a **sliding window**: each page re-sends it and resets the PIT's expiry, so it need only cover the longest gap between consecutive reads of the PIT (for `read_index`, the lazy open-to-first-page scheduling gap), not the whole job. See the Reading section. |
@@ -386,7 +398,8 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | `double` | unchanged; non-finite values (`Infinity`/`-Infinity`/`NaN`) become `null` (no JSON representation) | `1.5` → `1.5`; `Infinity` → `null` |
 | `float` (32-bit) | its **exact 32-bit value widened to double**, the stored number shows the float32 rounding, not the literal you typed (see note) | `0.1` (float) → `0.10000000149011612` |
 | `decimal(p,s)` | **float** (precision lost beyond ~15-17 sig figs) | `Decimal("1.50")` → `1.5` |
-| `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped) | `2021-01-01T00:00:00Z` → `1609459200000` |
+| `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped). The `timestamp` epoch is the true UTC instant, independent of `spark.sql.session.timeZone` (see below) | `2021-01-01T00:00:00Z` → `1609459200000` |
+| `timestamp_ntz` | **epoch milliseconds** of the wall-clock read as UTC (see below) | `2021-06-01 12:00:00` → `1622548800000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
 | `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
 | `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
@@ -411,6 +424,17 @@ connector interprets it as **UTC**, deterministically, since executors can be in
 The stored epoch-millis is that wall-clock time read as UTC, not as the cluster's local zone. If
 your NTZ values are really in some other zone, convert them to a zoned `timestamp` in Spark before
 export so the epoch is correct.
+
+**Timezone independence (`timestamp`):** the epoch a `timestamp` stores is its **true UTC instant,
+regardless of `spark.sql.session.timeZone`**: set the session to `America/New_York`, `Asia/Kolkata`,
+or anything else and the same instant produces the same epoch. The connector guarantees this by
+converting every `timestamp` column (at any nesting depth: inside `struct`/`array`/`map` too) to its
+epoch-millis in Spark via `unix_millis` **before** the export, rather than letting Spark's Arrow
+conversion render it to the session-local wall-clock. This matters because a naive
+(session-local) render would otherwise be stored as if it were UTC, silently shifting the stored
+instant by the session's offset. No caller action is needed, and the session is never mutated. Only
+`timestamp` is converted this way; `timestamp_ntz` (defined as UTC above) and `date` (no
+time-of-day) are already session-independent and are left untouched.
 
 ### Arrow-hostile types: `variant` and `interval` (handled automatically)
 
