@@ -562,6 +562,7 @@ integration_tests/             # live-Spark/ES tests run on Databricks serverles
 scripts/                       # release + maintenance gates (not shipped in the .whl)
   check_requirements_match.py  #   requirements.txt == the wheel's resolved dependency closure
   check_readme_sync.py         #   every module / fixture / script is documented in the README(s)
+.agents/skills/es-connector/   # maintainer skill: fidelity model, datatype contract, ES gotchas, release
 RELEASING.md                   # the release checklist (integration tests, wheel, gates, tag)
 ```
 
