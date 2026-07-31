@@ -41,13 +41,13 @@ before a customer relies on it.
 
 ## Open items: data durability & operations (deferred hardening)
 
-These were consciously deferred to keep 0.1.0 focused. Needed before production for SIEM/audit data:
+Hardening still needed before production for SIEM/audit data:
 
-- **Error capture / dead-letter.** *Partially addressed in 0.3.1.* `bulk_write` now returns
+- **Error capture / dead-letter.** Partially addressed. `bulk_write` returns
   `{written, deleted, errors, total_input, error_samples}`: `error_samples` is a **bounded** sample
   (≤20) of per-doc failure diagnostics (`_id`, op, status, ES reason), and `total_input` lets a
   caller reconcile `written+deleted+errors` against rows-in to detect below-per-doc loss. This makes
-  a failed write diagnosable and detectable. **Still deferred:** a durable **dead-letter path** that
+  a failed write diagnosable and detectable. **Still missing:** a durable **dead-letter path** that
   captures *every* failed row (not just a sample): for SIEM/audit, silent loss of the un-sampled
   failures beyond the cap is still a correctness gap. Route failures to a Delta table / DLQ.
 - **Backpressure / concurrency cap.** `mapInPandas` opens one ES client per Spark partition; a
@@ -69,23 +69,23 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   batch (StatsD, a Delta audit table).
 - **Monitoring.** The `on_batch` hook is a seam for metrics but nothing sinks throughput / error
   rate / lag.
-- **Updates & deletes.** Inserts/upserts via deterministic `_id` shipped in 0.1.0; **deletes shipped
-  in 0.2.0** (`has_deletes` + `delete_flag_column`, emitting delete-by-`_id` bulk actions with
-  scoped 404 no-op suppression). The connector deletes exactly the rows the caller flags: it does
-  **not** dedup or order Change Data Feed rows itself. That is deliberate: dedup needs the caller's
-  business sequencing column and should run distributed in Spark, not in executor memory (see the
+- **Updates & deletes.** Inserts/upserts via deterministic `_id`, and deletes via `has_deletes` +
+  `delete_flag_column` (emitting delete-by-`_id` bulk actions with scoped 404 no-op suppression),
+  are supported. The connector deletes exactly the rows the caller flags: it does **not** dedup or
+  order Change Data Feed rows itself. That is deliberate: dedup needs the caller's business
+  sequencing column and should run distributed in Spark, not in executor memory (see the
   Change-Data-Feed pattern in the README). **Known limitation:** a caller that dedups per
   micro-batch is only correct within a batch: late-arriving data whose `event_ts` is older than a
   doc already in ES, but committed in a *later* batch, can clobber the newer doc. The memory-free
-  fix is ES external versioning (`version` = `event_ts` epoch-millis, `version_type=external_gte`),
-  deferred to keep the 0.2.0 API surface minimal.
+  fix (not yet implemented) is ES external versioning (`version` = `event_ts` epoch-millis,
+  `version_type=external_gte`).
 
-## Open items: read path (`read_index`, shipped 0.4.0)
+## Open items: read path (`read_index`)
 
 - **Explicit schema required; no mapping inference.** `read_index` requires the caller to declare a
   Spark `StructType`. This is deliberate: several write transforms are one-way (epoch-millis,
   decimal→float, base64, variant/interval→string) and can't be inverted from `_source` alone. A
-  best-effort `GET /_mapping` inference for the unambiguous types is a candidate for a later version,
+  best-effort `GET /_mapping` inference for the unambiguous types is a possible future enhancement,
   but must never silently guess the ambiguous ones.
 - **PIT keep-alive must cover the whole downstream job.** `read_index` returns a *lazy* distributed
   DataFrame, so its Point-in-Time snapshot can't be driver-closed (that would kill the still-lazy
@@ -93,10 +93,10 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   read late will fail with an expired-PIT error. Set `pit_keep_alive` generously, or use
   `read_index_collect` (bounded, driver-side, closes its PIT explicitly) for small reads. No
   automatic PIT renewal yet.
-- **No Spark predicate/column pushdown.** v0.4.0 accepts a raw ES query DSL dict (`EsReadConfig.query`)
-  for server-side filtering, but does not translate Spark `.filter(...)`/`.select(...)` into ES
-  queries. A caller wanting pushdown must express it as the raw query. A proper Spark `DataSource`
-  with pushdown is out of scope (and blocked on serverless anyway).
+- **No Spark predicate/column pushdown.** `read_index` accepts a raw ES query DSL dict
+  (`EsReadConfig.query`) for server-side filtering, but does not translate Spark
+  `.filter(...)`/`.select(...)` into ES queries. A caller wanting pushdown must express it as the raw
+  query. A proper Spark `DataSource` with pushdown is out of scope (and blocked on serverless anyway).
 - **Read throughput not yet benchmarked.** The sliced-scroll fan-out is proven correct (all docs,
   once, across shards) but has no throughput/large-index benchmark. `num_slices` defaults to the
   shard count; the optimal slice count and `batch_size` for a large export are untuned.
@@ -114,7 +114,7 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
   nesting depth) to a string: `variant`→JSON string, scalar `interval`→its Spark string form.
   Field pruning
   (`drop_fields`) is a client opt-out to shrink payload, never a capability limit. Non-string
-  `map` keys are rendered to strings via the same value transform (0.3.1); Spark maps are
+  `map` keys are rendered to strings via the same value transform; Spark maps are
   homogeneously typed so keys stay distinct. Caveats to raise with a customer: (1) `decimal`→float
   loses precision beyond ~15-17 sig figs: cast to string in Spark if exact decimals matter
   (money/IDs); (2) added fields need matching ES mapping entries or ES dynamic-maps and guesses the
@@ -136,6 +136,6 @@ These were consciously deferred to keep 0.1.0 focused. Needed before production 
 - [ ] API-key auth via secret scope, worked example
 - [ ] FIPS/FedRAMP requirements confirmed
 - [ ] Index template + ILM defined
-- [ ] Durable dead-letter path added (0.3.1 surfaces bounded `error_samples` + `total_input`; a full DLQ for every failed row is still needed)
+- [ ] Durable dead-letter path added (bounded `error_samples` + `total_input` exist; a full DLQ for every failed row is still needed)
 - [ ] Streaming run as a job with checkpoint + restart-idempotency
 - [ ] ES major-version compatibility confirmed
