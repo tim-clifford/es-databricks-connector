@@ -501,9 +501,9 @@ The version comes from `[project].version` in `pyproject.toml`; bump it there be
 building a new release. The wheel lands in `dist/` (git-ignored).
 
 **Cutting a tagged release?** Follow [`RELEASING.md`](RELEASING.md): it enumerates the four required
-steps (integration tests, rebuild wheel, verify `requirements.txt` matches the wheel's closure via
-`scripts/check_requirements_match.py`, attach the wheel to the tag), with the requirements check as a
-hard gate.
+steps (integration tests, rebuild wheel, run the release gates, attach the wheel to the tag). Two
+hard gates run in step 3: `scripts/check_requirements_match.py` (requirements.txt matches the wheel's
+resolved closure) and `scripts/check_readme_sync.py` (every module / fixture / script is documented).
 
 **When cutting a release, regenerate [`requirements.txt`](requirements.txt).** The build does
 *not* read that file: the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
@@ -555,8 +555,14 @@ integration_tests/             # live-Spark/ES tests run on Databricks serverles
   test_deletes_roundtrip.py    #   has_deletes routing live: delete-by-id, delete-404 no-op
   test_streaming_sink.py       #   make_foreach_batch on real Structured Streaming + restart idempotency
   test_read_roundtrip.py       #   write->read fidelity + distributed sliced read (multi-shard)
+  test_timezone_utc.py         #   timestamp epoch is session-timezone-independent (UTC + non-UTC)
+  test_dynamic_mapping_coercion.py #  ES dynamic-mapping coercion: _source faithful vs indexed value
   test_sanitize_for_arrow.py   #   the Spark-side VARIANT/INTERVAL serialization, no ES
   config/test_config.yml       #   dbx_test config (profile, wheel, serverless env)
+scripts/                       # release + maintenance gates (not shipped in the .whl)
+  check_requirements_match.py  #   requirements.txt == the wheel's resolved dependency closure
+  check_readme_sync.py         #   every module / fixture / script is documented in the README(s)
+RELEASING.md                   # the release checklist (integration tests, wheel, gates, tag)
 ```
 
 Two test tiers: `tests/` is the fast, infra-free gate (pure-Python, run with `pytest`);

@@ -69,8 +69,12 @@ def _resolve_closure(wheel: str) -> dict[str, str]:
         env_dir = os.path.join(tmp, "venv")
         venv.create(env_dir, with_pip=True)
         pip = os.path.join(env_dir, "bin", "pip")
-        subprocess.run([pip, "install", "--quiet", "--disable-pip-version-check", wheel],
-                       check=True)
+        try:
+            subprocess.run([pip, "install", "--quiet", "--disable-pip-version-check", wheel],
+                           check=True)
+        except subprocess.CalledProcessError:
+            sys.exit("error: could not install the wheel to resolve its dependency closure "
+                     "(network required: pip resolves transitive deps from the index).")
         out = subprocess.run([pip, "freeze", "--all"], check=True, capture_output=True, text=True)
 
     closure: dict[str, str] = {}
