@@ -11,6 +11,31 @@ review** for any PR that changes behavior, the public API, datatype handling, th
 adds/removes files. It is cheap (a few minutes) and it is the only thing that keeps the skill itself
 honest.
 
+## The goal: describe the current state, not the history
+
+A doc's job is to let a user or agent understand **what the repo is now, how to use it, and what to
+watch out for**, in as few words as make that clear. It is NOT a changelog or a design journal. The
+review below pushes you to keep docs *in sync* with the code, but sync cuts both ways: syncing is as
+much **removing** now-irrelevant text as adding new text. Resist the natural pull to append an
+explanation for every change, that ratchet is how a clean README turns into an archaeological record
+no one reads.
+
+Concrete rules:
+- **Describe behavior in the present tense as if it were always so.** "`timestamp` stores the true
+  UTC instant regardless of session zone." NOT "as of 0.4.1 we fixed a bug where..." The fix is real
+  and belongs in git history and the release notes; the *doc* states the current guarantee.
+- **Version/history narration lives in exactly two places:** `HANDOFF.md` (current status of known
+  limitations, which legitimately tracks what is and isn't addressed) and the GitHub release notes /
+  commit history. Everywhere else, write the current truth without the story of how it got there.
+- **Prune when you sync.** If a change makes a caveat, workaround, or explanation obsolete, DELETE it
+  in the same edit. A stale "known issue" that's been fixed is as harmful as a missing one.
+- **Prefer the shortest form that a first-time reader can act on.** A gotcha is one tight paragraph
+  with the fix, not a retrospective of why it exists. If depth is genuinely needed, it goes in a
+  skill reference (progressive disclosure), not inline in the README a newcomer reads first.
+- **When adding vs. pruning are in tension, ask:** "does a reader USING the connector today need
+  this to use it correctly or avoid a surprise?" If yes, keep it, tightly. If it only explains a past
+  decision or a change already invisible in current behavior, leave it to history.
+
 ## The documentation set (every file that can drift)
 
 | Doc | Describes | Most likely to go stale when... |
@@ -41,7 +66,9 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
    signature and only one datatype-table row, but it changed a correctness guarantee that belongs in
    the README timezone section, `references/3-es-gotchas.md`, AND HANDOFF, none of which a
    table-only check would flag. Fixes are the sneakiest: a closed limitation left in HANDOFF
-   understates the connector, and a removed gotcha left in the docs misleads.
+   understates the connector, and a removed gotcha left in the docs misleads. **State the new
+   behavior in the present tense (see "the goal" above), don't narrate the change; and delete any
+   now-obsolete caveat rather than layering a correction on top of it.**
 4. **Datatype tables.** The README "Datatype coverage" (write) and "Read fidelity" (read) tables, and
    this skill's `references/1-fidelity-model.md`, all match `coerce_value` / `read_coerce`, and the
    one-way-delta list is exactly three (decimal, sub-ms timestamp, float32) unless a change
@@ -56,6 +83,13 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
    duplicates the READMEs by design, it drifts first, treat it as guilty until checked.
 8. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
    out of open items or annotated, so the readiness doc doesn't understate the connector.
+9. **Conciseness and pruning (the counterbalance to items 3-8).** Items 3-8 push toward *adding*;
+   this one pushes back. Read each doc as a first-time user would and cut what no longer earns its
+   place: obsolete caveats/workarounds for since-fixed behavior, changelog-style "as of vX we..."
+   narration, duplicate explanations of the same point across files, and depth that belongs in a
+   skill reference rather than the README. Ask "does a reader USING the connector today need this?"
+   A shorter doc that states the current truth beats a longer one that records how it got there. If a
+   review's net effect is only additions, be suspicious you skipped this item.
 
 ## Output of a review
 
