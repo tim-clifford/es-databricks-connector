@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import glob
 import os
+import re
 import sys
 
 # Each rule: (human label, glob of files that must be documented, list of docs any of which may
@@ -52,6 +53,20 @@ def _read(path: str) -> str:
         return f.read()
 
 
+def _mentions(text: str, base: str) -> bool:
+    """True if `text` references the filename `base` as a whole token, not as a substring of a
+    longer name. A plain `base in text` check false-NEGATIVES: `transform.py` is a substring of
+    `read_transform.py`, so documenting only the latter would wrongly satisfy the former and let the
+    gate pass green over a real gap. Require the char before the basename to be a path/word boundary
+    (start, whitespace, or a path separator), so `read_transform.py` does not count as a mention of
+    `transform.py`, while `src/transform.py` and a bare `transform.py` do."""
+    for m in re.finditer(re.escape(base), text):
+        prev = text[m.start() - 1] if m.start() > 0 else ""
+        if prev == "" or prev.isspace() or prev in "/\\`(":
+            return True
+    return False
+
+
 def main() -> int:
     any_gap = False
     for label, file_glob, docs, skip in RULES:
@@ -62,7 +77,7 @@ def main() -> int:
             if skip and skip(path):
                 continue
             base = os.path.basename(path)
-            if not any(base in text for text in doc_texts.values()):
+            if not any(_mentions(text, base) for text in doc_texts.values()):
                 gaps.append(base)
         where = " / ".join(docs)
         if gaps:
