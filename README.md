@@ -288,6 +288,16 @@ alone is ambiguous, so the reader must be told the intended type. There is no ma
 declare the schema explicitly. (ES also has no array type: a field declared `array<T>` is read as a
 list even if ES returned a scalar.)
 
+> **Dynamic-mapping gotcha:** if you don't pre-create an index mapping, ES infers each field's type
+> from the **first** document it sees and keeps it. A later doc whose value doesn't fit is silently
+> coerced for indexing (a `float` `1.5` into a field first seen as an integer indexes as `1`; a
+> keyword string past `ignore_above`, default 256 chars, isn't indexed). This does **not** affect the
+> connector round-trip: reads come from `_source`, which ES stores verbatim, so `read_index` returns
+> your original value regardless. It only bites when you **query ES directly** (aggregations, sort,
+> `term`), where you see the coerced/truncated *indexed* value, not `_source`. For heterogeneous or
+> long-string fields, pre-create an explicit mapping. (Same root cause as the `term`/`.keyword`
+> gotcha above.)
+
 ## Configuration
 
 **You always create one of two config objects**, depending on the direction:
@@ -490,6 +500,11 @@ python -m build --wheel                             # writes dist/databricks_es_
 The version comes from `[project].version` in `pyproject.toml`; bump it there before
 building a new release. The wheel lands in `dist/` (git-ignored).
 
+**Cutting a tagged release?** Follow [`RELEASING.md`](RELEASING.md): it enumerates the four required
+steps (integration tests, rebuild wheel, run the release gates, attach the wheel to the tag). Two
+hard gates run in step 3: `scripts/check_requirements_match.py` (requirements.txt matches the wheel's
+resolved closure) and `scripts/check_readme_sync.py` (every module / fixture / script is documented).
+
 **When cutting a release, regenerate [`requirements.txt`](requirements.txt).** The build does
 *not* read that file: the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
 fresh install resolves transitive versions at install time and drifts from the pinned snapshot.
@@ -540,8 +555,14 @@ integration_tests/             # live-Spark/ES tests run on Databricks serverles
   test_deletes_roundtrip.py    #   has_deletes routing live: delete-by-id, delete-404 no-op
   test_streaming_sink.py       #   make_foreach_batch on real Structured Streaming + restart idempotency
   test_read_roundtrip.py       #   write->read fidelity + distributed sliced read (multi-shard)
+  test_timezone_utc.py         #   timestamp epoch is session-timezone-independent (UTC + non-UTC)
+  test_dynamic_mapping_coercion.py #  ES dynamic-mapping coercion: _source faithful vs indexed value
   test_sanitize_for_arrow.py   #   the Spark-side VARIANT/INTERVAL serialization, no ES
   config/test_config.yml       #   dbx_test config (profile, wheel, serverless env)
+scripts/                       # release + maintenance gates (not shipped in the .whl)
+  check_requirements_match.py  #   requirements.txt == the wheel's resolved dependency closure
+  check_readme_sync.py         #   every module / fixture / script is documented in the README(s)
+RELEASING.md                   # the release checklist (integration tests, wheel, gates, tag)
 ```
 
 Two test tiers: `tests/` is the fast, infra-free gate (pure-Python, run with `pytest`);
