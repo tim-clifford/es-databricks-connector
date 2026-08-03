@@ -55,10 +55,10 @@ Each fixture owns one concern:
   rather than a stub. (`on_batch`'s contract is unit-tested; it isn't re-checked here because
   serverless `foreachBatch` runs server-side and can't feed a driver-local capture.)
 - **`test_read_roundtrip.py`**: live ES. Owns the **write → read round-trip**: `bulk_write` then
-  `read_index` / `read_index_collect` with the same schema reproduces the original rows, modulo the
-  documented one-way deltas (decimal precision, sub-ms timestamp floor, float32 widening). Exercises
-  both readers (distributed sliced-scroll + driver-side) and asserts they agree, plus multi-shard
-  fan-out and multi-page `search_after` paging over one PIT.
+  `read_index` with the same schema reproduces the original rows, modulo the documented one-way
+  deltas (decimal precision, sub-ms timestamp floor, float32 widening). Exercises default fan-out,
+  multi-shard sliced-scroll fan-out, and single-slice (`num_slices=1`) multi-page `search_after`
+  paging over one PIT.
 - **`test_timezone_utc.py`**: live ES. Owns the **timestamp timezone contract**: a `timestamp` (at
   every nesting depth) stores its true UTC instant regardless of `spark.sql.session.timeZone`. Writes
   the same instants under UTC and `America/New_York` and asserts identical epochs (the regression

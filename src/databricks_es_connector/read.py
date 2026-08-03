@@ -1,21 +1,16 @@
 """Read an Elasticsearch index into a Spark DataFrame.
 
-Two entry points, both requiring an explicit Spark `StructType` (v0.4.0 does no mapping inference:
-several write transforms are one-way and can't be inverted from `_source` without the declared type;
-see the README "Reading from Elasticsearch" section for the ambiguity rationale). Both share the
-coercion oracle `read_transform.read_coerce`, so they return identical values; only the transport
-differs.
+One entry point, `read_index`, requiring an explicit Spark `StructType` (v0.4.0 does no mapping
+inference: several write transforms are one-way and can't be inverted from `_source` without the
+declared type; see the README "Reading from Elasticsearch" section for the ambiguity rationale). It
+uses the coercion oracle `read_transform.read_coerce` to invert the write transforms per declared
+type.
 
-  - `read_index`: DISTRIBUTED (Option B). Opens a Point-in-Time on the driver, fans out
-                           `spark.range(num_slices).mapInPandas(...)`, one task per PIT slice, each
-                           task building its own ES client and paging its slice with `search_after`.
-                           Serverless-safe (same mechanism as the write path); data stays distributed
-                           (never collected to the driver). The returned DataFrame is lazy; the PIT is
-                           self-extended by each page's `keep_alive` (see read_index docstring). For
-                           full-index export.
-  - `read_index_collect`: DRIVER-SIDE (Option A). Pages the whole index through the driver and
-                           `createDataFrame`s the result. No executors involved. For bounded reads
-                           (lookups / reference data) and as the simple, proven fallback.
+`read_index` is DISTRIBUTED: it opens a Point-in-Time on the driver, then fans out
+`spark.range(num_slices).mapInPandas(...)`, one task per PIT slice, each task building its own ES
+client and paging its slice with `search_after`. Serverless-safe (same mechanism as the write path);
+data stays distributed (never collected to the driver). The returned DataFrame is lazy; the PIT is
+self-extended by each page's `keep_alive` (see the read_index docstring).
 
 pyspark is imported lazily so the pure-Python layers stay importable without Spark.
 """
@@ -147,45 +142,7 @@ def _validate(cfg: EsReadConfig, schema) -> None:
         raise ValueError("EsReadConfig.index is required to read")
 
 
-# --- driver-side reader (Option A) -----------------------------------------------------------
-
-def read_index_collect(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -> "DataFrame":
-    """Driver-side read: page the whole index through the driver, coerce to `schema`, and
-    `createDataFrame`. No executors. Use for bounded reads (lookups / reference data). For
-    full-index export use `read_index` (distributed)."""
-    _validate(cfg, schema)
-    query = cfg.query or {"match_all": {}}
-    field_tokens = _schema_field_tokens(schema)
-
-    from elasticsearch import Elasticsearch
-    es = Elasticsearch(**cfg.client_kwargs())
-    pit_id = None
-    try:
-        # open_point_in_time is INSIDE the try so a failure here still closes the client below (no
-        # PIT exists yet to close, pit_id stays None). Keeping it outside would leak the client on
-        # a PIT-open failure.
-        pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
-        rows = [
-            _coerce_hit(h.get("_source", {}), h.get("_id"), field_tokens, cfg.id_field, cfg.include_id)
-            for h in _slice_hits(es, pit_id, query, cfg.batch_size, cfg.pit_keep_alive)
-        ]
-    finally:
-        # Close the PIT (only if one was opened) and the driver client. Both are best-effort: the
-        # rows are already collected, and a leaked PIT expires on its own, a close failure must not
-        # fail the read.
-        if pit_id is not None:
-            try:
-                es.close_point_in_time(id=pit_id)
-            except Exception:
-                pass
-        try:
-            es.close()
-        except Exception:
-            pass
-    return spark.createDataFrame(rows, schema)
-
-
-# --- distributed reader (Option B) -----------------------------------------------------------
+# --- distributed reader -----------------------------------------------------------------------
 
 def _make_slice_reader(cfg: EsReadConfig, pit_id: str, query: dict, field_tokens, num_slices: int):
     """Return a mapInPandas function: for each slice id it receives (via spark.range), read that
@@ -236,10 +193,8 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
         immediately, plus serverless executor cold-start), and
       - the largest gap between pages if a slow downstream consumer applies backpressure.
     The default (5m) covers a normal scheduling gap; raise it only if one of those gaps is longer.
-    Keeping the read distributed is why the PIT can't be driver-closed; for small reads where an
-    explicit close is preferable, use `read_index_collect`.
-
-    For small/bounded reads, `read_index_collect` (driver-side, no executors) is simpler.
+    Keeping the read distributed is why the PIT can't be driver-closed; it expires on its own once
+    reads stop touching it. For a small/bounded read, pass `num_slices=1` (a single unsliced reader).
     """
     _validate(cfg, schema)
     query = cfg.query or {"match_all": {}}

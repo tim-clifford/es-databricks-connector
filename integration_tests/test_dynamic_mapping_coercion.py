@@ -21,7 +21,7 @@
 import json, requests, urllib3
 urllib3.disable_warnings()
 from dbx_test import NotebookTestFixture, run_notebook_tests
-from databricks_es_connector import EsWriteConfig, EsReadConfig, bulk_write, read_index_collect
+from databricks_es_connector import EsWriteConfig, EsReadConfig, bulk_write, read_index
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 
 SCOPE = "es_poc"
@@ -62,11 +62,11 @@ class TestDynamicMappingCoercion(NotebookTestFixture):
 
         # Connector read-back (reads _source): doc b's score must be the verbatim 10.7.
         num_read = EsReadConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
-                                index=NUM_INDEX, id_field="doc_id")
+                                index=NUM_INDEX, id_field="doc_id", num_slices=1)
         num_schema = StructType([StructField("doc_id", StringType()),
                                  StructField("score", DoubleType())])
         self.num_rows = {r["doc_id"]: r.asDict() for r in
-                         read_index_collect(spark, num_read, num_schema).collect()}
+                         read_index(spark, num_read, num_schema).collect()}
 
         # Direct ES sum aggregation (reads the INDEXED doc-values): 10 + coerced(10.7)=10 -> 20,
         # NOT 20.7. This is the value a Kibana dashboard / raw aggregation would report.
@@ -88,11 +88,11 @@ class TestDynamicMappingCoercion(NotebookTestFixture):
 
         # Connector read-back (reads _source): the full 300-char string comes back intact.
         str_read = EsReadConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
-                                index=STR_INDEX, id_field="doc_id")
+                                index=STR_INDEX, id_field="doc_id", num_slices=1)
         str_schema = StructType([StructField("doc_id", StringType()),
                                  StructField("tag", StringType())])
         self.str_rows = {r["doc_id"]: r.asDict() for r in
-                         read_index_collect(spark, str_read, str_schema).collect()}
+                         read_index(spark, str_read, str_schema).collect()}
 
         # Direct term query on the keyword sub-field for the exact 300-char value: because the value
         # exceeded ignore_above (256), it was NOT indexed into `tag.keyword`, so this finds NOTHING.

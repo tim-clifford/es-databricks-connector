@@ -8,11 +8,10 @@
 # MAGIC (`read_coerce`) is the true inverse of the write transform against real Elasticsearch, not
 # MAGIC just in the offline unit oracle.
 # MAGIC
-# MAGIC Exercises BOTH readers: the distributed sliced-scroll `read_index` (Option B, the at-scale
-# MAGIC path) and the driver-side `read_index_collect` (Option A, bounded reads); they share the
-# MAGIC coercion oracle and must agree. Also drives multi-slice fan-out and multi-PAGE paging (the
-# MAGIC sliding-window PIT keep-alive) against real ES. Live ES + the `es_poc` scope required.
-# MAGIC Throwaway indices, dropped per run.
+# MAGIC Exercises the distributed sliced-scroll `read_index` across three shapes: default fan-out,
+# MAGIC multi-slice fan-out over a 3-shard index, and a single-slice (`num_slices=1`) multi-PAGE read
+# MAGIC that drives the sliding-window PIT keep-alive against real ES. Live ES + the `es_poc` scope
+# MAGIC required. Throwaway indices, dropped per run.
 
 # COMMAND ----------
 import json, base64, datetime, requests, urllib3
@@ -20,7 +19,7 @@ urllib3.disable_warnings()
 from decimal import Decimal
 from dbx_test import NotebookTestFixture, run_notebook_tests
 from databricks_es_connector import (
-    EsWriteConfig, EsReadConfig, bulk_write, read_index, read_index_collect,
+    EsWriteConfig, EsReadConfig, bulk_write, read_index,
 )
 from pyspark.sql.types import (
     StructType, StructField, StringType, BooleanType, LongType, IntegerType, DoubleType,
@@ -121,16 +120,11 @@ class TestReadRoundtrip(NotebookTestFixture):
         self.write_result = bulk_write(self.src, self.write_cfg)
         requests.post(f"{ES_HOSTS}/{INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
 
-        # Read back with the SAME schema via BOTH entry points:
-        #   read_index: distributed (mapInPandas fan-out); the primary at-scale path.
-        #   read_index_collect: driver-side; the bounded-read path.
-        # Both must return identical rows (they share the coercion oracle); we assert the
-        # distributed result against the source and cross-check the two agree.
+        # Read back with the SAME schema via read_index (distributed mapInPandas fan-out); assert the
+        # round-tripped rows against the source.
         self.out = read_index(spark, self.read_cfg, SCHEMA)
-        self.out_collect = read_index_collect(spark, self.read_cfg, SCHEMA)
         self.src_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.src.collect()}
         self.out_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.out.collect()}
-        self.collect_rows = {r["doc_id"]: r.asDict(recursive=True) for r in self.out_collect.collect()}
 
         # --- multi-shard index: exercise REAL sliced-scroll fan-out (>1 slice) ---
         # A 3-shard index so read_index defaults to 3 slices and each task reads a disjoint slice.
@@ -235,11 +229,6 @@ class TestReadRoundtrip(NotebookTestFixture):
         # 1.50 and 99.99 both fit in decimal(10,2); read back as Decimal, equal to source.
         assert self.out_rows["r1"]["s_decimal"] == self.src_rows["r1"]["s_decimal"]
         assert self.out_rows["r2"]["s_decimal"] == self.src_rows["r2"]["s_decimal"]
-
-    # --- the two entry points agree (they share the coercion oracle) ---
-    def test_distributed_and_collect_readers_agree(self):
-        assert self.collect_rows == self.out_rows, \
-            "read_index (distributed) and read_index_collect (driver) returned different rows"
 
     # --- multi-shard: sliced-scroll fan-out reads every doc exactly once, no gaps/dupes ---
     def test_multishard_slices_cover_all_docs(self):

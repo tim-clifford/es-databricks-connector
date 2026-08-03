@@ -30,7 +30,7 @@ compression. The Python client has none of those limits.
   - [Deletes](#deletes)
   - [The write result (`bulk_write` return value)](#the-write-result-bulk_write-return-value)
 - [Reading from Elasticsearch](#reading-from-elasticsearch)
-  - [`read_index` / `read_index_collect`](#read_index--read_index_collect)
+  - [`read_index`](#read_index)
   - [Read fidelity (write → read)](#read-fidelity-write--read)
 - [Configuration](#configuration)
   - [Connection (shared by both configs)](#connection-shared-by-both-configs)
@@ -65,7 +65,7 @@ compression. The Python client has none of those limits.
   hand it any DataFrame and a target index, and every Spark datatype is exportable with no
   pre-processing (see [Datatype coverage](#datatype-coverage-write-transforms--read-inverse)).
 
-**Reading** (`read_index` / `read_index_collect`):
+**Reading** (`read_index`):
 
 - **Distributed snapshot read.** One Elasticsearch Point-in-Time gives a consistent snapshot, and a
   sliced scroll fans out across executors (one task per shard/slice) so a full-index export scales.
@@ -216,7 +216,7 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 
 ## Reading from Elasticsearch
 
-### `read_index` / `read_index_collect`
+### `read_index`
 
 Read an Elasticsearch index back into a Spark DataFrame. **You must declare the target Spark
 schema**: the reader does not infer it (see [Read fidelity](#read-fidelity-write--read) for why).
@@ -261,9 +261,8 @@ data stays across executors (never collected to the driver), so it scales for fu
   The `5m` default covers a normal scheduling gap; raise it only if one of those gaps runs longer.
   (The PIT can't be closed on the driver without killing the still-lazy read, so it's left to expire
   on its own once reads stop touching it.)
-- **For small/bounded reads** (lookups, reference data), `read_index_collect(spark, cfg, schema)`
-  is a simpler driver-side variant: it pages the whole result through the driver and closes its PIT
-  explicitly. No executors. Same values, same required schema.
+- **For small/bounded reads** (lookups, reference data), pass `num_slices=1` for a single unsliced
+  reader; the returned DataFrame is still lazy and distributed, just one task instead of a fan-out.
 
 ### Read fidelity (write → read)
 
@@ -303,7 +302,7 @@ list even if ES returned a scalar.)
 **You always create one of two config objects**, depending on the direction:
 
 - **`EsWriteConfig`**: for `bulk_write` / `make_foreach_batch`.
-- **`EsReadConfig`**: for `read_index` / `read_index_collect`.
+- **`EsReadConfig`**: for `read_index`.
 
 Both are frozen, serializable dataclasses (in `src/databricks_es_connector/config.py`) so they can
 be shipped to Spark executors: the Elasticsearch client is built *inside* each partition, never on
@@ -547,7 +546,7 @@ src/databricks_es_connector/   # the library (this is what ships in the .whl)
   stream.py                    #   foreachBatch helper for Structured Streaming
   spark_prep.py                #   sanitize_for_arrow: Arrow-hostile types (VARIANT/INTERVAL) -> JSON string
   read_transform.py            #   pure-Python inverse coercion on READ (ES value + type -> Spark value)
-  read.py                      #   read_index (distributed sliced-scroll) / read_index_collect (driver-side)
+  read.py                      #   read_index (distributed sliced-scroll PIT reader)
 tests/                         # unit tests for the pure-Python layer (no Spark/ES needed)
 integration_tests/             # live-Spark/ES tests run on Databricks serverless via dbx_test
   test_datatype_coverage.py    #   every Spark datatype + edge cases, round-tripped through ES

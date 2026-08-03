@@ -349,34 +349,6 @@ def _install_fake_es(monkeypatch, es):
     monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
 
 
-def test_read_index_collect_opens_and_closes_pit(monkeypatch):
-    import databricks_es_connector.read as read_mod
-    es = _FakeSearchES([_page("a", "b"), _page()])
-    _install_fake_es(monkeypatch, es)
-    spark = _FakeSpark()
-    schema = _Schema([("doc_id", "string")])
-
-    out = read_mod.read_index_collect(spark, _rcfg(), schema)
-    # Driver path collects rows and builds a DataFrame with the declared schema.
-    rows, used_schema = spark.created
-    assert [r["doc_id"] for r in rows] == ["a", "b"]
-    assert used_schema is schema
-    # PIT was opened and CLOSED, and the driver client was closed too (no connection-pool leak).
-    assert es.closed == ["pit-abc"]
-    assert es.client_closed == 1
-
-def test_read_index_collect_closes_pit_even_on_error(monkeypatch):
-    import databricks_es_connector.read as read_mod
-    class _BoomES(_FakeSearchES):
-        def search(self, **kw):
-            raise RuntimeError("es down")
-    es = _BoomES([])
-    _install_fake_es(monkeypatch, es)
-    with pytest.raises(RuntimeError, match="es down"):
-        read_mod.read_index_collect(_FakeSpark(), _rcfg(), _Schema([("doc_id", "string")]))
-    assert es.closed == ["pit-abc"]   # finally still closed the PIT
-    assert es.client_closed == 1      # and the driver client
-
 def test_read_index_distributed_opens_pit_and_fans_out(monkeypatch):
     import databricks_es_connector.read as read_mod
     es = _FakeSearchES([])
@@ -409,36 +381,6 @@ def test_read_index_validates_before_touching_es(monkeypatch):
         read_mod.read_index(_FakeSpark(), _rcfg(), _Schema([]))
     with pytest.raises(ValueError, match="index is required"):
         read_mod.read_index(_FakeSpark(), _rcfg(index=""), _Schema([("doc_id", "string")]))
-
-def test_read_index_collect_swallows_pit_close_failure(monkeypatch):
-    # A failure closing the PIT OR the client must not fail the read: the rows are already
-    # collected, and the PIT will expire on its own. (Covers both defensive excepts in the finally.)
-    import databricks_es_connector.read as read_mod
-    class _CloseBoomES(_FakeSearchES):
-        def close_point_in_time(self, id):
-            raise RuntimeError("pit close failed")
-        def close(self):
-            raise RuntimeError("client close failed")
-    es = _CloseBoomES([_page("a"), _page()])
-    _install_fake_es(monkeypatch, es)
-    spark = _FakeSpark()
-    out = read_mod.read_index_collect(spark, _rcfg(), _Schema([("doc_id", "string")]))
-    rows, _ = spark.created
-    assert [r["doc_id"] for r in rows] == ["a"]   # read succeeded despite both close failures
-
-def test_read_index_collect_closes_client_when_pit_open_fails(monkeypatch):
-    # If open_point_in_time raises, the driver client must still be closed (no leak), and NO
-    # PIT-close should be attempted (none was opened). Guards the open-inside-try fix.
-    import databricks_es_connector.read as read_mod
-    class _OpenBoomES(_FakeSearchES):
-        def open_point_in_time(self, index, keep_alive):
-            raise RuntimeError("pit open failed")
-    es = _OpenBoomES([])
-    _install_fake_es(monkeypatch, es)
-    with pytest.raises(RuntimeError, match="pit open failed"):
-        read_mod.read_index_collect(_FakeSpark(), _rcfg(), _Schema([("doc_id", "string")]))
-    assert es.client_closed == 1   # client closed despite the open failure
-    assert es.closed == []         # no PIT was opened, so none was closed
 
 def test_read_index_distributed_swallows_client_close_failure(monkeypatch):
     # In the distributed path the driver client close is best-effort too: a failure must not stop

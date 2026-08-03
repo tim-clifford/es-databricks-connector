@@ -14,10 +14,10 @@ mechanism). The read schema is required (no mapping inference).
 
 from .config import EsConnection, EsWriteConfig, EsReadConfig, EsConfig
 from .transform import to_es_source, coerce_value
-from .bulk import bulk_write, make_partition_writer
+from .bulk import bulk_write
 from .stream import make_foreach_batch
 from .spark_prep import sanitize_for_arrow
-from .read import read_index, read_index_collect
+from .read import read_index
 from .read_transform import read_coerce
 
 __all__ = [
@@ -28,12 +28,10 @@ __all__ = [
     "to_es_source",
     "coerce_value",
     "bulk_write",
-    "make_partition_writer",
     "make_foreach_batch",
     "sanitize_for_arrow",
     "read_index",
-    "read_index_collect",
     "read_coerce",
 ]
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"

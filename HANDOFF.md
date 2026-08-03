@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.4.1)
+# Production Readiness / Known Limitations (0.4.2)
 
 `databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
 bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -90,9 +90,8 @@ Hardening still needed before production for SIEM/audit data:
 - **PIT keep-alive must cover the whole downstream job.** `read_index` returns a *lazy* distributed
   DataFrame, so its Point-in-Time snapshot can't be driver-closed (that would kill the still-lazy
   read); it expires via `pit_keep_alive`. If a downstream job runs longer than that window, slices
-  read late will fail with an expired-PIT error. Set `pit_keep_alive` generously, or use
-  `read_index_collect` (bounded, driver-side, closes its PIT explicitly) for small reads. No
-  automatic PIT renewal yet.
+  read late will fail with an expired-PIT error. Set `pit_keep_alive` generously. No automatic PIT
+  renewal yet.
 - **No Spark predicate/column pushdown.** `read_index` accepts a raw ES query DSL dict
   (`EsReadConfig.query`) for server-side filtering, but does not translate Spark
   `.filter(...)`/`.select(...)` into ES queries. A caller wanting pushdown must express it as the raw
