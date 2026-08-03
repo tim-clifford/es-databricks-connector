@@ -72,7 +72,7 @@ class EsConnection:
 class EsWriteConfig(EsConnection):
     """Connection + write behavior for bulk_write / make_foreach_batch."""
     # --- write behavior ---
-    index: str = ""                         # target index (or use a per-row _index)
+    index: str = ""                         # target index; one index per write (no per-row routing)
     id_field: Optional[str] = None          # column used as deterministic _id (idempotency)
     chunk_size: int = 500                   # docs per bulk request
 
