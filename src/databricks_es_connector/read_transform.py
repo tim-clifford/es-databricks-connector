@@ -13,9 +13,16 @@ the exact inverse of a `transform.coerce_value` branch; the accepted round-trip 
 those the README datatype table documents (decimal precision, sub-millisecond timestamp, float32
 widening): reads introduce no new lossiness.
 
-Target types are given as Spark type *tokens* (short lowercase strings like "timestamp", "long",
-"struct<...>") rather than pyspark objects, so this module stays importable without Spark for local
-unit testing. read.py maps a pyspark DataType to its token before calling in.
+Target types are given as type *tokens* rather than pyspark objects, so this module stays importable
+without Spark for local unit testing. read.py maps a pyspark DataType to a token before calling in.
+A token is either:
+  - a scalar: a lowercase Spark type string ("string", "long", "timestamp", "decimal(10,2)", ...), or
+  - a container: a tuple carrying its already-parsed sub-token(s), so no string parsing happens here:
+      ("array", elem_token)
+      ("map",   key_token, value_token)
+      ("struct", [(field_name, field_token), ...])
+read.py builds these tuples directly by walking the declared pyspark DataType (which is already a
+navigable tree), so this module never has to re-parse a `struct<...>` DDL string.
 """
 from __future__ import annotations
 
@@ -64,13 +71,14 @@ def _epoch_millis_to_date(v: Any) -> _dt.date:
     return _epoch_millis_to_datetime(v).date()
 
 
-def read_coerce(value: Any, target: str) -> Any:
+def read_coerce(value: Any, target: Any) -> Any:
     """Coerce one ES `_source` value to the Python value Spark expects for `target`.
 
-    `target` is a Spark type token (lowercase), e.g. "string", "boolean", "byte"/"short"/"int"/
-    "long", "float"/"double", "decimal(10,2)", "date", "timestamp", "timestamp_ntz", "binary",
-    "variant", "interval ...", or a nested "struct<...>" / "array<...>" / "map<...>". Nested tokens
-    recurse.
+    `target` is a type token (see the module docstring):
+      - a scalar string: "string", "boolean", "byte"/"short"/"int"/"long", "float"/"double",
+        "decimal(10,2)", "date", "timestamp", "timestamp_ntz", "binary", "variant", "interval ...".
+      - a container tuple: ("array", elem), ("map", key, val), ("struct", [(name, sub), ...]).
+        read.py builds these from the declared pyspark DataType, so no string parsing happens here.
 
     null/missing -> None for every type. Each non-null branch is the inverse of a coerce_value
     transform; anything already JSON-native (string/number/bool) passes through with the target's
@@ -78,6 +86,23 @@ def read_coerce(value: Any, target: str) -> Any:
     """
     if _is_null(value):
         return None
+
+    # --- container tokens: a pre-parsed tuple, recurse against the sub-token(s) ---
+    if isinstance(target, tuple):
+        kind = target[0]
+        if kind == "array":
+            elem = target[1]
+            seq = value if isinstance(value, (list, tuple)) else [value]   # ES scalar-as-1-elem
+            return [read_coerce(x, elem) for x in seq]
+        if kind == "map":
+            # JSON object keys are always strings; coerce values by the value sub-token.
+            valtype = target[2]
+            return {k: read_coerce(v, valtype) for k, v in dict(value).items()}
+        if kind == "struct":
+            src = dict(value)
+            return {name: read_coerce(src.get(name), sub) for name, sub in target[1]}
+        # Unknown container kind: passthrough rather than guess (mirrors the scalar fallback).
+        return value
 
     t = target.strip().lower()
 
@@ -115,68 +140,5 @@ def read_coerce(value: Any, target: str) -> Any:
     if t == "string" or t == "variant" or t.startswith("interval"):
         return value if isinstance(value, str) else str(value)
 
-    # --- nested containers: recurse against the element/field/value sub-type ---
-    if t.startswith("array<"):
-        elem = _inner(t, "array<")
-        seq = value if isinstance(value, (list, tuple)) else [value]   # ES scalar-as-1-elem
-        return [read_coerce(x, elem) for x in seq]
-
-    if t.startswith("map<"):
-        # map<keytype,valtype>: JSON object keys are always strings; coerce values by valtype.
-        _k, valtype = _split_map(t)
-        return {k: read_coerce(v, valtype) for k, v in dict(value).items()}
-
-    if t.startswith("struct<"):
-        fields = _struct_fields(t)
-        src = dict(value)
-        return {name: read_coerce(src.get(name), ftype) for name, ftype in fields}
-
     # Unknown token: leave the value as-is (a plain passthrough) rather than guess.
     return value
-
-
-# --- token parsing helpers (a minimal Spark DDL-type-string parser, depth-aware) -----------------
-
-def _inner(token: str, prefix: str) -> str:
-    """The single inner type of array<INNER>, strips the prefix and the trailing '>'."""
-    return token[len(prefix):-1].strip()
-
-
-def _split_top_level(body: str):
-    """Split a struct/map body on top-level commas only.
-
-    Ignores commas nested inside `<...>` (nested struct/array/map) AND inside `(...)`: the latter
-    matters because a `decimal(p,s)` token carries a comma between its precision and scale, e.g.
-    `struct<a:decimal(10,2),b:int>`. Tracking angle-bracket depth alone would wrongly split on that
-    inner comma; we track paren depth too.
-    """
-    parts, depth, start = [], 0, 0
-    for i, ch in enumerate(body):
-        if ch in "<(":
-            depth += 1
-        elif ch in ">)":
-            depth -= 1
-        elif ch == "," and depth == 0:
-            parts.append(body[start:i]); start = i + 1
-    parts.append(body[start:])
-    return [p.strip() for p in parts if p.strip()]
-
-
-def _split_map(token: str):
-    """map<keytype,valtype> -> (keytype, valtype), splitting on the top-level comma."""
-    body = token[len("map<"):-1]
-    parts = _split_top_level(body)
-    return parts[0], parts[1]
-
-
-def _struct_fields(token: str):
-    """struct<name:type,name:type,...> -> [(name, type), ...]. The field split (_split_top_level) is
-    depth-aware over both <...> and (...) so a decimal(p,s)'s inner comma doesn't split a field. The
-    name/type split is a plain first-':' partition: a Spark field name contains no ':' (or brackets),
-    so the first ':' always separates name from type, even when the type is a decimal or a struct."""
-    body = token[len("struct<"):-1]
-    out = []
-    for field in _split_top_level(body):
-        name, _colon, ftype = field.partition(":")
-        out.append((name.strip(), ftype.strip()))
-    return out

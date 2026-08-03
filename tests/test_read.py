@@ -8,7 +8,7 @@ import pytest
 
 from databricks_es_connector import EsReadConfig
 from databricks_es_connector.read import (
-    _coerce_hit, _schema_field_tokens, _resolve_num_slices, _make_slice_reader,
+    _coerce_hit, _schema_field_tokens, _resolve_num_slices, _make_slice_reader, _spark_type_token,
 )
 
 
@@ -41,6 +41,47 @@ def test_read_config_rejects_nonpositive_batch():
 def test_read_config_rejects_bad_num_slices():
     with pytest.raises(ValueError, match="num_slices"):
         _rcfg(num_slices=0)
+
+
+# --- _spark_type_token: walk a pyspark DataType into read_coerce's token tree ----------------
+# Fakes duck-typed exactly like the pyspark DataTypes _spark_type_token inspects: a scalar exposes
+# only simpleString(); a container exposes the structural attribute (fields / elementType /
+# keyType+valueType). This mirrors how read.py recognizes containers without importing pyspark.
+
+class _FakeScalar:
+    def __init__(self, s): self._s = s
+    def simpleString(self): return self._s
+
+class _FakeField:
+    def __init__(self, name, dtype): self.name = name; self.dataType = dtype
+
+class _FakeStruct:
+    def __init__(self, fields): self.fields = [_FakeField(n, t) for n, t in fields]
+
+class _FakeArray:
+    def __init__(self, elem): self.elementType = elem
+
+class _FakeMap:
+    def __init__(self, k, v): self.keyType = k; self.valueType = v
+
+
+def test_spark_type_token_scalar_is_simplestring():
+    assert _spark_type_token(_FakeScalar("decimal(10,2)")) == "decimal(10,2)"
+
+def test_spark_type_token_builds_container_tuples():
+    # struct<m:map<string,int>,a:array<decimal(10,2)>,n:long> -> nested tuple tree, no DDL string.
+    dt_struct = _FakeStruct([
+        ("m", _FakeMap(_FakeScalar("string"), _FakeScalar("int"))),
+        ("a", _FakeArray(_FakeScalar("decimal(10,2)"))),
+        ("n", _FakeScalar("long")),
+    ])
+    assert _spark_type_token(dt_struct) == (
+        "struct", [
+            ("m", ("map", "string", "int")),
+            ("a", ("array", "decimal(10,2)")),
+            ("n", "long"),
+        ],
+    )
 
 
 # --- _coerce_hit: map one ES hit to a schema-shaped row --------------------------------------

@@ -36,14 +36,26 @@ _log = logging.getLogger(__name__)
 
 # --- pure helpers (no Spark) -----------------------------------------------------------------
 
-def _spark_type_token(dtype: "DataType") -> str:
-    """Render a pyspark DataType to the lowercase token read_coerce understands.
+def _spark_type_token(dtype: "DataType"):
+    """Render a pyspark DataType to the token read_transform.read_coerce understands.
 
-    Spark's own `simpleString()` already produces exactly the DDL form we parse (`timestamp`,
-    `decimal(10,2)`, `struct<name:type,...>`, `array<...>`, `map<...>`), so we delegate to it.
-    Kept as a seam so the coercion layer never imports pyspark.
+    A scalar type becomes its lowercase `simpleString()` string ("timestamp", "decimal(10,2)", ...).
+    A container becomes a tuple carrying its already-walked sub-token(s) -- ("array", elem),
+    ("map", key, val), ("struct", [(name, sub), ...]) -- so the coercion layer never re-parses a
+    `struct<...>` DDL string; we hand it the structure the DataType already gives us here.
+
+    Containers are recognized structurally (elementType / keyType+valueType / fields) rather than by
+    isinstance, so this stays importable without pyspark and the read.py unit tests can pass simple
+    duck-typed DataType fakes. Anything without those attributes is a scalar -> simpleString().
     """
-    return dtype.simpleString()
+    fields = getattr(dtype, "fields", None)
+    if fields is not None:                                        # StructType
+        return ("struct", [(f.name, _spark_type_token(f.dataType)) for f in fields])
+    if getattr(dtype, "elementType", None) is not None:          # ArrayType
+        return ("array", _spark_type_token(dtype.elementType))
+    if getattr(dtype, "keyType", None) is not None:              # MapType
+        return ("map", _spark_type_token(dtype.keyType), _spark_type_token(dtype.valueType))
+    return dtype.simpleString()                                   # scalar
 
 
 def _schema_field_tokens(schema: "StructType"):
