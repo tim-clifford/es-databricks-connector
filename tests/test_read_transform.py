@@ -20,6 +20,19 @@ def _roundtrip(x, target):
     return read_coerce(coerce_value(x), target)
 
 
+# Container token constructors. read.py builds these tuples by walking the declared pyspark
+# DataType; here we build them directly so the read-inverse is tested without Spark. Scalars stay
+# plain strings ("int", "decimal(10,2)"), matching read.py's simpleString() leaves.
+def _arr(elem):
+    return ("array", elem)
+
+def _map(key, val):
+    return ("map", key, val)
+
+def _struct(*fields):        # fields: (name, sub_token) pairs
+    return ("struct", list(fields))
+
+
 # --- scalars: exact round-trip ---------------------------------------------------------------
 
 def test_string_roundtrip():
@@ -39,7 +52,7 @@ def test_double_roundtrip():
 
 def test_null_roundtrips_to_none_for_every_type():
     for tok in ("string", "boolean", "long", "double", "timestamp", "date", "binary",
-                "decimal(10,2)", "struct<a:int>", "array<int>", "map<string,int>"):
+                "decimal(10,2)", _struct(("a", "int")), _arr("int"), _map("string", "int")):
         assert read_coerce(None, tok) is None
 
 
@@ -120,60 +133,60 @@ def test_interval_reads_back_as_string():
 # --- containers: recurse against sub-types ---------------------------------------------------
 
 def test_array_roundtrip():
-    assert _roundtrip([1, 2, 3], "array<int>") == [1, 2, 3]
+    assert _roundtrip([1, 2, 3], _arr("int")) == [1, 2, 3]
 
 def test_array_of_timestamps_roundtrip():
     ts = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
-    assert _roundtrip([ts], "array<timestamp>") == [ts]
+    assert _roundtrip([ts], _arr("timestamp")) == [ts]
 
 def test_nested_array_of_arrays_roundtrip():
-    # array<array<int>>: the token splitter must keep the inner array<...> intact and recurse both
-    # levels. Empty inner array preserved; null inner element preserved.
-    assert _roundtrip([[1, 2], [3], []], "array<array<int>>") == [[1, 2], [3], []]
-    assert read_coerce([[1, 2], None], "array<array<int>>") == [[1, 2], None]
+    # array<array<int>>: the container tuple carries the inner array token, and read_coerce recurses
+    # both levels. Empty inner array preserved; null inner element preserved.
+    assert _roundtrip([[1, 2], [3], []], _arr(_arr("int"))) == [[1, 2], [3], []]
+    assert read_coerce([[1, 2], None], _arr(_arr("int"))) == [[1, 2], None]
 
 def test_empty_string_roundtrip():
     assert _roundtrip("", "string") == ""
 
 def test_es_scalar_read_as_single_element_array():
     # ES has no array type: a field declared array<int> may come back as a bare scalar. Wrap it.
-    assert read_coerce(5, "array<int>") == [5]
+    assert read_coerce(5, _arr("int")) == [5]
 
 def test_null_element_in_array_preserved():
-    assert read_coerce([1, None, 3], "array<int>") == [1, None, 3]
+    assert read_coerce([1, None, 3], _arr("int")) == [1, None, 3]
 
 def test_struct_roundtrip_with_mixed_types():
     row = {"id": 7, "ts": dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc), "payload": b"\x00\x01"}
     stored = coerce_value(row)
-    out = read_coerce(stored, "struct<id:int,ts:timestamp,payload:binary>")
+    out = read_coerce(stored, _struct(("id", "int"), ("ts", "timestamp"), ("payload", "binary")))
     assert out == {"id": 7, "ts": dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc),
                    "payload": b"\x00\x01"}
 
 def test_struct_missing_field_is_none():
     # A field absent from _source (ES omits some) reads as None, not a KeyError.
-    out = read_coerce({"a": 1}, "struct<a:int,b:string>")
+    out = read_coerce({"a": 1}, _struct(("a", "int"), ("b", "string")))
     assert out == {"a": 1, "b": None}
 
 def test_empty_struct_reads_as_empty_dict():
-    # struct<> (zero-field) has no fields to fill: an empty _source object reads back as {}.
-    assert read_coerce({}, "struct<>") == {}
+    # A zero-field struct has no fields to fill: an empty _source object reads back as {}.
+    assert read_coerce({}, _struct()) == {}
 
 def test_nested_struct_roundtrip():
     row = {"inner": {"x": 1, "ts": dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)}}
     stored = coerce_value(row)
-    out = read_coerce(stored, "struct<inner:struct<x:int,ts:timestamp>>")
+    out = read_coerce(stored, _struct(("inner", _struct(("x", "int"), ("ts", "timestamp")))))
     assert out == {"inner": {"x": 1, "ts": dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)}}
 
 def test_map_values_coerced_by_valtype():
     ts = dt.datetime(2021, 1, 1, tzinfo=dt.timezone.utc)
     stored = coerce_value({"a": ts, "b": ts})   # map<string,timestamp>
-    out = read_coerce(stored, "map<string,timestamp>")
+    out = read_coerce(stored, _map("string", "timestamp"))
     assert out == {"a": ts, "b": ts}
 
 def test_array_of_structs_roundtrip():
     rows = [{"k": "a", "v": 1}, {"k": "b", "v": 2}]
     stored = coerce_value(rows)
-    assert read_coerce(stored, "array<struct<k:string,v:int>>") == rows
+    assert read_coerce(stored, _arr(_struct(("k", "string"), ("v", "int")))) == rows
 
 def test_map_non_string_keys_stay_stringified():
     # Non-string map keys are a DOCUMENTED one-way transform: writes stringify keys (JSON object
@@ -181,54 +194,51 @@ def test_map_non_string_keys_stay_stringified():
     # such, even when the declared key type is int. This is not lossy re-parsing; it's the contract.
     stored = coerce_value({1: "x", 2: "y"})     # map<int,string> -> {"1": "x", "2": "y"} on write
     assert stored == {"1": "x", "2": "y"}
-    out = read_coerce(stored, "map<int,string>")
+    out = read_coerce(stored, _map("int", "string"))
     assert out == {"1": "x", "2": "y"}           # keys stay strings; values coerced by valtype
     assert all(isinstance(k, str) for k in out)
 
 
-# --- token parser edge cases (nested commas must not split fields) ---------------------------
+# --- token dispatch edge cases ---------------------------------------------------------------
 
-def test_unknown_token_passes_value_through():
-    # An unrecognized type token must not crash: the value passes through unchanged (a defensive
-    # fallback; the caller declared the schema, so this is a last resort, not the normal path).
+def test_unknown_scalar_token_passes_value_through():
+    # An unrecognized SCALAR type token must not crash: the value passes through unchanged (a
+    # defensive fallback; the caller declared the schema, so this is a last resort, not normal).
     assert read_coerce({"anything": 1}, "somefuturetype") == {"anything": 1}
     assert read_coerce(42, "geo_point") == 42
 
+def test_unknown_container_kind_passes_value_through():
+    # A tuple whose kind isn't array/map/struct is also a defensive passthrough, not a crash.
+    assert read_coerce({"x": 1}, ("somefuturecontainer", "int")) == {"x": 1}
 
-def test_struct_with_nested_container_fields_parses():
-    # A struct whose fields are themselves containers: the top-level split must ignore the inner
-    # commas of map<string,int> / array<int>.
-    tok = "struct<m:map<string,int>,a:array<int>,n:long>"
+
+def test_struct_with_nested_container_fields():
+    # A struct whose fields are themselves containers: each field carries its own container tuple,
+    # so nesting is just tuple recursion (no string parsing, no comma-splitting to get wrong).
+    tok = _struct(("m", _map("string", "int")), ("a", _arr("int")), ("n", "long"))
     src = {"m": {"x": 1}, "a": [1, 2], "n": 5}
     out = read_coerce(src, tok)
     assert out == {"m": {"x": 1}, "a": [1, 2], "n": 5}
 
-def test_struct_with_nested_decimal_field_parses():
-    # REGRESSION: a decimal(p,s) token carries a comma INSIDE its parens. The field splitter must
-    # ignore that comma (paren-aware), or the struct gains a spurious "2)" field and following
-    # fields shift. This is exactly Spark's simpleString() form: struct<a:decimal(10,2),b:int>.
-    tok = "struct<a:decimal(10,2),b:int>"
+def test_struct_with_nested_decimal_field():
+    # A decimal(p,s) field: the precision/scale comma used to be a parser hazard (it lived inside a
+    # struct<...> string). With pre-parsed tuples the decimal is just an opaque scalar token, so the
+    # comma is a non-issue. Corresponds to Spark simpleString() struct<a:decimal(10,2),b:int>.
+    tok = _struct(("a", "decimal(10,2)"), ("b", "int"))
     out = read_coerce({"a": 1.5, "b": 3}, tok)
     assert out == {"a": Decimal("1.5"), "b": 3}
-    assert set(out.keys()) == {"a", "b"}      # no spurious "2)" key
+    assert set(out.keys()) == {"a", "b"}
 
-def test_map_value_decimal_parses():
-    # Guard (not red-before-green): a map valtype's decimal comma. This survived the pre-fix bug by
-    # luck, the truncated "decimal(10" still hit the startswith("decimal") branch, but pin it so
-    # the paren-aware split stays correct here too.
-    out = read_coerce({"k": 2.5}, "map<string,decimal(10,2)>")
+def test_map_value_decimal():
+    out = read_coerce({"k": 2.5}, _map("string", "decimal(10,2)"))
     assert out == {"k": Decimal("2.5")}
 
-def test_array_of_decimal_parses():
-    # Guard: array element decimal. array<...> uses _inner (never splits on commas), so this passed
-    # pre-fix too; kept to pin the contract.
-    out = read_coerce([1.5, 2.5], "array<decimal(10,2)>")
+def test_array_of_decimal():
+    out = read_coerce([1.5, 2.5], _arr("decimal(10,2)"))
     assert out == [Decimal("1.5"), Decimal("2.5")]
 
-def test_struct_of_array_of_decimal_parses():
-    # Guard: nested paren + angle brackets together, the decimal comma is shielded by the inner
-    # array<>, so this also passed pre-fix; kept so the two depth counters can't regress and interfere.
-    tok = "struct<vals:array<decimal(5,2)>,n:int>"
+def test_struct_of_array_of_decimal():
+    tok = _struct(("vals", _arr("decimal(5,2)")), ("n", "int"))
     out = read_coerce({"vals": [1.1, 2.2], "n": 7}, tok)
     assert out == {"vals": [Decimal("1.1"), Decimal("2.2")], "n": 7}
 

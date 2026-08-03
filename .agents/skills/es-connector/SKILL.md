@@ -24,9 +24,9 @@ the README explicitly documents as one-way.
 ## Architecture in one screen
 
 **Public API** (`src/databricks_es_connector/__init__.py`): `bulk_write`, `read_index`,
-`read_index_collect`, `make_foreach_batch`, configs (`EsWriteConfig`, `EsReadConfig`, `EsConnection`,
-and the `EsConfig` alias = `EsWriteConfig`), plus the pure transforms `coerce_value` / `read_coerce`
-/ `to_es_source` / `sanitize_for_arrow`.
+`make_foreach_batch`, configs (`EsWriteConfig`, `EsReadConfig`, `EsConnection`, and the `EsConfig`
+alias = `EsWriteConfig`), plus the pure transforms `coerce_value` / `read_coerce` / `to_es_source` /
+`sanitize_for_arrow`.
 
 **Write path** (`bulk_write` in `bulk.py`) runs, in order:
 1. `sanitize_for_arrow(df)` (`spark_prep.py`, Spark-side): serializes Arrow-hostile columns
@@ -41,9 +41,10 @@ and the `EsConfig` alias = `EsWriteConfig`), plus the pure transforms `coerce_va
    `coerce_value` (`transform.py`), the pure-Python value shaper, then `build_action` /
    `to_es_source` build the ES bulk action; `helpers.bulk` ships it.
 
-**Read path** (`read_index` / `read_index_collect` in `read.py`): opens a Point-in-Time, fans out
-`spark.range(num_slices).mapInPandas(...)` (or pages on the driver for `_collect`), and coerces each
-`_source` value back to the caller's **declared Spark type** via `read_coerce` (`read_transform.py`).
+**Read path** (`read_index` in `read.py`): opens a Point-in-Time, fans out
+`spark.range(num_slices).mapInPandas(...)` (pass `num_slices=1` for a single unsliced reader on small
+reads), and coerces each `_source` value back to the caller's **declared Spark type** via
+`read_coerce` (`read_transform.py`).
 The read schema is required, there is no mapping inference (several write transforms are one-way and
 can't be inverted from the stored value alone).
 
