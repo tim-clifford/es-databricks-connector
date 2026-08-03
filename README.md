@@ -574,7 +574,13 @@ is part of the customer artifact.
 
 ## License & Attribution
 
-**Copyright © Databricks, Inc.**: Developed and maintained by Databricks Forward Deployed Engineering. Available to support customers and the broader community in connecting Databricks to Elasticsearch. For production support and customization, contact your Databricks account team.
+Copyright © 2026 Databricks, Inc. Licensed under the Databricks License; see
+[`LICENSE`](LICENSE) for terms and [`NOTICE`](NOTICE) for third-party attributions. Use is
+permitted in connection with the Databricks Services (see the LICENSE for the full scope).
+
+Developed and maintained by Databricks Forward Deployed Engineering to help customers connect
+Databricks to Elasticsearch. For production support and customization, contact your Databricks
+account team.
 
 ---
 
