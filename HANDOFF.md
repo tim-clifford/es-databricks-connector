@@ -87,11 +87,14 @@ Hardening still needed before production for SIEM/audit data:
   decimal→float, base64, variant/interval→string) and can't be inverted from `_source` alone. A
   best-effort `GET /_mapping` inference for the unambiguous types is a possible future enhancement,
   but must never silently guess the ambiguous ones.
-- **PIT keep-alive must cover the whole downstream job.** `read_index` returns a *lazy* distributed
-  DataFrame, so its Point-in-Time snapshot can't be driver-closed (that would kill the still-lazy
-  read); it expires via `pit_keep_alive`. If a downstream job runs longer than that window, slices
-  read late will fail with an expired-PIT error. Set `pit_keep_alive` generously. No automatic PIT
-  renewal yet.
+- **PIT keep-alive is a sliding window, and there is no automatic renewal.** `read_index` returns a
+  *lazy* distributed DataFrame, so its Point-in-Time snapshot can't be driver-closed (that would kill
+  the still-lazy read); it expires via `pit_keep_alive`. Each page request re-sends `pit_keep_alive`
+  and resets the PIT's expiry, so it need only cover the longest gap *between* consecutive touches of
+  the PIT (the lazy open-to-first-page scheduling gap, or a slow downstream consumer applying
+  backpressure between pages), not the whole job's wall-clock. A gap longer than the window fails the
+  late slice with an expired-PIT error; raise `pit_keep_alive` if a stage is slow to schedule or
+  consume. Nothing renews the PIT outside those page touches.
 - **No Spark predicate/column pushdown.** `read_index` accepts a raw ES query DSL dict
   (`EsReadConfig.query`) for server-side filtering, but does not translate Spark
   `.filter(...)`/`.select(...)` into ES queries. A caller wanting pushdown must express it as the raw
