@@ -76,8 +76,29 @@ class EsWriteConfig(EsConnection):
     id_field: Optional[str] = None          # column used as deterministic _id (idempotency)
     chunk_size: int = 500                   # docs per bulk request
 
+    # Per-DOCUMENT retries for rows Elasticsearch rejects with a retryable status (429
+    # es_rejected_execution_exception: the ES write queue is full). This is NOT the same as
+    # EsConnection.max_retries, which is transport-level and only fires on the HTTP status of the
+    # whole request: the _bulk API returns HTTP 200 even when individual items fail, so the
+    # transport retry never sees a rejected document. Without this, a 429'd row is a hard error on
+    # its first and only attempt. Backoff is exponential (elasticsearch-py: initial_backoff * 2**n).
+    max_retries_per_doc: int = 3
+    retry_on_doc_status: tuple = (429,)     # per-doc statuses worth retrying (429 = ES queue full)
+
     # --- doc shaping ---
     drop_fields: tuple = field(default_factory=tuple)  # columns to prune before indexing (egress lever)
+    # drop_fields is frequently used as a PII/egress control, and a misspelled column name would
+    # silently prune NOTHING (the field ships to ES anyway). True => bulk_write validates every
+    # drop_fields name against the DataFrame schema and raises on an unknown one, so the control
+    # fails CLOSED. Set False only if you deliberately reuse one config across DataFrames with
+    # differing columns.
+    strict_drop_fields: bool = True
+
+    # Elasticsearch auto-creates a missing index on write (action.auto_create_index defaults to
+    # true), so a TYPO'd index name silently produces a brand-new dynamically-mapped index and a
+    # perfect-looking written count. True => bulk_write checks the index exists first and raises if
+    # not. Set False for a pipeline that intentionally relies on auto-creation or an index template.
+    require_existing_index: bool = True
 
     # --- deletes ---
     # has_deletes=False (default) is the historical behavior: every row is an index/upsert.
@@ -88,6 +109,12 @@ class EsWriteConfig(EsConnection):
 
     def __post_init__(self):
         super().__post_init__()
+        if self.max_retries_per_doc < 0:
+            raise ValueError("EsWriteConfig.max_retries_per_doc must be >= 0")
+        if not self.retry_on_doc_status and self.max_retries_per_doc:
+            # Retries requested but no status to retry on would silently never retry.
+            raise ValueError("max_retries_per_doc is set but retry_on_doc_status is empty, "
+                             "name at least one status (e.g. (429,)) or set max_retries_per_doc=0")
         # Delete routing is all-or-nothing and needs an _id to target.
         if self.has_deletes:
             if not self.delete_flag_column:
@@ -121,6 +148,11 @@ class EsReadConfig(EsConnection):
     # between pages. See read_index's docstring.
     pit_keep_alive: str = "5m"
     include_id: bool = True                 # expose ES _id when the schema declares the id_field
+    # When num_slices is None the reader looks up the index's shard count. If that lookup fails it
+    # can only fall back to ONE unsliced reader: correct but serial, silently forfeiting the
+    # parallelism read_index exists for (and a `logging` warning is easy to miss entirely on
+    # serverless). True => raise instead of degrading quietly. Set False to accept the serial read.
+    strict_slices: bool = True
 
     def __post_init__(self):
         super().__post_init__()

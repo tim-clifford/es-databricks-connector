@@ -118,8 +118,12 @@ def test_partition_writer_counts_and_schema(monkeypatch):
     assert len(out) == 1
     row = out[0].iloc[0]
     # mapInPandas schema: counts + reconciliation total + bounded error samples (JSON string)
-    assert list(out[0].columns) == ["written", "deleted", "errors", "total_input", "error_samples"]
+    assert list(out[0].columns) == ["written", "deleted", "errors", "ignored", "coerced_nonfinite",
+                                    "total_input", "error_samples"]
     assert (int(row["written"]), int(row["deleted"]), int(row["errors"])) == (2, 1, 2)
+    # The delete-404 is still not an error, but it is now COUNTED so reconciliation can tell an
+    # expected no-op apart from a row lost below the per-document level.
+    assert int(row["ignored"]) == 1
 
 
 def test_partition_writer_empty_chunk_yields_zeros(monkeypatch):
@@ -228,9 +232,11 @@ def test_partition_writer_error_samples_are_bounded(monkeypatch):
 
 # --- driver-side merge of per-partition summaries (pure, no Spark) ------------------------
 
-def _prow(written=0, deleted=0, errors=0, total_input=0, samples=None):
+def _prow(written=0, deleted=0, errors=0, ignored=0, coerced_nonfinite=0, total_input=0,
+          samples=None):
     import json
-    return {"written": written, "deleted": deleted, "errors": errors,
+    return {"written": written, "deleted": deleted, "errors": errors, "ignored": ignored,
+            "coerced_nonfinite": coerced_nonfinite,
             "total_input": total_input, "error_samples": json.dumps(samples or [])}
 
 
@@ -245,6 +251,33 @@ def test_merge_reconciliation_gap_is_visible():
     # A partition that lost rows below the per-doc level: 10 in, only 7 accounted for.
     out = _merge_partition_results([_prow(written=7, total_input=10)])
     assert out["total_input"] - (out["written"] + out["deleted"] + out["errors"]) == 3
+    assert out["unaccounted"] == 3       # derived for the caller, not left as arithmetic homework
+
+
+def test_merge_delete_404_noops_are_not_counted_as_loss():
+    # THE distinction `ignored` exists for. 3 rows in: 1 indexed, 2 delete-404 no-ops. Nothing was
+    # lost, so unaccounted must be 0 -- otherwise a raise-on-gap policy would fire on every CDF
+    # replay batch that deletes an already-absent doc (the common case).
+    out = _merge_partition_results([_prow(written=1, ignored=2, total_input=3)])
+    assert out["ignored"] == 2
+    assert out["unaccounted"] == 0
+
+
+def test_merge_sums_coerced_nonfinite():
+    # inf/-inf/NaN silently became JSON null; the count makes that visible.
+    out = _merge_partition_results([_prow(written=2, coerced_nonfinite=1, total_input=2),
+                                    _prow(written=3, coerced_nonfinite=2, total_input=3)])
+    assert out["coerced_nonfinite"] == 3
+
+
+def test_merge_tolerates_rows_without_the_new_keys():
+    # A summary row lacking ignored/coerced_nonfinite (a pre-0.6.0 shape) must degrade to 0 rather
+    # than KeyError, so a version skew is a wrong count and not a crashed job.
+    import json
+    legacy = {"written": 4, "deleted": 0, "errors": 0, "total_input": 4,
+              "error_samples": json.dumps([])}
+    out = _merge_partition_results([legacy])
+    assert out["written"] == 4 and out["ignored"] == 0 and out["coerced_nonfinite"] == 0
 
 
 def test_merge_concatenates_and_caps_samples():
@@ -259,7 +292,8 @@ def test_merge_concatenates_and_caps_samples():
 
 def test_merge_empty_is_all_zero():
     out = _merge_partition_results([])
-    assert out == {"written": 0, "deleted": 0, "errors": 0, "total_input": 0, "error_samples": []}
+    assert out == {"written": 0, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+                   "total_input": 0, "unaccounted": 0, "error_samples": []}
 
 
 # --- bulk_write orchestration wiring (fake Spark; symmetry with read_index's unit test) --------
@@ -274,6 +308,8 @@ def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
     captured = {}
 
     class _FakeDF:
+        columns = ["doc_id"]
+
         def mapInPandas(self, writer, schema):
             captured["writer"] = writer
             captured["schema"] = schema
@@ -284,6 +320,10 @@ def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
                                   samples=[{"_id": "b", "op_type": "index", "status": 400,
                                             "reason": "boom"}])]
             return _Mapped()
+
+    # _preflight would otherwise make a real indices.exists() call to the (fake) host; stub it and
+    # assert separately that bulk_write calls it BEFORE writing (see the preflight tests below).
+    monkeypatch.setattr(bulk_mod, "_preflight", lambda df, cfg: captured.__setitem__("preflight", df))
 
     # sanitize_for_arrow is Spark-side; stub it to return our fake DF and prove it's applied first.
     def _fake_sanitize(df):
@@ -304,8 +344,10 @@ def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
 
     assert captured["sanitized_in"] == "original-df"       # sanitize applied to the caller's df
     assert isinstance(captured["normalized_in"], _FakeDF)  # normalize runs on sanitize's output
+    assert isinstance(captured["preflight"], _FakeDF)      # preflight ran, on the prepared df
     assert captured["schema"] == \
-        "written long, deleted long, errors long, total_input long, error_samples string"
+        ("written long, deleted long, errors long, ignored long, coerced_nonfinite long, "
+         "total_input long, error_samples string")
     # The collected partition rows are merged into the final result dict.
     assert out["written"] == 4 and out["errors"] == 1 and out["total_input"] == 5
     assert out["error_samples"][0]["_id"] == "b"
