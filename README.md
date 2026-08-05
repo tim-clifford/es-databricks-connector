@@ -404,27 +404,29 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `http_compress` | `bool` | `True` | No | gzip both directions: compresses the request body on write and asks ES to gzip the response on read (`content-encoding` + `accept-encoding`). The egress-cost lever. |
 | `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
 | `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request** (transport level): a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see the two-layer note below. |
-| `max_retries` | `int` | - | No | **Umbrella**: sets every retry layer at once (`transport_max_retries`, plus [`max_retries_per_doc`](#write-behavior-eswriteconfig) on a write config). A constructor convenience, not a stored field. Passing it *together with* a per-layer field raises. |
+| `max_retries` | `int` | - | No | Shorthand that sets **every** retry level at once: `transport_max_retries`, plus [`max_retries_per_doc`](#write-behavior-eswriteconfig) on a write config. Cannot be combined with either of those (raises). Reading `cfg.max_retries` back gives the shared number, or `None` if the levels were set to different values. |
 | `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
 raises (pick one).
 
-**Setting retries with one knob.** `max_retries=N` sets every retry layer at once, on any config:
+**Retries: `max_retries` is the simple knob.** A write actually retries at two levels (see
+[Retries on a write](#retries-on-a-write-two-layers)). `max_retries=N` sets both to `N`, so you don't
+have to know that:
 
 ```python
-EsReadConfig(...,  max_retries=5)                 # the transport layer
-EsWriteConfig(..., max_retries=5)                 # transport AND per-document
-EsWriteConfig(..., transport_max_retries=5,       # or tune each layer
-                   max_retries_per_doc=2)
+EsWriteConfig(..., max_retries=5)                 # 5 retries at every level
 ```
 
-It expands into the per-layer fields at construction, so no stored value can disagree with them.
-Passing it together with a per-layer field raises rather than resolving by precedence. Reading
-`cfg.max_retries` gives the shared value when the layers agree, `None` when they differ. A write has
-a second layer the transport knob cannot reach, see
-[Retries on a write](#retries-on-a-write-two-layers) below.
+To set the levels differently, name them individually instead:
+
+```python
+EsWriteConfig(..., transport_max_retries=5, max_retries_per_doc=2)
+```
+
+Use one style or the other. Combining `max_retries` with either individual field raises, so the
+effective value is never in doubt.
 
 ### Write behavior (`EsWriteConfig`)
 
@@ -454,15 +456,15 @@ therefore different questions, so a write has two retry layers:
 | Catches | ES unreachable, LB 503, gateway timeout, connection reset | A document ES refused because its write queue is full |
 
 A **429 means different things at each layer**: "the cluster rejected your request" versus "the
-cluster rejected this document". Only the second loses data quietly, and `transport_max_retries`
-cannot see it, because the per-item statuses are in a response body the transport layer never
-inspects.
+cluster rejected this document". `transport_max_retries` cannot see the second one, because the
+per-item statuses live in a response body the transport layer never reads. That is why
+`max_retries_per_doc` exists, and why leaving it at `0` while raising `transport_max_retries` warns:
+rejected documents would get no retries at all.
 
-Per-document retries sleep **blockingly** in the executor with exponential backoff (2s, doubling,
-capped at 600s), so `max_retries=8` is up to ~8.5 minutes per partition while costing the transport
-layer almost nothing. Tune the layers separately for a high transport count. Setting
-`transport_max_retries` above its default with `max_retries_per_doc=0` warns, since that leaves
-rejected documents with no retries at all.
+**Keep `max_retries_per_doc` low.** Each per-document retry sleeps in the executor with exponential
+backoff (2s, doubling, capped at 600s), so `8` can stall a partition for ~8.5 minutes. The transport
+layer has no such cost, so if you want many transport retries, set the two levels separately rather
+than raising `max_retries`.
 
 **Doc shaping**
 
