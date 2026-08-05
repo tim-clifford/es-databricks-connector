@@ -254,24 +254,82 @@ def test_config_rejects_retries_with_no_retryable_status():
 
 
 def test_warns_when_transport_retries_raised_but_per_doc_retries_off():
-    # `max_retries` and `max_retries_per_doc` are one character apart and mean different things.
-    # Someone hardening against ES backpressure by raising the transport knob has almost certainly
-    # not intended to leave rejected documents with zero retries. Documenting the difference is not
-    # enough: the config itself has to say so.
+    # `transport_max_retries` and `max_retries_per_doc` mean different things (a whole HTTP request
+    # vs one rejected document). Someone hardening against ES backpressure by raising the transport
+    # knob has almost certainly not intended to leave rejected documents with zero retries.
+    # Documenting the difference is not enough: the config itself has to say so.
     with pytest.warns(UserWarning, match="max_retries_per_doc"):
-        _cfg(max_retries=10, max_retries_per_doc=0)
+        _cfg(transport_max_retries=10, max_retries_per_doc=0)
 
 
 @pytest.mark.parametrize("kw", [
-    {},                                              # defaults
-    {"max_retries": 10, "max_retries_per_doc": 5},   # both raised: coherent
-    {"max_retries_per_doc": 0},                      # per-doc off, transport at default
-    {"max_retries": 1, "max_retries_per_doc": 0},    # per-doc off, transport LOWERED: deliberate
+    {},                                                        # defaults
+    {"transport_max_retries": 10, "max_retries_per_doc": 5},    # both raised: coherent
+    {"max_retries_per_doc": 0},                                 # per-doc off, transport at default
+    {"transport_max_retries": 1, "max_retries_per_doc": 0},     # per-doc off, transport LOWERED
 ])
 def test_no_spurious_retry_warning(kw, recwarn):
     # A warning that fires on sane configurations trains people to ignore warnings.
     _cfg(**kw)
     assert [w for w in recwarn if "max_retries_per_doc" in str(w.message)] == []
+
+
+# --- the rename itself (transport_max_retries, 0.6.0) ------------------------------------------
+
+def test_transport_max_retries_reaches_the_client():
+    # Our field was renamed; the elasticsearch-py client kwarg is still `max_retries`.
+    cfg = _cfg(transport_max_retries=7)
+    assert cfg.client_kwargs()["max_retries"] == 7
+
+
+def test_old_max_retries_spelling_still_constructs_with_a_deprecation_warning():
+    # Renaming a public field on a shipped config must not hard-break existing callers.
+    with pytest.warns(DeprecationWarning, match="transport_max_retries"):
+        cfg = _cfg(max_retries=5)
+    assert cfg.transport_max_retries == 5
+    assert cfg.client_kwargs()["max_retries"] == 5
+
+
+def test_reading_the_old_attribute_still_works():
+    # Existing code doing `cfg.max_retries` keeps reading the right value.
+    assert _cfg(transport_max_retries=4).max_retries == 4
+
+
+def test_passing_both_spellings_is_rejected():
+    # Ambiguous intent: refuse rather than silently pick one.
+    with pytest.raises(ValueError, match="only one of"):
+        _cfg(max_retries=1, transport_max_retries=2)
+
+
+@pytest.mark.parametrize("cls_kw", [
+    ("EsConnection", {}),
+    ("EsWriteConfig", {"index": "i"}),
+    ("EsReadConfig", {"index": "i"}),
+])
+def test_deprecated_alias_works_on_every_config_class(cls_kw):
+    # EsConnection is the base, and both subclasses regenerate __init__, so the shim has to be
+    # applied to all three (a subclass would otherwise silently lose it).
+    import databricks_es_connector.config as cfg_mod
+    name, extra = cls_kw
+    cls = getattr(cfg_mod, name)
+    with pytest.warns(DeprecationWarning):
+        obj = cls(hosts="https://h:9200", basic_auth=("u", "p"), **extra, max_retries=9)
+    assert obj.transport_max_retries == 9
+
+
+def test_configs_are_still_frozen_dataclasses_after_the_shim():
+    # The alias is applied by wrapping the GENERATED __init__ after @dataclass, so the dataclass
+    # machinery (frozen, fields, defaults) must be intact.
+    import dataclasses
+    cfg = _cfg()
+    assert dataclasses.is_dataclass(cfg)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cfg.transport_max_retries = 1
+
+
+def test_negative_transport_retries_rejected():
+    with pytest.raises(ValueError, match="transport_max_retries"):
+        _cfg(transport_max_retries=-1)
 
 
 # =====================================================================================

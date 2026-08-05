@@ -409,18 +409,31 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `ca_certs` | `str \| None` | `None` | No | Path to a CA bundle when pinning. Mutually exclusive with `verify_certs=False`. |
 | `http_compress` | `bool` | `True` | No | gzip both directions: compresses the request body on write and asks ES to gzip the response on read (`content-encoding` + `accept-encoding`). The egress-cost lever. |
 | `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
-| `max_retries` | `int` | `3` | No | Client-side retries per **request** (transport level). This does **not** retry an individual rejected document, see the warning below. |
+| `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request** (transport level): a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see the warning below. Renamed from `max_retries` in 0.6.0; the old spelling still constructs with a `DeprecationWarning`. |
 | `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
-> **`max_retries` does not cover rejected documents.** It is transport-level: it fires on the HTTP
-> status of the whole request. The `_bulk` API returns **HTTP 200 even when individual documents
-> fail** (each item carries its own status in the response body), so a document rejected with a 429
-> `es_rejected_execution_exception` is invisible to this retry. Per-document retries are a separate
-> knob, `EsWriteConfig.max_retries_per_doc` (default 3).
+> **Two retry layers, because Elasticsearch fails in two places.** A bulk request sends N documents
+> in one HTTP call; ES processes each independently and answers with a **single HTTP 200** plus a
+> per-item status in the response *body*. So "the request succeeded" and "the documents succeeded"
+> are different questions, and each needs its own retry:
 >
-> The two names are one character apart, so the config does not rely on you reading this: raising
-> `max_retries` above its default while `max_retries_per_doc=0` emits a `UserWarning`, because that
-> combination is almost never what someone hardening against ES backpressure intends.
+> | | `transport_max_retries` (`EsConnection`) | `max_retries_per_doc` (`EsWriteConfig`) |
+> |---|---|---|
+> | **Default** | `3` | `3` (the `elasticsearch-py` default is **0**) |
+> | **Layer** | HTTP transport | Bulk response body |
+> | **Retries on** | `429, 502, 503, 504` (whole request) | `429` (per item, via `retry_on_doc_status`) |
+> | **Retry unit** | The entire request, all N documents | Only the failed subset |
+> | **Catches** | ES unreachable, LB 503, gateway timeout, connection reset | A document ES refused because its write queue is full |
+> | **Applies to** | Reads **and** writes | Writes only |
+>
+> The overlap is what makes this confusing: a **429 means different things at each layer**. At the
+> transport layer it means "the cluster rejected your request"; in the response body it means "the
+> cluster rejected this document". Only the second silently loses data, and `transport_max_retries`
+> cannot see it.
+>
+> The config does not rely on you reading this: raising `transport_max_retries` above its default
+> while `max_retries_per_doc=0` emits a `UserWarning`, since that combination is almost never what
+> someone hardening against ES backpressure intends.
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also

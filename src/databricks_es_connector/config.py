@@ -16,6 +16,8 @@ existing write code keeps working; new code should name the read/write config ex
 """
 from __future__ import annotations
 
+import functools
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -38,14 +40,28 @@ class EsConnection:
     # --- client tuning (apply to both read and write requests) ---
     http_compress: bool = True              # gzip both ways: request body on write, ES response on read
     request_timeout: int = 60
-    # TRANSPORT-level retries: they fire on the HTTP status of a whole REQUEST (connection errors,
-    # timeouts, a 429/503 on the bulk call itself). They do NOT retry an individual rejected
-    # document: the _bulk API answers HTTP 200 even when items inside fail, so this retry never sees
-    # them. Per-document retries are EsWriteConfig.max_retries_per_doc. The two names are
-    # confusingly close, so EsWriteConfig.__post_init__ warns if you raise this one while leaving
-    # per-document retries off.
-    max_retries: int = 3
+    # TRANSPORT-level retries: they fire on the HTTP status of a whole REQUEST (a connection reset, a
+    # load-balancer 503, a gateway timeout, or a 429 on the bulk call itself), and they re-send the
+    # ENTIRE request. They do NOT retry an individual rejected document, because the `_bulk` API
+    # answers HTTP 200 even when items inside it fail: the per-item statuses live in the response
+    # BODY, which the transport layer never inspects. Per-document retries are a separate knob,
+    # `EsWriteConfig.max_retries_per_doc`.
+    #
+    # Named `transport_max_retries` (renamed from `max_retries` in 0.6.0) precisely because the old
+    # name was one character from `max_retries_per_doc` while meaning something entirely different:
+    # both defaulted to 3, so the pair was indistinguishable at a glance. `max_retries=` is still
+    # accepted with a DeprecationWarning (see __init__ below).
+    transport_max_retries: int = 3
     retry_on_timeout: bool = True
+
+    @property
+    def max_retries(self) -> int:
+        """Deprecated read alias for `transport_max_retries` (renamed in 0.6.0).
+
+        Kept so existing code that READS cfg.max_retries keeps working. Writing it (passing
+        `max_retries=` to the constructor) is handled by `_accept_deprecated_max_retries` below.
+        """
+        return self.transport_max_retries
 
     def __post_init__(self):
         if not self.hosts:
@@ -54,6 +70,8 @@ class EsConnection:
             raise ValueError("EsConfig requires either api_key or basic_auth")
         if self.verify_certs is False and self.ca_certs:
             raise ValueError("ca_certs is set but verify_certs is False, pick one")
+        if self.transport_max_retries < 0:
+            raise ValueError("transport_max_retries must be >= 0")
 
     def client_kwargs(self) -> dict:
         """Kwargs for elasticsearch.Elasticsearch(...). Built on the executor."""
@@ -61,7 +79,9 @@ class EsConnection:
             "hosts": self.hosts,
             "http_compress": self.http_compress,
             "request_timeout": self.request_timeout,
-            "max_retries": self.max_retries,
+            # The elasticsearch-py client's own kwarg is still called `max_retries`; only OUR field
+            # was renamed. This is the one place the two spellings meet.
+            "max_retries": self.transport_max_retries,
             "retry_on_timeout": self.retry_on_timeout,
             "verify_certs": self.verify_certs,
         }
@@ -123,10 +143,9 @@ class EsWriteConfig(EsConnection):
         # cover a 429'd document (the _bulk API returns HTTP 200 even when items inside fail, so the
         # transport retry cannot see them). Warn rather than raise: the combination is legal, just
         # very unlikely to be what was meant.
-        if self.max_retries_per_doc == 0 and self.max_retries > 3:
-            import warnings
+        if self.max_retries_per_doc == 0 and self.transport_max_retries > 3:
             warnings.warn(
-                f"max_retries={self.max_retries} (transport-level) is raised above the default but "
+                f"transport_max_retries={self.transport_max_retries} is raised above the default but "
                 "max_retries_per_doc=0, so documents Elasticsearch rejects with a 429 get NO "
                 "retries. The _bulk API returns HTTP 200 even when individual items fail, so "
                 "transport-level retries never see them. Set max_retries_per_doc (default 3) if you "
@@ -181,6 +200,43 @@ class EsReadConfig(EsConnection):
             raise ValueError("EsReadConfig.batch_size must be positive")
         if self.num_slices is not None and self.num_slices < 1:
             raise ValueError("EsReadConfig.num_slices must be >= 1 when set")
+
+
+def _accept_deprecated_max_retries(cls):
+    """Let `max_retries=` still construct a config, with a DeprecationWarning.
+
+    `max_retries` was renamed `transport_max_retries` in 0.6.0 because the old name sat one character
+    from `max_retries_per_doc` while meaning something entirely different (whole HTTP request vs one
+    rejected document), and both defaulted to 3, so the pair was indistinguishable at a glance.
+
+    Applied AFTER @dataclass so it wraps the GENERATED __init__: defining __init__ in the class body
+    would make @dataclass skip generating one at all, and there is no `__dataclass_init__` to fall
+    back to (verified). Wrapping keeps field order, defaults and inheritance exactly as generated.
+    """
+    original = cls.__init__
+
+    @functools.wraps(original)
+    def __init__(self, *args, **kwargs):
+        if "max_retries" in kwargs:
+            if "transport_max_retries" in kwargs:
+                raise ValueError(
+                    "pass only one of transport_max_retries or max_retries (deprecated alias for it)")
+            warnings.warn(
+                f"{cls.__name__}.max_retries was renamed to transport_max_retries in 0.6.0, to "
+                "distinguish it from EsWriteConfig.max_retries_per_doc: this one retries a whole HTTP "
+                "REQUEST, the other retries an individual DOCUMENT that Elasticsearch rejected (the "
+                "_bulk API returns HTTP 200 even when items inside it fail, so the transport retry "
+                "cannot see them). The old name still works but will be removed in a future release.",
+                DeprecationWarning, stacklevel=2)
+            kwargs["transport_max_retries"] = kwargs.pop("max_retries")
+        original(self, *args, **kwargs)
+
+    cls.__init__ = __init__
+    return cls
+
+
+for _cls in (EsConnection, EsWriteConfig, EsReadConfig):
+    _accept_deprecated_max_retries(_cls)
 
 
 # Backward-compatible alias: pre-0.4.0, the (write) config was named EsConfig. Keep it working so
