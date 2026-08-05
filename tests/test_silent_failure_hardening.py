@@ -253,6 +253,27 @@ def test_config_rejects_retries_with_no_retryable_status():
         _cfg(max_retries_per_doc=3, retry_on_doc_status=())
 
 
+def test_warns_when_transport_retries_raised_but_per_doc_retries_off():
+    # `max_retries` and `max_retries_per_doc` are one character apart and mean different things.
+    # Someone hardening against ES backpressure by raising the transport knob has almost certainly
+    # not intended to leave rejected documents with zero retries. Documenting the difference is not
+    # enough: the config itself has to say so.
+    with pytest.warns(UserWarning, match="max_retries_per_doc"):
+        _cfg(max_retries=10, max_retries_per_doc=0)
+
+
+@pytest.mark.parametrize("kw", [
+    {},                                              # defaults
+    {"max_retries": 10, "max_retries_per_doc": 5},   # both raised: coherent
+    {"max_retries_per_doc": 0},                      # per-doc off, transport at default
+    {"max_retries": 1, "max_retries_per_doc": 0},    # per-doc off, transport LOWERED: deliberate
+])
+def test_no_spurious_retry_warning(kw, recwarn):
+    # A warning that fires on sane configurations trains people to ignore warnings.
+    _cfg(**kw)
+    assert [w for w in recwarn if "max_retries_per_doc" in str(w.message)] == []
+
+
 # =====================================================================================
 # Item 13: a misspelled drop_fields entry must fail CLOSED (it is a PII/egress control)
 # =====================================================================================

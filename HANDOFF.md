@@ -73,7 +73,9 @@ Hardening still needed before production for SIEM/audit data:
   failing the batch so Spark retries it and the offset holds; with `id_field` set the retry is an
   idempotent upsert. Note the asymmetry that made this hard to spot: `ConnectionError`/
   `ConnectionTimeout`/`SerializationError` are **not** `ApiError` subclasses, so transport failures
-  always propagated and were retried. Only the ES rejection path was swallowed. Operators opting into
+  always propagated and were retried. The per-document rejection path was not *hidden* (the count was
+  always returned), it was simply not **enforced**: nothing acted on it unless the caller checked, and
+  a caller who only logged it got a green batch. Operators opting into
   `on_error="log"`/`"ignore"` are accepting unretried loss and should have external alerting on the
   `errors`/`unaccounted` counts.
 - **Streaming freshness expectations.** On serverless only `availableNow`/`Once` triggers work, so

@@ -38,6 +38,12 @@ class EsConnection:
     # --- client tuning (apply to both read and write requests) ---
     http_compress: bool = True              # gzip both ways: request body on write, ES response on read
     request_timeout: int = 60
+    # TRANSPORT-level retries: they fire on the HTTP status of a whole REQUEST (connection errors,
+    # timeouts, a 429/503 on the bulk call itself). They do NOT retry an individual rejected
+    # document: the _bulk API answers HTTP 200 even when items inside fail, so this retry never sees
+    # them. Per-document retries are EsWriteConfig.max_retries_per_doc. The two names are
+    # confusingly close, so EsWriteConfig.__post_init__ warns if you raise this one while leaving
+    # per-document retries off.
     max_retries: int = 3
     retry_on_timeout: bool = True
 
@@ -111,6 +117,21 @@ class EsWriteConfig(EsConnection):
         super().__post_init__()
         if self.max_retries_per_doc < 0:
             raise ValueError("EsWriteConfig.max_retries_per_doc must be >= 0")
+        # `max_retries` and `max_retries_per_doc` are one character apart and mean different things.
+        # Someone who raises the transport-level knob to harden against ES backpressure has almost
+        # certainly NOT intended to disable per-document retries, which are the ones that actually
+        # cover a 429'd document (the _bulk API returns HTTP 200 even when items inside fail, so the
+        # transport retry cannot see them). Warn rather than raise: the combination is legal, just
+        # very unlikely to be what was meant.
+        if self.max_retries_per_doc == 0 and self.max_retries > 3:
+            import warnings
+            warnings.warn(
+                f"max_retries={self.max_retries} (transport-level) is raised above the default but "
+                "max_retries_per_doc=0, so documents Elasticsearch rejects with a 429 get NO "
+                "retries. The _bulk API returns HTTP 200 even when individual items fail, so "
+                "transport-level retries never see them. Set max_retries_per_doc (default 3) if you "
+                "meant to retry rejected documents.",
+                UserWarning, stacklevel=3)
         if not self.retry_on_doc_status and self.max_retries_per_doc:
             # Retries requested but no status to retry on would silently never retry.
             raise ValueError("max_retries_per_doc is set but retry_on_doc_status is empty, "

@@ -165,11 +165,15 @@ lost below the per-document level). Expected delete-404 no-ops (`ignored`) are n
 CDF replay that deletes already-absent docs does not trip it. `on_batch` runs *before* the policy is
 applied, so a metrics or dead-letter hook still observes the failing batch.
 
-> **Which failures were already loud.** `ConnectionError`, `ConnectionTimeout` and
-> `SerializationError` are **not** `ApiError` subclasses, so the connector's `raise_on_exception=False`
-> never suppressed them: a network failure has always propagated, failed the Spark task, and been
-> retried. It was the ES *rejection* path that was swallowed. Worth knowing when triaging: the
-> scenario that sounds most alarming was the safe one.
+> **Which failures were already loud, and what "not raising" actually meant.** `ConnectionError`,
+> `ConnectionTimeout` and `SerializationError` are **not** `ApiError` subclasses, so the connector's
+> `raise_on_exception=False` never suppressed them: a network failure has always propagated, failed
+> the Spark task, and been retried. What the pre-0.6.0 path did with a per-document *rejection* was
+> narrower than "hide it": the count was always returned in the result dict, so the information was
+> there. It simply was not **enforced** — nothing acted on it unless the caller wrote the check, and
+> a caller who only logged it got a green batch. So the gap was an unenforced signal, not a hidden
+> one. Worth knowing when triaging: the failure mode that sounds most alarming (the network) was
+> always the safe one.
 
 ### Deletes
 
@@ -413,6 +417,10 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 > fail** (each item carries its own status in the response body), so a document rejected with a 429
 > `es_rejected_execution_exception` is invisible to this retry. Per-document retries are a separate
 > knob, `EsWriteConfig.max_retries_per_doc` (default 3).
+>
+> The two names are one character apart, so the config does not rely on you reading this: raising
+> `max_retries` above its default while `max_retries_per_doc=0` emits a `UserWarning`, because that
+> combination is almost never what someone hardening against ES backpressure intends.
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
