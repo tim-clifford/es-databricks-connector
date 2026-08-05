@@ -630,7 +630,8 @@ building a new release. The wheel lands in `dist/` (git-ignored).
 **Cutting a tagged release?** Follow [`RELEASING.md`](RELEASING.md): it enumerates the four required
 steps (integration tests, rebuild wheel, run the release gates, attach the wheel to the tag). Two
 hard gates run in step 3: `scripts/check_requirements_match.py` (requirements.txt matches the wheel's
-resolved closure) and `scripts/check_readme_sync.py` (every module / fixture / script is documented).
+resolved closure), `scripts/check_readme_sync.py` (every module / fixture / script is documented), and
+`scripts/check_version_consistency.py` (every version/wheel reference agrees with `pyproject.toml`).
 
 **When cutting a release, regenerate [`requirements.txt`](requirements.txt).** The build does
 *not* read that file: the wheel declares only the abstract range `elasticsearch>=8,<9`, so a
@@ -689,6 +690,7 @@ integration_tests/             # live-Spark/ES tests run on Databricks serverles
 scripts/                       # release + maintenance gates (not shipped in the .whl)
   check_requirements_match.py  #   requirements.txt == the wheel's resolved dependency closure
   check_readme_sync.py         #   every module / fixture / script is documented in the README(s)
+  check_version_consistency.py #   __init__, HANDOFF header + every wheel reference match pyproject
 .agents/skills/es-connector/   # maintainer skill: fidelity model, datatype contract, ES gotchas, release
 RELEASING.md                   # the release checklist (integration tests, wheel, gates, tag)
 ```

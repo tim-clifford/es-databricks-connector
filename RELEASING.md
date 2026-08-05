@@ -1,7 +1,8 @@
 # Releasing
 
 The checklist for cutting a tagged release. Every release MUST pass these four steps in order.
-Step 3 is enforced by scripts (`scripts/check_requirements_match.py` and `scripts/check_readme_sync.py`,
+Step 3 is enforced by scripts (`scripts/check_requirements_match.py`, `scripts/check_readme_sync.py`
+and `scripts/check_version_consistency.py`,
 each exits non-zero on drift); the others are manual but must be done and their evidence recorded in
 the release notes.
 
@@ -102,6 +103,11 @@ re-annotate, and re-run until green.
 
 ```bash
 python scripts/check_readme_sync.py
+
+# Every version / wheel reference agrees with pyproject.toml. Catches the worst kind of drift:
+# integration_tests/config/test_config.yml pins the wheel the LIVE tier installs, so a stale pin
+# there silently validates the previous release.
+python scripts/check_version_consistency.py
 ```
 
 Exits `0` when every shipped module, integration fixture, and release script is referenced by name

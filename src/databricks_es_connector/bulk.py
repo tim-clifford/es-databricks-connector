@@ -172,13 +172,16 @@ def _merge_partition_results(rows) -> dict:
         written += int(r["written"] or 0)
         deleted += int(r["deleted"] or 0)
         errors += int(r["errors"] or 0)
-        # `ignored`/`coerced_nonfinite` are read with .get-like tolerance so a stale/foreign row
-        # shape (e.g. a pre-0.6.0 summary) degrades to 0 rather than raising here.
+        # Optional keys are read with `in` rather than `.get()`: these rows are pyspark `Row`s in
+        # production, and Row has no `.get` (it raises ATTRIBUTE_NOT_SUPPORTED). `in` checks field
+        # names on a Row and keys on a dict, so it works for both. Tolerating absence means a
+        # stale/foreign row shape degrades to a zero/empty rather than crashing the whole write here.
         ignored += int((r["ignored"] if "ignored" in r else 0) or 0)
         coerced_nonfinite += int((r["coerced_nonfinite"] if "coerced_nonfinite" in r else 0) or 0)
         total_input += int(r["total_input"] or 0)
-        if len(samples) < ERROR_SAMPLE_CAP and r["error_samples"]:
-            samples.extend(json.loads(r["error_samples"]))
+        _samples_json = r["error_samples"] if "error_samples" in r else None
+        if len(samples) < ERROR_SAMPLE_CAP and _samples_json:
+            samples.extend(json.loads(_samples_json))
     return {
         "written": written, "deleted": deleted, "errors": errors, "ignored": ignored,
         "coerced_nonfinite": coerced_nonfinite,

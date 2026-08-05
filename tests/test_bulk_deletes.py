@@ -280,6 +280,32 @@ def test_merge_tolerates_rows_without_the_new_keys():
     assert out["written"] == 4 and out["ignored"] == 0 and out["coerced_nonfinite"] == 0
 
 
+def test_merge_tolerates_a_row_without_error_samples():
+    # Same tolerance as the counters above, for the one remaining optional key. Without it a row
+    # missing `error_samples` raised KeyError and took down the whole merge (so a partial version
+    # skew became a crashed write rather than a slightly-wrong sample list).
+    out = _merge_partition_results([{"written": 4, "deleted": 0, "errors": 0, "ignored": 0,
+                                     "coerced_nonfinite": 0, "total_input": 4}])
+    assert out["written"] == 4 and out["error_samples"] == []
+
+
+def test_merge_reads_optional_keys_from_a_real_spark_row():
+    # These rows are pyspark Rows in production, not dicts. Row has NO .get() (it raises
+    # ATTRIBUTE_NOT_SUPPORTED), which is why the optional reads use `in` instead. Assert against a
+    # real Row so a refactor to .get() fails here rather than only on a live cluster.
+    Row = pytest.importorskip("pyspark.sql").Row
+    full = Row(written=3, deleted=0, errors=1, ignored=2, coerced_nonfinite=1, total_input=7,
+               error_samples='[{"_id": "x"}]')
+    out = _merge_partition_results([full])
+    assert (out["written"], out["ignored"], out["coerced_nonfinite"]) == (3, 2, 1)
+    assert out["unaccounted"] == 1                      # 7 - (3+0+1+2)
+    assert out["error_samples"] == [{"_id": "x"}]
+
+    legacy_row = Row(written=4, deleted=0, errors=0, total_input=4)   # no new keys at all
+    out2 = _merge_partition_results([legacy_row])
+    assert out2["written"] == 4 and out2["ignored"] == 0 and out2["error_samples"] == []
+
+
 def test_merge_concatenates_and_caps_samples():
     # Two partitions each with samples; merged list is capped at ERROR_SAMPLE_CAP.
     half = ERROR_SAMPLE_CAP
