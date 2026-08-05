@@ -80,7 +80,10 @@ integration tier above is what has to be green.
   test, a `skipped` test, or a fixture missing entirely. Matching NAMES rather than counts is
   deliberate: `dbx_test` expands a `@pytest.mark.parametrize` method into `test_thing[1]`,
   `test_thing[2]`, ..., so a count check would fail a healthy parametrized fixture, and a count also
-  cannot see one test vanishing while another is added.
+  cannot see one test vanishing while another is added. The gate reimplements the framework's
+  discovery with `ast` (the fixtures are notebooks and cannot be imported off-cluster), including
+  per-case parametrize expansion, so it must stay in step with `_get_test_methods`:
+  `tests/test_check_tier_results.py` pins that parity along with every failure shape.
 - **`scripts/check_version_consistency.py`**, asserts `pyproject.toml`'s version matches
   `__init__.__version__`, `HANDOFF.md`'s header, and every wheel-filename reference in the docs, this
   skill, and `integration_tests/config/test_config.yml`. That last file is the reason it exists: it

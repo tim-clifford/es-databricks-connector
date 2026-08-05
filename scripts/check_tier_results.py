@@ -93,6 +93,54 @@ def _is_discoverable_test(name: str) -> bool:
     return name.startswith("test_") and not name.startswith("test__")
 
 
+def _expansion_names(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str] | None:
+    """The exact names `dbx_test` will report for one method, expanding `@pytest.mark.parametrize`.
+
+    Returns `{method.name}` for an unparametrized method. For a parametrized one, returns one name
+    per parameter set, built with the framework's own rule (`_get_test_methods`):
+
+        param_id = param_set["id"] or "-".join(str(v) for v in values)
+        test_name = f"{name}[{param_id}]"
+
+    Expanding is what makes a PARTIAL parametrized run detectable. Matching the bare method name is
+    not enough: three of four expansions still de-parametrize to the same single name, so the method
+    looks fully covered while one case silently never ran.
+
+    Returns `None` when the parameter sets are not a literal in the source (e.g. a name or a
+    comprehension). The count is then unknowable statically, so the caller falls back to requiring
+    the bare method name -- weaker, but honest, and it never fails a healthy run.
+    """
+    for dec in method.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        # Match `pytest.mark.parametrize(...)` / `mark.parametrize(...)` / `parametrize(...)`.
+        attr = dec.func
+        tail = attr.attr if isinstance(attr, ast.Attribute) else getattr(attr, "id", None)
+        if tail != "parametrize" or len(dec.args) < 2:
+            continue
+        try:
+            values = ast.literal_eval(dec.args[1])
+            ids = None
+            for kw in dec.keywords:
+                if kw.arg == "ids":
+                    ids = ast.literal_eval(kw.value)
+        except (ValueError, TypeError, SyntaxError):
+            return None                      # not a literal: count is not statically knowable
+        if not isinstance(values, (list, tuple)) or not values:
+            return None
+        out: set[str] = set()
+        for i, vs in enumerate(values):
+            if ids is not None and i < len(ids):
+                pid = str(ids[i])
+            elif isinstance(vs, (list, tuple)):
+                pid = "-".join(str(v) for v in vs)
+            else:
+                pid = str(vs)
+            out.add(f"{method.name}[{pid}]")
+        return out
+    return {method.name}
+
+
 def source_test_names() -> dict[str, set[str]]:
     """{fixture module stem: {names of test_* methods the framework would DISCOVER in it}}.
 
@@ -107,6 +155,8 @@ def source_test_names() -> dict[str, set[str]]:
       reachable through inheritance, which is why every top-level class is scanned and not just the
       `NotebookTestFixture` subclass.
     - **`test__`-prefixed methods excluded**, per `_is_discoverable_test`.
+    - **`@pytest.mark.parametrize` expanded to one name per case**, per `_expansion_names`, so that a
+      run which executes only some of a method's cases is detectable.
 
     Names are collected into a SET, so an inherited method counts once no matter how many classes in
     the file expose it.
@@ -118,16 +168,31 @@ def source_test_names() -> dict[str, set[str]]:
         # tree.body, not ast.walk: walking would descend into nested classes the framework cannot see.
         for node in tree.body:
             if isinstance(node, ast.ClassDef):
-                found.update(item.name for item in node.body
-                             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                             and _is_discoverable_test(item.name))
+                for item in node.body:
+                    if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        continue
+                    if not _is_discoverable_test(item.name):
+                        continue
+                    expansions = _expansion_names(item)
+                    # None = parametrized over a non-literal, so the case count is unknowable here.
+                    # Fall back to the bare method name: weaker (a partial run of THAT method slips
+                    # through) but it cannot fail a healthy run over a number we cannot compute.
+                    found.update(expansions if expansions is not None else {item.name})
         names[path.stem] = found
     return names
 
 
 # `dbx_test` reports a test as `Class.method`, and a parametrized method as `Class.method[param]`.
-# Strip both decorations to recover the source method name.
+# Two levels of stripping, because they answer different questions:
+#   _strip_class   drops only `Class.`, KEEPING `[param]` -> compare against an expanded source name
+#   _source_method drops both        -> the fallback, when the source could not be expanded
+_CLASS_PREFIX_RE = re.compile(r"^(?:[A-Za-z_]\w*\.)+(?=[A-Za-z_]\w*(?:\[|$))")
 _REPORTED_NAME_RE = re.compile(r"^(?:.*\.)?(?P<method>[A-Za-z_]\w*)(?:\[.*\])?$")
+
+
+def _strip_class(reported_name: str) -> str:
+    """`TestX.test_a[2]` -> `test_a[2]`. Leaves an already-bare name alone."""
+    return _CLASS_PREFIX_RE.sub("", reported_name.strip())
 
 # `dbx_test` emits exactly six statuses (grep `status="` in its testing.py): passed, skipped,
 # xfailed, xpassed, failed, error. Only `passed` is evidence that a test asserted something about
@@ -209,11 +274,22 @@ def check(results_path: Path) -> tuple[list[str], list[str], int]:
 
         # 2. the reported set and the source set must be EQUAL, in both directions, and every
         #    reported result must have actually asserted something.
+        #
+        # A reported name is credited under the form the source expects. `expected[stem]` holds full
+        # names including any `[case]` suffix, so `test_a[2]` is credited as `test_a[2]` and a run
+        # missing one case is caught. Only when the source could not be expanded (parametrized over a
+        # non-literal, so it holds the bare `test_a`) is the suffix stripped, which is what keeps that
+        # fallback from failing a healthy run.
+        want = expected[stem]
+
+        def _credit(reported: str) -> str:
+            return reported if reported in want else _source_method(reported)
+
         covered: set[str] = set()
         for entry in entries:
             name = entry.get("test_name") or ""
             status = (entry.get("status") or "").lower()
-            method = _source_method(name)
+            method = _credit(_strip_class(name))
             if status in _COVERING:
                 covered.add(method)
                 counted += 1
