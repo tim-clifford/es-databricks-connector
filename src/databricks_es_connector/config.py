@@ -49,6 +49,7 @@ transport layer almost nothing. Prefer the granular form when you need a high tr
 from __future__ import annotations
 
 import functools
+import inspect
 import warnings
 from dataclasses import dataclass, field, fields
 from typing import Optional
@@ -173,7 +174,12 @@ class EsWriteConfig(EsConnection):
                 "retries. The _bulk API returns HTTP 200 even when individual items fail, so "
                 "transport-level retries never see them. Set max_retries_per_doc, or use "
                 "max_retries=<n> to set both layers at once.",
-                UserWarning, stacklevel=3)
+                # stacklevel=4, not 3: __post_init__ <- generated __init__ <- the umbrella wrapper
+                # <- the caller. The wrapper added a frame, so 3 pointed inside config.py, which
+                # blames the library for the caller's configuration. Pinned by a test that asserts
+                # the warning's filename/lineno, since this is exactly the kind of off-by-one that
+                # silently returns if the call chain changes again.
+                UserWarning, stacklevel=4)
         if not self.retry_on_doc_status and self.max_retries_per_doc:
             # Retries requested but no status to retry on would silently never retry.
             raise ValueError("max_retries_per_doc is set but retry_on_doc_status is empty, "
@@ -272,6 +278,19 @@ def _support_max_retries_umbrella(cls):
                 kwargs[f] = umbrella
         original(self, *args, **kwargs)
 
+    # Advertise `max_retries` in the signature. functools.wraps copies the GENERATED __init__'s
+    # signature, which does not mention `max_retries` (it is not a field), so `help(EsWriteConfig)`,
+    # IDE completion and anything else using inspect.signature would not reveal a supported argument.
+    # Append it as keyword-only so introspection matches what the constructor actually accepts.
+    try:
+        _sig = inspect.signature(original)
+        _params = list(_sig.parameters.values())
+        _params.append(inspect.Parameter("max_retries", inspect.Parameter.KEYWORD_ONLY,
+                                         annotation=int))
+        __init__.__signature__ = _sig.replace(parameters=_params)
+    except (TypeError, ValueError):  # pragma: no cover - introspection is best-effort, never fatal
+        pass
+
     cls.__init__ = __init__
 
     def _max_retries(self):
@@ -288,8 +307,15 @@ def _support_max_retries_umbrella(cls):
     return cls
 
 
-# Order matters only for readability; each class is wrapped independently because each subclass
-# regenerates its own __init__ and would otherwise not have the umbrella at all.
+# Each class is wrapped independently, because @dataclass regenerates __init__ for every subclass, so
+# wrapping only the base would leave the subclasses without the umbrella.
+#
+# KNOWN BOUNDARY: a FURTHER subclass defined by a caller (e.g. `@dataclass(frozen=True) class
+# MyConfig(EsWriteConfig)`) regenerates __init__ again and is not wrapped, so `max_retries=` raises
+# TypeError there while the per-layer fields keep working. That fails loudly rather than silently
+# mis-configuring retries, and subclassing these configs is not part of the public API (construct
+# them, don't extend them), so it is left as-is rather than solved with metaclass machinery.
+# `_support_max_retries_umbrella` is importable if a caller genuinely needs it on their own subclass.
 for _cls in (EsConnection, EsWriteConfig, EsReadConfig):
     _support_max_retries_umbrella(_cls)
 

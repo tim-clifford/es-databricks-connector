@@ -14,6 +14,7 @@ Grouped by the failure they prevent:
  15. inf/-inf/NaN becoming JSON null with no count
  16. an ambiguous delete-flag string silently meaning "not a delete"
 """
+import inspect
 import json
 
 import pytest
@@ -340,6 +341,35 @@ def test_max_retries_is_not_a_stored_field():
     assert "max_retries" not in {f.name for f in dataclasses.fields(_cfg())}
 
 
+def test_a_further_subclass_loses_the_umbrella_but_fails_loudly():
+    # Documented boundary: @dataclass regenerates __init__ for every subclass, so a caller's own
+    # subclass is not wrapped. What matters is that it fails LOUDLY (TypeError) rather than silently
+    # ignoring the argument and leaving retries at their defaults, and that the per-layer fields
+    # still work. Pinned so the failure mode cannot degrade into a silent one.
+    import dataclasses
+
+    @dataclasses.dataclass(frozen=True)
+    class _Custom(EsWriteConfig):
+        extra: str = "x"
+
+    base = dict(hosts="https://h:9200", basic_auth=("u", "p"), index="i")
+    with pytest.raises(TypeError, match="max_retries"):
+        _Custom(**base, max_retries=7)
+    granular = _Custom(**base, transport_max_retries=7, max_retries_per_doc=7)
+    assert (granular.transport_max_retries, granular.max_retries_per_doc) == (7, 7)
+
+
+@pytest.mark.parametrize("name", ["EsConnection", "EsWriteConfig", "EsReadConfig"])
+def test_max_retries_is_advertised_in_the_signature(name):
+    # Because it is not a dataclass field, the generated __init__ signature that functools.wraps
+    # copies does not mention it -- so help(), IDE completion and any introspecting tool would hide a
+    # supported argument. The wrapper appends it explicitly.
+    import databricks_es_connector.config as cfg_mod
+    params = inspect.signature(getattr(cfg_mod, name)).parameters
+    assert "max_retries" in params, f"{name} does not advertise max_retries"
+    assert params["max_retries"].kind is inspect.Parameter.KEYWORD_ONLY
+
+
 @pytest.mark.parametrize("name,extra", [
     ("EsConnection", {}),
     ("EsWriteConfig", {"index": "i"}),
@@ -390,6 +420,28 @@ def test_negative_umbrella_rejected():
     # The umbrella must not bypass per-layer validation.
     with pytest.raises(ValueError):
         _cfg(max_retries=-1)
+
+
+def test_retry_warning_points_at_the_caller_not_the_library():
+    # A warning whose filename/lineno land inside config.py blames the library for the caller's
+    # configuration and is useless for finding the offending line. Wrapping __init__ for the umbrella
+    # added a stack frame, which silently made the old stacklevel point inside config.py; this pins
+    # the correct one so that regression cannot come back unnoticed.
+    import warnings
+    # Constructed DIRECTLY here, not via the _cfg() helper: the helper would itself be the immediate
+    # caller, so the warning would correctly name the helper's line and this test could not tell a
+    # right stacklevel from a wrong one.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        EsWriteConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="doc_id",
+                      transport_max_retries=10, max_retries_per_doc=0)
+        expected_line = inspect.currentframe().f_lineno - 2   # the EsWriteConfig( line
+
+    relevant = [w for w in caught if w.category is UserWarning]
+    assert relevant, "expected a UserWarning"
+    w = relevant[0]
+    assert w.filename == __file__, f"warning blamed {w.filename}, not the caller's file"
+    assert w.lineno == expected_line, f"warning blamed line {w.lineno}, expected {expected_line}"
 
 
 # =====================================================================================
