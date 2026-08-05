@@ -77,25 +77,48 @@ def _display(path: Path) -> str:
     return str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path)
 
 
+def _is_discoverable_test(name: str) -> bool:
+    """Mirror `dbx_test`'s own discovery rule for a method name.
+
+    Its `_get_test_methods` does:
+
+        if not name.startswith("test_") or name.startswith("test__"): continue
+
+    so a `test__`-prefixed method is deliberately NOT a test (it is a helper that happens to sort
+    near the tests). This gate must demand exactly the set the framework runs: requiring more means
+    failing a release over a test that was never going to run.
+    """
+    return name.startswith("test_") and not name.startswith("test__")
+
+
 def source_test_names() -> dict[str, set[str]]:
-    """{fixture module stem: {names of test_* methods declared in it}}.
+    """{fixture module stem: {names of test_* methods the framework would DISCOVER in it}}.
 
     Parsed with `ast` rather than imported: these are Databricks notebooks whose top level calls
-    `dbutils`, so importing them off-cluster is impossible.
+    `dbutils`, so importing them off-cluster is impossible. That makes this an independent
+    reimplementation of `dbx_test`'s discovery, so it has to match the framework's rules rather than
+    guess at them, in both directions:
 
-    Every class in the file is walked, not just the `NotebookTestFixture` subclass, so a test living
-    on a shared base class still counts. Names are collected into a SET, which is also what makes an
-    inherited method counted once no matter how many classes expose it.
+    - **Only TOP-LEVEL classes.** `dbx_test` discovers via `dir(self)` on the fixture instance, which
+      sees the class and its bases but never an inner class. So a test method on a nested class is
+      never run, and demanding it would fail a healthy release. A base class at module level IS
+      reachable through inheritance, which is why every top-level class is scanned and not just the
+      `NotebookTestFixture` subclass.
+    - **`test__`-prefixed methods excluded**, per `_is_discoverable_test`.
+
+    Names are collected into a SET, so an inherited method counts once no matter how many classes in
+    the file expose it.
     """
     names: dict[str, set[str]] = {}
     for path in sorted(FIXTURE_DIR.glob("test_*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         found: set[str] = set()
-        for node in ast.walk(tree):
+        # tree.body, not ast.walk: walking would descend into nested classes the framework cannot see.
+        for node in tree.body:
             if isinstance(node, ast.ClassDef):
                 found.update(item.name for item in node.body
                              if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                             and item.name.startswith("test_"))
+                             and _is_discoverable_test(item.name))
         names[path.stem] = found
     return names
 

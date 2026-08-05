@@ -127,6 +127,11 @@ runs each fixture as a notebook, and reports console + JUnit + JSON results (JUn
   it. A `@pytest.mark.skip` counts as missing, because a reported-but-skipped test keeps the numbers
   matching while asserting nothing; parametrized expansions (`test_thing[1]`, ...) are matched back
   to their source method.
+- **`dbx_test` discovers tests via `dir()` on the fixture instance**, so a test method only runs if
+  it is on the fixture class or a module-level base class, and its name does NOT start with `test__`
+  (a double underscore marks a helper, not a test). A method on a *nested* class is never discovered.
+  The gate mirrors these rules exactly, so keep new tests within them: a test the framework silently
+  skips is coverage you do not have.
 - **Every fixture must CREATE each index it writes to**, with an explicit mapping, rather than
   relying on Elasticsearch auto-creation: `require_existing_index` defaults to `True`, so a write to
   a missing index raises, and per the point above that raise inside `run_setup` silently costs you
