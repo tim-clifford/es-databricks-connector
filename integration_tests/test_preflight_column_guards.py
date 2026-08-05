@@ -69,6 +69,10 @@ class TestPreflightColumnGuards(NotebookTestFixture):
             self.flag_error = exc
         self._refresh()
         self.count_after_typo = self._count()
+        # Snapshot k1's _source HERE, not in the assertion: the last setup phase below deletes k1 and
+        # k2 with the correct config, so a live read at assertion time would find nothing and fail
+        # for a reason that has nothing to do with the guard under test.
+        self.k1_source_after_typo = self._source_of("k1")
 
         # --- a misspelled id_field ---
         id_cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
@@ -127,9 +131,11 @@ class TestPreflightColumnGuards(NotebookTestFixture):
 
     def test_misspelled_delete_flag_wrote_nothing(self):
         # The point of a PREFLIGHT: it fails before any document is touched, so ES is untouched
-        # (not partially upserted). Both seeded docs are still present and unmodified.
+        # (not partially upserted). Both seeded docs are still present and unmodified. Asserted
+        # against the snapshot taken right after that write attempt, since later setup phases
+        # legitimately delete these docs.
         assert self.count_after_typo == 2, self.count_after_typo
-        assert self._source_of("k1") == {"doc_id": "k1", "n": 1}, self._source_of("k1")
+        assert self.k1_source_after_typo == {"doc_id": "k1", "n": 1}, self.k1_source_after_typo
 
     # --- the sibling fields, same class ---
     def test_misspelled_id_field_raises(self):
