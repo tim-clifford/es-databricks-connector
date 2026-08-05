@@ -24,7 +24,7 @@ __all__ = [
     "EsConnection",
     "EsWriteConfig",
     "EsReadConfig",
-    "EsConfig",          # backward-compatible alias for EsWriteConfig (pre-0.4.0 name)
+    "EsConfig",          # backward-compatible alias for EsWriteConfig (the legacy name)
     "to_es_source",
     "coerce_value",
     "bulk_write",

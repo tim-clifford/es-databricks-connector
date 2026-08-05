@@ -8,8 +8,8 @@ a UC Volume (dbfs:/tmp paths fail with INSUFFICIENT_PERMISSIONS on serverless).
 Idempotency: with EsConfig.id_field set, streaming's at-least-once checkpoint semantics
 combine with deterministic _id to give effectively exactly-once (retries upsert).
 
-WHY THIS RAISES BY DEFAULT (changed in 0.6.0)
----------------------------------------------
+WHY THIS RAISES BY DEFAULT
+--------------------------
 Structured Streaming commits a micro-batch's checkpoint offset when `foreachBatch` RETURNS
 NORMALLY. It has no view into what happened to the documents inside. So if this function
 swallowed a failed write, a micro-batch in which Elasticsearch rejected every document would
@@ -54,7 +54,7 @@ def make_foreach_batch(cfg: EsConfig, on_batch: Optional[Callable] = None,
                  specific reason not to.
       - "log":   log a warning and return normally. The checkpoint ADVANCES and the rejected rows
                  are never retried. Only appropriate for a loss-tolerant pipeline.
-      - "ignore": return normally with no log. Restores the pre-0.6.0 behavior; silent data loss.
+      - "ignore": return normally with no log. Silent data loss; the checkpoint advances anyway.
 
     A write "failed" when Elasticsearch rejected any document (`errors > 0`) or any row went
     unaccounted for (`unaccounted > 0`, i.e. loss below the per-document level). Expected

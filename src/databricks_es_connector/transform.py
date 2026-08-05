@@ -178,20 +178,19 @@ def coerce_value(v: Any, stats: Optional[dict] = None) -> Any:
 def to_es_source(
     row: dict,
     *,
-    id_field: Optional[str] = None,
     drop_fields: Iterable[str] = (),
     stats: Optional[dict] = None,
 ) -> dict:
     """Turn one row (dict) into the ES _source document.
 
-    - drops `drop_fields` (egress pruning; also drops id_field from _source is NOT done,
-      the id is kept in _source by default so the doc is self-describing).
+    - drops `drop_fields` (egress pruning).
     - coerces values (timestamps -> epoch millis, nested structs preserved).
 
-    `stats`, if given, is forwarded to `coerce_value` to count invisible coercions.
+    The id column is deliberately KEPT in `_source`, so the document is self-describing. The `_id`
+    itself is extracted separately by the caller (see build_action), which is why this function
+    takes no id argument and stays a pure value transform.
 
-    Returns the _source dict. The _id is extracted separately by the caller
-    (see build_action) so this stays a pure value transform.
+    `stats`, if given, is forwarded to `coerce_value` to count invisible coercions.
     """
     drop = set(drop_fields)
     return {k: coerce_value(v, stats) for k, v in row.items() if k not in drop}
@@ -295,7 +294,7 @@ def build_action(
 
     # Index path. Drop the delete flag from the body so it isn't indexed as data.
     drop = tuple(drop_fields) + ((delete_flag_column,) if (has_deletes and delete_flag_column) else ())
-    source = to_es_source(row, id_field=id_field, drop_fields=drop, stats=stats)
+    source = to_es_source(row, drop_fields=drop, stats=stats)
     action = {"_index": index, "_source": source}
     if id_field is not None:
         action["_id"] = _require_id(row, id_field)

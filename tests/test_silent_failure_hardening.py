@@ -728,3 +728,178 @@ def test_read_config_allows_opting_out_of_strict_slices():
     cfg = EsReadConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i",
                        strict_slices=False)
     assert cfg.strict_slices is False
+
+
+# =====================================================================================
+# Item 17: a config field naming a MISSING column must fail closed (the class, not one case)
+#
+# `drop_fields` was hardened in 0.6.0 (item 13) but the other two column-naming fields were not.
+# `delete_flag_column` was the live data-loss case: with has_deletes=True and a misspelled flag
+# column, `row.get(flag)` returns None for EVERY row, so no row is ever routed to a delete and
+# every intended deletion is applied as an UPSERT instead. Proven live against real Spark + ES:
+# deleted=0, errors=0, unaccounted=0, raise_on_error=True passed clean, and the documents that
+# should have been erased were still in the index (with the flag column indexed alongside them).
+#
+# This is invisible below _preflight by construction: a column that is PRESENT with a null value
+# must not be a delete (test_null_flag_is_not_a_delete pins that), and `.get()` cannot tell that
+# apart from a column that is ABSENT. `_preflight` is the only layer that sees df.columns, so it is
+# the only place the two can be distinguished.
+# =====================================================================================
+
+def test_preflight_rejects_missing_delete_flag_column():
+    # The live silent failure: every intended delete silently became an upsert.
+    cfg = _cfg(has_deletes=True, delete_flag_column="_is_deleted",   # typo: real column is _is_delete
+               require_existing_index=False)
+    with pytest.raises(ValueError, match="delete_flag_column"):
+        bulk_mod._preflight(_ColsDF(["doc_id", "n", "_is_delete"]), cfg)
+
+
+def test_preflight_delete_flag_error_is_actionable():
+    cfg = _cfg(has_deletes=True, delete_flag_column="_is_deleted", require_existing_index=False)
+    with pytest.raises(ValueError) as exc:
+        bulk_mod._preflight(_ColsDF(["doc_id", "_is_delete"]), cfg)
+    msg = str(exc.value)
+    assert "_is_deleted" in msg and "_is_delete" in msg      # names the typo AND the real columns
+    assert "upsert" in msg or "delete" in msg                # says what goes wrong
+
+
+def test_preflight_accepts_a_present_delete_flag_column():
+    cfg = _cfg(has_deletes=True, delete_flag_column="_is_delete", require_existing_index=False)
+    bulk_mod._preflight(_ColsDF(["doc_id", "_is_delete"]), cfg)   # must not raise
+
+
+def test_preflight_ignores_delete_flag_when_deletes_are_off():
+    # has_deletes=False means the flag column is irrelevant (the config forbids setting it anyway).
+    cfg = _cfg(require_existing_index=False)
+    bulk_mod._preflight(_ColsDF(["doc_id"]), cfg)                 # must not raise
+
+
+def test_preflight_rejects_missing_id_field():
+    # A missing id_field raises per-row in _require_id today, mid-write, after some partitions may
+    # already have committed. Preflight turns it into one clear driver-side failure before any write.
+    cfg = _cfg(id_field="docid", require_existing_index=False)     # typo: real column is doc_id
+    with pytest.raises(ValueError, match="id_field"):
+        bulk_mod._preflight(_ColsDF(["doc_id", "n"]), cfg)
+
+
+def test_preflight_covers_every_column_naming_config_field():
+    """The class-closure guard: this test FAILS when a new column-naming field is added.
+
+    The 0.6.0 hardening fixed `drop_fields` and left `delete_flag_column` open because nothing
+    enumerated the class. This pins the enumeration, so a fourth field cannot be added without a
+    deliberate decision about whether _preflight must validate it.
+    """
+    assert bulk_mod._COLUMN_NAMING_FIELDS == ("id_field", "drop_fields", "delete_flag_column")
+
+
+# =====================================================================================
+# Item 18: read_index must reject declared types it cannot honor (char/varchar/void)
+#
+# These produce simpleString() tokens ('varchar(10)', 'char(5)', 'void') that no read_coerce branch
+# matches, so the value falls through the unknown-token passthrough untouched -- bypassing the
+# _reject_non_scalar guard that StringType correctly applies. Proven live: a multi-valued ES field
+# declared varchar reached Spark as a Python list and died with
+# `PySparkNotImplementedError: Invalid return type in mapInPandas`, an error that names neither the
+# field nor the real problem.
+# =====================================================================================
+
+def test_read_coerce_rejects_varchar_and_char():
+    for token in ("varchar(10)", "char(5)"):
+        with pytest.raises(ReadSchemaMismatch, match="StringType"):
+            read_coerce("abc", token)
+
+
+def test_read_coerce_rejects_void():
+    # NullType: Spark cannot carry it through mapInPandas either.
+    with pytest.raises(ReadSchemaMismatch):
+        read_coerce("abc", "void")
+
+
+def test_read_coerce_still_accepts_string():
+    assert read_coerce("abc", "string") == "abc"
+
+
+# =====================================================================================
+# Item 19: a BooleanType read must not turn the string "false" into True
+#
+# bool("false") is True, so an ES field storing the STRING "false" (common when reading an index
+# the connector did not write) silently inverts. Proven live: Row(doc_id='b1', flag=True).
+# Mirrors the write side's _is_delete_flagged, which already refuses to guess.
+# =====================================================================================
+
+def test_read_coerce_boolean_parses_false_strings():
+    for s in ("false", "False", "FALSE", "f", "0", "no", "n"):
+        assert read_coerce(s, "boolean") is False, f"{s!r} must read as False"
+
+
+def test_read_coerce_boolean_parses_true_strings():
+    for s in ("true", "True", "t", "1", "yes", "y"):
+        assert read_coerce(s, "boolean") is True, f"{s!r} must read as True"
+
+
+def test_read_coerce_boolean_rejects_ambiguous_strings():
+    # 'maybe'/'2'/'on' read as truthy to bool() but mean nothing definite. Raise instead of guess.
+    for s in ("maybe", "2", "on", "enabled", "-1"):
+        with pytest.raises(ReadSchemaMismatch):
+            read_coerce(s, "boolean")
+
+
+def test_read_coerce_boolean_keeps_real_booleans_and_numbers():
+    assert read_coerce(True, "boolean") is True
+    assert read_coerce(False, "boolean") is False
+    assert read_coerce(1, "boolean") is True
+    assert read_coerce(0, "boolean") is False
+
+
+# =====================================================================================
+# Item 20: a NEGATIVE unaccounted must be SURFACED, but must not fail the write
+#
+# unaccounted = total_input - (written+deleted+errors+ignored). A negative value means more outcomes
+# than inputs: structurally impossible, so it would be a counting bug in THIS library rather than
+# anything wrong with the caller's data. Two wrong answers here:
+#   - silence (the pre-fix behavior): a broken accounting identity reconciles clean and nobody knows.
+#   - raising: fails a healthy write, and on the streaming path that is an infinite retry loop on a
+#     batch that can never pass, escapable only via on_error="log", which also switches off real
+#     loss detection. test_negative_unaccounted_does_not_raise pins that it must not raise.
+# So it logs at ERROR and lets the write stand.
+# =====================================================================================
+
+def test_negative_unaccounted_is_logged_not_raised(caplog):
+    result = {"written": 12, "deleted": 0, "errors": 0, "ignored": 0, "total_input": 10,
+              "unaccounted": -2, "error_samples": []}
+    with caplog.at_level("ERROR", logger="databricks_es_connector.bulk"):
+        assert reconcile_or_raise(result, index="my-index") is result   # returns clean, no raise
+    assert caplog.records, "an impossible count must not pass in total silence"
+    msg = caplog.records[0].getMessage()
+    assert "my-index" in msg and "impossible" in msg
+    assert "accounting bug" in msg      # tells the user it is our bug, not their data
+
+
+def test_merge_then_reconcile_surfaces_impossible_counts(caplog):
+    rows = [{"written": 12, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+             "total_input": 10, "error_samples": "[]"}]
+    merged = _merge_partition_results(rows)
+    assert merged["unaccounted"] == -2
+    with caplog.at_level("ERROR", logger="databricks_es_connector.bulk"):
+        reconcile_or_raise(merged, index="i")
+    assert caplog.records
+
+
+def test_positive_unaccounted_still_raises():
+    # The guard-rail for the above: loosening the negative case must not weaken real loss detection.
+    result = {"written": 7, "deleted": 0, "errors": 0, "ignored": 0, "total_input": 10,
+              "unaccounted": 3, "error_samples": []}
+    with pytest.raises(EsWriteError, match="unaccounted"):
+        reconcile_or_raise(result, index="i")
+
+
+# =====================================================================================
+# Item 21: to_es_source's `id_field` parameter was accepted but had NO effect (dead parameter)
+# =====================================================================================
+
+def test_to_es_source_has_no_dead_id_field_parameter():
+    import databricks_es_connector.transform as tmod
+    params = inspect.signature(tmod.to_es_source).parameters
+    assert "id_field" not in params, (
+        "to_es_source accepted id_field but ignored it entirely; a public parameter that lies is "
+        "worse than no parameter")

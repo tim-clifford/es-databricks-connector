@@ -1,6 +1,6 @@
 """Read an Elasticsearch index into a Spark DataFrame.
 
-One entry point, `read_index`, requiring an explicit Spark `StructType` (v0.4.0 does no mapping
+One entry point, `read_index`, requiring an explicit Spark `StructType` (there is no mapping
 inference: several write transforms are one-way and can't be inverted from `_source` without the
 declared type; see the README "Reading from Elasticsearch" section for the ambiguity rationale). It
 uses the coercion oracle `read_transform.read_coerce` to invert the write transforms per declared
@@ -148,7 +148,7 @@ def _validate(cfg: EsReadConfig, schema) -> None:
     # unit-testable without pyspark. A wrong type has no truthy `.fields` and hits the error; a real
     # StructType passes.
     if not getattr(schema, "fields", None):
-        raise ValueError("read_index requires a non-empty Spark StructType schema (v0.4.0 has no "
+        raise ValueError("read_index requires a non-empty Spark StructType schema (there is no "
                          "mapping inference, declare the schema explicitly)")
     if not cfg.index:
         raise ValueError("EsReadConfig.index is required to read")

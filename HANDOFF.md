@@ -93,7 +93,10 @@ Hardening still needed before production for SIEM/audit data:
   on the indexed value rather than on a `read_index` round-trip.
 - **Updates & deletes.** Inserts/upserts via deterministic `_id`, and deletes via `has_deletes` +
   `delete_flag_column` (emitting delete-by-`_id` bulk actions with scoped 404 no-op suppression),
-  are supported. The connector deletes exactly the rows the caller flags: it does **not** dedup or
+  are supported. A `delete_flag_column` that is not a column in the DataFrame fails the write before
+  any document is touched, because otherwise no row is flagged and every intended delete is applied
+  as an upsert while the counts still reconcile. The connector deletes exactly the rows the caller
+  flags: it does **not** dedup or
   order Change Data Feed rows itself. That is deliberate: dedup needs the caller's business
   sequencing column and should run distributed in Spark, not in executor memory (see the
   Change-Data-Feed pattern in the README). **Known limitation:** a caller that dedups per

@@ -38,11 +38,14 @@ and the `EsConfig` alias = `EsWriteConfig`), the pure transforms `coerce_value` 
    (at any depth) to an epoch-millis long via `unix_millis`, so the stored epoch is the true UTC
    instant regardless of `spark.sql.session.timeZone`. Runs AFTER sanitize (sanitize strips the
    VARIANT columns that would break `df.schema`).
-3. `_preflight(df, cfg)` (driver-side, once): validates `drop_fields` names against `df.columns` and
+3. `_preflight(df, cfg)` (driver-side, once): validates every config field that NAMES a column
+   (`_COLUMN_NAMING_FIELDS`: `id_field`, `drop_fields`, `delete_flag_column`) against `df.columns` and
    checks the target index exists, so a misspelled name fails closed instead of silently pruning
-   nothing or writing to an auto-created index. Runs after sanitize (`df.columns` is then safe) and
-   before any row is written. Never inside the `mapInPandas` closure, which would put an HTTP
-   round-trip on every executor.
+   nothing, turning every delete into an upsert, or writing to an auto-created index. Runs after
+   sanitize (`df.columns` is then safe) and before any row is written. Never inside the `mapInPandas`
+   closure, which would put an HTTP round-trip on every executor. This is the ONLY layer that can
+   make these checks: below it a row is a dict, and `row.get(name)` cannot distinguish an absent
+   column from one that is present-but-null (which must stay legal).
 4. `df.mapInPandas(writer, ...)` (per-partition, executor-side): each row dict goes through
    `coerce_value` (`transform.py`), the pure-Python value shaper, then `build_action` /
    `to_es_source` build the ES bulk action; `helpers.streaming_bulk` ships it, yielding one result
