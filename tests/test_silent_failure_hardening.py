@@ -274,55 +274,109 @@ def test_no_spurious_retry_warning(kw, recwarn):
     assert [w for w in recwarn if "max_retries_per_doc" in str(w.message)] == []
 
 
-# --- the rename itself (transport_max_retries, 0.6.0) ------------------------------------------
+# --- the two retry layers: umbrella vs granular (0.6.0) ----------------------------------------
+# `max_retries` is a supported convenience that sets EVERY layer at once; the per-layer fields tune
+# them independently. Mixing the two is rejected so the effective count never depends on an invisible
+# precedence rule.
 
 def test_transport_max_retries_reaches_the_client():
-    # Our field was renamed; the elasticsearch-py client kwarg is still `max_retries`.
-    cfg = _cfg(transport_max_retries=7)
-    assert cfg.client_kwargs()["max_retries"] == 7
+    # Our field is `transport_max_retries`; the elasticsearch-py client kwarg is still `max_retries`.
+    assert _cfg(transport_max_retries=7).client_kwargs()["max_retries"] == 7
 
 
-def test_old_max_retries_spelling_still_constructs_with_a_deprecation_warning():
-    # Renaming a public field on a shipped config must not hard-break existing callers.
-    with pytest.warns(DeprecationWarning, match="transport_max_retries"):
-        cfg = _cfg(max_retries=5)
+def test_umbrella_sets_every_layer():
+    cfg = _cfg(max_retries=5)
     assert cfg.transport_max_retries == 5
+    assert cfg.max_retries_per_doc == 5
     assert cfg.client_kwargs()["max_retries"] == 5
 
 
-def test_reading_the_old_attribute_still_works():
-    # Existing code doing `cfg.max_retries` keeps reading the right value.
-    assert _cfg(transport_max_retries=4).max_retries == 4
+def test_umbrella_is_not_a_deprecated_alias():
+    # It is a first-class way to configure retries, so it must NOT warn.
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")     # any warning becomes an exception
+        _cfg(max_retries=5)
 
 
-def test_passing_both_spellings_is_rejected():
-    # Ambiguous intent: refuse rather than silently pick one.
-    with pytest.raises(ValueError, match="only one of"):
-        _cfg(max_retries=1, transport_max_retries=2)
+def test_granular_layers_are_independent():
+    cfg = _cfg(transport_max_retries=5, max_retries_per_doc=2)
+    assert (cfg.transport_max_retries, cfg.max_retries_per_doc) == (5, 2)
 
 
-@pytest.mark.parametrize("cls_kw", [
+@pytest.mark.parametrize("kw", [
+    {"max_retries": 5, "max_retries_per_doc": 2},                             # umbrella + per-doc
+    {"max_retries": 5, "transport_max_retries": 1},                           # umbrella + transport
+    {"max_retries": 5, "transport_max_retries": 1, "max_retries_per_doc": 2},  # umbrella + both
+])
+def test_mixing_umbrella_and_granular_is_rejected(kw):
+    # Accepting both would make the effective value depend on precedence nobody can see at the call
+    # site. The error names the conflicting fields and the equivalent granular form.
+    with pytest.raises(ValueError, match="not both"):
+        _cfg(**kw)
+
+
+def test_mixing_error_names_the_conflicting_field():
+    with pytest.raises(ValueError) as exc:
+        _cfg(max_retries=5, max_retries_per_doc=2)
+    msg = str(exc.value)
+    assert "max_retries_per_doc" in msg and "max_retries=5" in msg
+
+
+def test_reading_max_retries_when_layers_agree():
+    assert _cfg(max_retries=4).max_retries == 4
+    assert _cfg().max_retries == 3                 # both defaults are 3
+
+
+def test_reading_max_retries_is_none_when_layers_differ():
+    # Honest rather than arbitrary: under a granular config there is no single number to report, so
+    # do not pick one of the two and imply it describes both.
+    assert _cfg(transport_max_retries=5, max_retries_per_doc=2).max_retries is None
+
+
+def test_max_retries_is_not_a_stored_field():
+    # It expands into the real fields at construction, so no stored value can drift from the layers.
+    import dataclasses
+    assert "max_retries" not in {f.name for f in dataclasses.fields(_cfg())}
+
+
+@pytest.mark.parametrize("name,extra", [
     ("EsConnection", {}),
     ("EsWriteConfig", {"index": "i"}),
     ("EsReadConfig", {"index": "i"}),
 ])
-def test_deprecated_alias_works_on_every_config_class(cls_kw):
-    # EsConnection is the base, and both subclasses regenerate __init__, so the shim has to be
-    # applied to all three (a subclass would otherwise silently lose it).
+def test_umbrella_works_on_every_config_class(name, extra):
+    # Each subclass regenerates its own __init__, so the umbrella has to be applied to all three or a
+    # subclass silently loses it.
     import databricks_es_connector.config as cfg_mod
-    name, extra = cls_kw
-    cls = getattr(cfg_mod, name)
-    with pytest.warns(DeprecationWarning):
-        obj = cls(hosts="https://h:9200", basic_auth=("u", "p"), **extra, max_retries=9)
+    obj = getattr(cfg_mod, name)(hosts="https://h:9200", basic_auth=("u", "p"), **extra,
+                                 max_retries=9)
     assert obj.transport_max_retries == 9
 
 
-def test_configs_are_still_frozen_dataclasses_after_the_shim():
-    # The alias is applied by wrapping the GENERATED __init__ after @dataclass, so the dataclass
-    # machinery (frozen, fields, defaults) must be intact.
+def test_umbrella_on_read_config_covers_only_the_layers_it_has():
+    # A read has no per-document layer at all (there are no documents being written to retry), so the
+    # umbrella must not invent one, and the conflict message must name only the real field.
+    from databricks_es_connector import EsReadConfig
+    cfg = EsReadConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", max_retries=7)
+    assert cfg.transport_max_retries == 7
+    assert not hasattr(cfg, "max_retries_per_doc")
+    assert cfg.max_retries == 7
+    with pytest.raises(ValueError, match="transport_max_retries"):
+        EsReadConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i",
+                     max_retries=7, transport_max_retries=1)
+
+
+def test_configs_are_still_frozen_dataclasses_after_the_wrapper():
+    # The umbrella wraps the GENERATED __init__ after @dataclass, so the dataclass machinery
+    # (frozen, fields, defaults, pickling) must be intact. Pickling matters: these configs are
+    # captured in closures and shipped to Spark executors.
     import dataclasses
-    cfg = _cfg()
+    import pickle
+    cfg = _cfg(max_retries=6)
     assert dataclasses.is_dataclass(cfg)
+    assert pickle.loads(pickle.dumps(cfg)) == cfg
+    assert isinstance(hash(cfg), int)
     with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.transport_max_retries = 1
 
@@ -330,6 +384,12 @@ def test_configs_are_still_frozen_dataclasses_after_the_shim():
 def test_negative_transport_retries_rejected():
     with pytest.raises(ValueError, match="transport_max_retries"):
         _cfg(transport_max_retries=-1)
+
+
+def test_negative_umbrella_rejected():
+    # The umbrella must not bypass per-layer validation.
+    with pytest.raises(ValueError):
+        _cfg(max_retries=-1)
 
 
 # =====================================================================================

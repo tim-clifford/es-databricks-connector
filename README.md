@@ -409,7 +409,8 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `ca_certs` | `str \| None` | `None` | No | Path to a CA bundle when pinning. Mutually exclusive with `verify_certs=False`. |
 | `http_compress` | `bool` | `True` | No | gzip both directions: compresses the request body on write and asks ES to gzip the response on read (`content-encoding` + `accept-encoding`). The egress-cost lever. |
 | `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
-| `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request** (transport level): a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see the warning below. Renamed from `max_retries` in 0.6.0; the old spelling still constructs with a `DeprecationWarning`. |
+| `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request** (transport level): a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see the two-layer note below. |
+| `max_retries` | `int` | - | No | **Umbrella**: sets every retry layer at once (`transport_max_retries`, plus `max_retries_per_doc` on a write config). A constructor convenience, not a stored field. Passing it *together with* a per-layer field raises. |
 | `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
 > **Two retry layers, because Elasticsearch fails in two places.** A bulk request sends N documents
@@ -431,9 +432,30 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 > cluster rejected this document". Only the second silently loses data, and `transport_max_retries`
 > cannot see it.
 >
-> The config does not rely on you reading this: raising `transport_max_retries` above its default
-> while `max_retries_per_doc=0` emits a `UserWarning`, since that combination is almost never what
-> someone hardening against ES backpressure intends.
+> **Configure them with one knob or two, but not both.**
+>
+> ```python
+> EsWriteConfig(..., max_retries=5)                 # umbrella: 5 at every layer
+> EsWriteConfig(..., transport_max_retries=5,       # granular: tune each layer
+>                    max_retries_per_doc=2)
+> ```
+>
+> `max_retries` expands into the per-layer fields at construction, so there is no stored value that
+> could disagree with them. Passing it *together with* a per-layer field **raises**, rather than
+> resolving by precedence: the effective retry count should never depend on a rule you cannot see at
+> the call site. Reading `cfg.max_retries` gives the shared value when the layers agree and `None`
+> when they were set granularly, since no single number describes that.
+>
+> **One asymmetry before you raise the umbrella.** Per-document retries sleep **blockingly** in the
+> executor with exponential backoff (`elasticsearch-py`: 2s, doubling, capped at 600s), so
+> `max_retries=8` is up to ~8.5 minutes of sleep per partition, while the same value costs the
+> transport layer almost nothing. Use the granular form when you want a high transport count without
+> that stall.
+>
+> The config also warns if you configure the layers granularly such that
+> `transport_max_retries` is raised above its default while `max_retries_per_doc=0`, since that leaves
+> rejected documents with no retries at all and is almost never intended. (The umbrella cannot produce
+> that combination.)
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also

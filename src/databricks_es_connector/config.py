@@ -13,12 +13,44 @@ Three types, sharing one connection base:
 
 `EsConfig` remains as a backward-compatible alias for `EsWriteConfig` (the pre-0.4.0 name), so
 existing write code keeps working; new code should name the read/write config explicitly.
+
+RETRIES: ONE UMBRELLA OR TWO LAYERS
+-----------------------------------
+Elasticsearch can fail a write in two independent places, so there are two retry layers:
+
+  transport_max_retries   a whole HTTP REQUEST failed (connection reset, LB 503, gateway timeout,
+                          or a 429 on the bulk call itself). Re-sends the entire request. Applies to
+                          reads and writes. -> elastic_transport.Transport
+  max_retries_per_doc     ONE DOCUMENT inside a successful request was rejected (429, ES write queue
+                          full). Re-sends only the failed subset. Writes only.
+                          -> elasticsearch.helpers.streaming_bulk
+
+They exist separately because the `_bulk` API answers **HTTP 200 even when documents inside it
+fail**: the per-item statuses live in the response body, which the transport layer never inspects.
+A 429 therefore means different things at each layer, and only the per-document one loses data
+quietly.
+
+Configure them either way, but not both ways at once:
+
+    EsWriteConfig(..., max_retries=5)                 # UMBRELLA: 5 at every layer
+    EsWriteConfig(..., transport_max_retries=5,       # GRANULAR: tune each layer
+                       max_retries_per_doc=2)
+
+`max_retries` is a constructor-level convenience, not a stored field: it expands into the real
+per-layer fields. Passing it together with either per-layer field raises, so the effective retry
+count never depends on an invisible precedence rule. Reading `cfg.max_retries` gives the shared value
+when the layers agree, and `None` when they were set granularly (there is no single number to report).
+
+One asymmetry worth knowing before raising the umbrella: per-document retries sleep BLOCKINGLY in the
+executor with exponential backoff (elasticsearch-py: 2s, doubling, capped at 600s), so
+`max_retries=8` is up to ~8.5 minutes of sleep per partition, while the same value costs the
+transport layer almost nothing. Prefer the granular form when you need a high transport count.
 """
 from __future__ import annotations
 
 import functools
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Optional
 
 
@@ -44,24 +76,14 @@ class EsConnection:
     # load-balancer 503, a gateway timeout, or a 429 on the bulk call itself), and they re-send the
     # ENTIRE request. They do NOT retry an individual rejected document, because the `_bulk` API
     # answers HTTP 200 even when items inside it fail: the per-item statuses live in the response
-    # BODY, which the transport layer never inspects. Per-document retries are a separate knob,
+    # BODY, which the transport layer never inspects. Per-document retries are
     # `EsWriteConfig.max_retries_per_doc`.
     #
-    # Named `transport_max_retries` (renamed from `max_retries` in 0.6.0) precisely because the old
-    # name was one character from `max_retries_per_doc` while meaning something entirely different:
-    # both defaulted to 3, so the pair was indistinguishable at a glance. `max_retries=` is still
-    # accepted with a DeprecationWarning (see __init__ below).
+    # `max_retries` is the UMBRELLA that sets both layers at once (see the module docstring). Leave
+    # this field alone and set `max_retries` for one simple knob; set this one to tune the transport
+    # layer independently. Setting both is rejected, so the effective value is never ambiguous.
     transport_max_retries: int = 3
     retry_on_timeout: bool = True
-
-    @property
-    def max_retries(self) -> int:
-        """Deprecated read alias for `transport_max_retries` (renamed in 0.6.0).
-
-        Kept so existing code that READS cfg.max_retries keeps working. Writing it (passing
-        `max_retries=` to the constructor) is handled by `_accept_deprecated_max_retries` below.
-        """
-        return self.transport_max_retries
 
     def __post_init__(self):
         if not self.hosts:
@@ -137,19 +159,20 @@ class EsWriteConfig(EsConnection):
         super().__post_init__()
         if self.max_retries_per_doc < 0:
             raise ValueError("EsWriteConfig.max_retries_per_doc must be >= 0")
-        # `max_retries` and `max_retries_per_doc` are one character apart and mean different things.
-        # Someone who raises the transport-level knob to harden against ES backpressure has almost
-        # certainly NOT intended to disable per-document retries, which are the ones that actually
-        # cover a 429'd document (the _bulk API returns HTTP 200 even when items inside fail, so the
-        # transport retry cannot see them). Warn rather than raise: the combination is legal, just
-        # very unlikely to be what was meant.
+        # The `max_retries` umbrella cannot produce this combination (it sets both layers to the same
+        # value), so reaching here means the layers were configured GRANULARLY: the transport layer
+        # was hardened while per-document retries were switched off. That is almost certainly not
+        # what someone protecting against ES backpressure intended, because per-document retries are
+        # the only ones that cover a 429'd document (the _bulk API returns HTTP 200 even when items
+        # inside it fail, so the transport retry never sees them). Warn rather than raise: the
+        # combination is legal and might be deliberate, just very unlikely.
         if self.max_retries_per_doc == 0 and self.transport_max_retries > 3:
             warnings.warn(
                 f"transport_max_retries={self.transport_max_retries} is raised above the default but "
                 "max_retries_per_doc=0, so documents Elasticsearch rejects with a 429 get NO "
                 "retries. The _bulk API returns HTTP 200 even when individual items fail, so "
-                "transport-level retries never see them. Set max_retries_per_doc (default 3) if you "
-                "meant to retry rejected documents.",
+                "transport-level retries never see them. Set max_retries_per_doc, or use "
+                "max_retries=<n> to set both layers at once.",
                 UserWarning, stacklevel=3)
         if not self.retry_on_doc_status and self.max_retries_per_doc:
             # Retries requested but no status to retry on would silently never retry.
@@ -202,41 +225,73 @@ class EsReadConfig(EsConnection):
             raise ValueError("EsReadConfig.num_slices must be >= 1 when set")
 
 
-def _accept_deprecated_max_retries(cls):
-    """Let `max_retries=` still construct a config, with a DeprecationWarning.
+# The per-layer fields `max_retries` fans out to. Only the ones a class actually HAS are set, so the
+# umbrella works on EsReadConfig (no per-document layer exists for a read) as well as write configs.
+_RETRY_LAYER_FIELDS = ("transport_max_retries", "max_retries_per_doc")
 
-    `max_retries` was renamed `transport_max_retries` in 0.6.0 because the old name sat one character
-    from `max_retries_per_doc` while meaning something entirely different (whole HTTP request vs one
-    rejected document), and both defaulted to 3, so the pair was indistinguishable at a glance.
 
-    Applied AFTER @dataclass so it wraps the GENERATED __init__: defining __init__ in the class body
-    would make @dataclass skip generating one at all, and there is no `__dataclass_init__` to fall
-    back to (verified). Wrapping keeps field order, defaults and inheritance exactly as generated.
+def _support_max_retries_umbrella(cls):
+    """Give `cls` a `max_retries=` constructor argument that sets EVERY retry layer at once.
+
+    Two ways to configure retries, and you pick one:
+
+      EsWriteConfig(..., max_retries=5)                  # simple: 5 at both layers
+      EsWriteConfig(..., transport_max_retries=5,        # granular: tune each layer
+                         max_retries_per_doc=2)
+
+    Mixing them is REJECTED rather than resolved by precedence. If `max_retries=5` and
+    `max_retries_per_doc=2` were both accepted, the effective per-document value would depend on an
+    ordering rule nobody can see at the call site, which is exactly the class of ambiguity this
+    config keeps trying to eliminate. An error naming both spellings is unmissable.
+
+    `max_retries` is not a dataclass field: it is a pure constructor-level convenience that expands
+    into the real fields. So `cfg.max_retries` is a read-only property (see below) rather than stored
+    state, and there is never a stored value that could disagree with the layers it set.
+
+    Applied AFTER @dataclass so it wraps the GENERATED __init__. Defining __init__ in the class body
+    would make @dataclass skip generating one at all, leaving no `__dataclass_init__` to delegate to
+    (verified). Wrapping keeps field order, defaults, inheritance, pickling and frozen-ness intact.
     """
     original = cls.__init__
+    own_fields = {f.name for f in fields(cls)}
+    layers = tuple(f for f in _RETRY_LAYER_FIELDS if f in own_fields)
 
     @functools.wraps(original)
     def __init__(self, *args, **kwargs):
         if "max_retries" in kwargs:
-            if "transport_max_retries" in kwargs:
+            conflicts = sorted(f for f in layers if f in kwargs)
+            if conflicts:
                 raise ValueError(
-                    "pass only one of transport_max_retries or max_retries (deprecated alias for it)")
-            warnings.warn(
-                f"{cls.__name__}.max_retries was renamed to transport_max_retries in 0.6.0, to "
-                "distinguish it from EsWriteConfig.max_retries_per_doc: this one retries a whole HTTP "
-                "REQUEST, the other retries an individual DOCUMENT that Elasticsearch rejected (the "
-                "_bulk API returns HTTP 200 even when items inside it fail, so the transport retry "
-                "cannot see them). The old name still works but will be removed in a future release.",
-                DeprecationWarning, stacklevel=2)
-            kwargs["transport_max_retries"] = kwargs.pop("max_retries")
+                    f"pass either max_retries (the umbrella, which sets {' and '.join(layers)}) or "
+                    f"the per-layer field(s) {', '.join(conflicts)}, not both. Mixing them would "
+                    "make the effective retry count depend on an invisible precedence rule. "
+                    f"For {cls.__name__}, max_retries={kwargs['max_retries']!r} is equivalent to "
+                    + ", ".join(f"{f}={kwargs['max_retries']!r}" for f in layers) + ".")
+            umbrella = kwargs.pop("max_retries")
+            for f in layers:
+                kwargs[f] = umbrella
         original(self, *args, **kwargs)
 
     cls.__init__ = __init__
+
+    def _max_retries(self):
+        """The umbrella retry setting, if every layer currently agrees; else None.
+
+        Read-only and derived, because `max_retries` is a constructor convenience rather than stored
+        state. It returns None under a granular configuration (the layers differ), which is honest:
+        there is no single number that describes it.
+        """
+        values = {getattr(self, f) for f in layers}
+        return next(iter(values)) if len(values) == 1 else None
+
+    cls.max_retries = property(_max_retries)
     return cls
 
 
+# Order matters only for readability; each class is wrapped independently because each subclass
+# regenerates its own __init__ and would otherwise not have the umbrella at all.
 for _cls in (EsConnection, EsWriteConfig, EsReadConfig):
-    _accept_deprecated_max_retries(_cls)
+    _support_max_retries_umbrella(_cls)
 
 
 # Backward-compatible alias: pre-0.4.0, the (write) config was named EsConfig. Keep it working so
