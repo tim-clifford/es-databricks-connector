@@ -21,12 +21,26 @@ behavior; the test tier deserves the same treatment.
 
 A count that only looks stable because two errors cancel is what a gate catches and a reviewer does
 not. Per the connector skill's rule that a mechanizable check belongs in `scripts/` rather than in a
-checklist someone can skip, this enforces two invariants on the newest tier results:
+checklist someone can skip, this enforces three invariants on the newest tier results:
 
   1. **No fixture reported zero tests.** A zero-test fixture is a skipped fixture, never a pass.
-  2. **Every fixture's reported test count matches the number of `test_*` methods in its source.**
-     This is the stronger check: it catches a fixture that ran only PART of its tests, and it
-     catches the `all_tests` collapse (1 reported vs N in source) that hides a setup failure.
+  2. **Every `test_*` method in a fixture's source is present in that fixture's results, BY NAME.**
+     Names, not counts: a count comparison cannot tell "ran 12 of 13" from "ran 13, one of which
+     was parametrized into two" (see below), and it silently accepts one test disappearing while
+     another is added. Matching names catches the `all_tests` collapse, a partial run, and a
+     renamed-but-never-wired test, and it says exactly which test is missing.
+  3. **Nothing that did not actually assert is counted as coverage.** `skipped` results are
+     reported by `dbx_test` as ordinary entries, so a `@pytest.mark.skip` added to a fixture keeps
+     every count matching while that test verifies nothing. A skipped test is therefore reported as
+     missing. `xfailed` is listed separately as a warning: it ran, but it proves a known-broken path
+     rather than a working one.
+
+Why names rather than counts (learned the hard way, in review of the commit that added this file):
+`dbx_test` supports `@pytest.mark.parametrize` and expands ONE source method into N reported results
+named `test_thing[1]`, `test_thing[2]`, ... A strict count check therefore FAILS on a perfectly
+healthy parametrized fixture, which would have blocked a release with a message accusing the fixture
+of never running. Reported names are matched back to their source method by stripping the `[...]`
+suffix, so a parametrized method is satisfied by any of its expansions.
 
 Also fails when it finds no results at all, or no fixtures inside them, so a moved directory or an
 empty run cannot make the gate vacuous.
@@ -58,77 +72,124 @@ def newest_results() -> Path:
     return candidates[-1]
 
 
-def source_test_counts() -> dict[str, int]:
-    """{fixture module stem: number of test_* methods declared in it}.
+def _display(path: Path) -> str:
+    """Repo-relative when possible, absolute otherwise (a --results path may be outside the repo)."""
+    return str(path.relative_to(ROOT) if path.is_relative_to(ROOT) else path)
+
+
+def source_test_names() -> dict[str, set[str]]:
+    """{fixture module stem: {names of test_* methods declared in it}}.
 
     Parsed with `ast` rather than imported: these are Databricks notebooks whose top level calls
     `dbutils`, so importing them off-cluster is impossible.
+
+    Every class in the file is walked, not just the `NotebookTestFixture` subclass, so a test living
+    on a shared base class still counts. Names are collected into a SET, which is also what makes an
+    inherited method counted once no matter how many classes expose it.
     """
-    counts: dict[str, int] = {}
+    names: dict[str, set[str]] = {}
     for path in sorted(FIXTURE_DIR.glob("test_*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
-        n = 0
+        found: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef):
-                n += sum(1 for item in node.body
-                         if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                         and item.name.startswith("test_"))
-        counts[path.stem] = n
-    return counts
+                found.update(item.name for item in node.body
+                             if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                             and item.name.startswith("test_"))
+        names[path.stem] = found
+    return names
 
 
-def reported_counts(results: dict) -> dict[str, list[str]]:
-    """{fixture stem: [reported test names]} from a results.json."""
-    by_fixture: dict[str, list[str]] = {}
+# `dbx_test` reports a test as `Class.method`, and a parametrized method as `Class.method[param]`.
+# Strip both decorations to recover the source method name.
+_REPORTED_NAME_RE = re.compile(r"^(?:.*\.)?(?P<method>[A-Za-z_]\w*)(?:\[.*\])?$")
+
+# Statuses that mean "this test did not assert anything about working behavior". `skipped` is the
+# dangerous one: it is reported as an ordinary entry, so a @pytest.mark.skip keeps every count
+# matching while the test verifies nothing.
+_NON_COVERING = {"skipped"}
+
+
+def _source_method(reported_name: str) -> str:
+    """`TestX.test_a[2]` -> `test_a`. Returns the input unchanged if it does not parse."""
+    m = _REPORTED_NAME_RE.match(reported_name.strip())
+    return m.group("method") if m else reported_name
+
+
+def reported_by_fixture(results: dict) -> dict[str, list[dict]]:
+    """{fixture stem: [raw test entries]} from a results.json."""
+    by_fixture: dict[str, list[dict]] = {}
     for test in results.get("tests", []):
         # `notebook` is a workspace path; the stem is the fixture module name.
         stem = re.sub(r"\.py$", "", (test.get("notebook") or "").rstrip("/").split("/")[-1])
-        by_fixture.setdefault(stem, []).append(test.get("test_name") or "<unnamed>")
+        by_fixture.setdefault(stem, []).append(test)
     return by_fixture
 
 
-def check(results_path: Path) -> list[str]:
+def check(results_path: Path) -> tuple[list[str], list[str], int]:
+    """Return (problems, warnings, tests_counted). Empty `problems` means the gate passes."""
     problems: list[str] = []
+    warnings: list[str] = []
     results = json.loads(results_path.read_text())
-    reported = reported_counts(results)
-    expected = source_test_counts()
+    reported = reported_by_fixture(results)
+    expected = source_test_names()
+    shown = _display(results_path)
 
     if not reported:
-        return [f"{results_path.relative_to(ROOT)} contains no test entries at all, so this check "
-                "would verify nothing"]
+        return ([f"{shown} contains no test entries at all, so this check would verify nothing"],
+                warnings, 0)
     if not expected:
-        return [f"no test_*.py fixtures found under {FIXTURE_DIR.relative_to(ROOT)}, so this check "
-                "would verify nothing"]
+        return ([f"no test_*.py fixtures found under {FIXTURE_DIR.relative_to(ROOT)}, so this check "
+                 "would verify nothing"], warnings, 0)
 
-    for stem, names in sorted(reported.items()):
-        got = len(names)
+    counted = 0
+    for stem, entries in sorted(reported.items()):
         # 1. zero tests, or the single opaque entry dbx_test emits when setup failed
-        if got == 0:
+        if not entries:
             problems.append(f"{stem}: reported ZERO tests -- a skipped fixture is not a pass")
             continue
-        if names == ["all_tests"]:
-            want = expected.get(stem)
+        if [e.get("test_name") for e in entries] == ["all_tests"]:
+            want = len(expected.get(stem, ()))
             detail = f" ({want} test_* methods in source)" if want else ""
             problems.append(
                 f"{stem}: reported a single opaque 'all_tests' entry{detail}. Either run_setup "
                 "failed (dbx_test reports that as zero tests, which reads as success) or the "
                 "fixture does not end with dbutils.notebook.exit(json.dumps(run_notebook_tests()))")
             continue
-        # 2. partial runs: fewer (or more) reported than the source declares
         if stem not in expected:
-            problems.append(f"{stem}: reported {got} test(s) but there is no "
+            problems.append(f"{stem}: reported {len(entries)} test(s) but there is no "
                             f"integration_tests/{stem}.py to compare against")
-        elif got != expected[stem]:
-            problems.append(f"{stem}: reported {got} test(s) but {expected[stem]} test_* method(s) "
-                            f"are declared in integration_tests/{stem}.py")
+            continue
+
+        # 2. every source method must appear by name, and must have actually asserted something.
+        covered: set[str] = set()
+        for entry in entries:
+            name = entry.get("test_name") or ""
+            status = (entry.get("status") or "").lower()
+            method = _source_method(name)
+            if status in _NON_COVERING:
+                # Reported, but it asserted nothing. Left OUT of `covered` so it surfaces below as
+                # missing rather than silently satisfying the name match.
+                warnings.append(f"{stem}.{name}: reported as {status!r}, which is not coverage")
+                continue
+            if status == "xfailed":
+                # It ran, but it pins a known-broken path rather than a working one. Counted as
+                # covered (the method did execute) and flagged so it cannot hide.
+                warnings.append(f"{stem}.{name}: xfailed (a known-broken path, not a working one)")
+            covered.add(method)
+            counted += 1
+
+        for missing in sorted(expected[stem] - covered):
+            problems.append(f"{stem}: source declares {missing}() but no passing result reports it "
+                            f"-- it did not run, was renamed without being wired up, or was skipped")
 
     # A fixture that exists in source but is missing from the results entirely: it never ran, and
     # nothing in the summary would say so.
     for stem, want in sorted(expected.items()):
         if want and stem not in reported:
-            problems.append(f"{stem}: {want} test(s) in source but the fixture is ABSENT from the "
-                            "results -- it never ran")
-    return problems
+            problems.append(f"{stem}: {len(want)} test(s) in source but the fixture is ABSENT from "
+                            "the results -- it never ran")
+    return problems, warnings, counted
 
 
 def main() -> int:
@@ -138,9 +199,11 @@ def main() -> int:
     args = ap.parse_args()
 
     results_path = args.results or newest_results()
-    problems = check(results_path)
+    problems, warnings, counted = check(results_path)
 
-    print(f"tier results: {results_path.relative_to(ROOT) if results_path.is_relative_to(ROOT) else results_path}")
+    print(f"tier results: {_display(results_path)}")
+    for w in warnings:
+        print(f"  ! {w}")
     if problems:
         print(f"\n{len(problems)} problem(s) -- the tier did not run what it claims to cover:")
         for p in problems:
@@ -148,8 +211,7 @@ def main() -> int:
         print("\nA fixture whose setup fails reports 0 tests, 0 failures, which prints as a PASS. "
               "Fix the fixture and re-run the tier; do not release on these results.")
         return 1
-    total = sum(len(v) for v in reported_counts(json.loads(results_path.read_text())).values())
-    print(f"OK: every fixture ran, and each one's count matches its source ({total} tests).")
+    print(f"OK: every test_* method in every fixture ran and passed ({counted} results).")
     return 0
 
 
