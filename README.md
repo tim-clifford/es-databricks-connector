@@ -403,30 +403,16 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `ca_certs` | `str \| None` | `None` | No | Path to a CA bundle when pinning. Mutually exclusive with `verify_certs=False`. |
 | `http_compress` | `bool` | `True` | No | gzip both directions: compresses the request body on write and asks ES to gzip the response on read (`content-encoding` + `accept-encoding`). The egress-cost lever. |
 | `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
-| `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request** (transport level): a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see the two-layer note below. |
-| `max_retries` | `int` | - | No | Shorthand that sets **every** retry level at once: `transport_max_retries`, plus [`max_retries_per_doc`](#write-behavior-eswriteconfig) on a write config. Cannot be combined with either of those (raises). Reading `cfg.max_retries` back gives the shared number, or `None` if the levels were set to different values. |
-| `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
+| `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request**: a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see [Retries on a write](#retries-on-a-write-two-layers). |
+| `max_retries` | `int` | - | No | Shorthand that sets **both** retry levels at once: `transport_max_retries` and [`max_retries_per_doc`](#write-behavior-eswriteconfig). Cannot be combined with either of those (raises). Reading `cfg.max_retries` back gives the shared number, or `None` if the levels were set to different values. |
+| `retry_on_timeout` | `bool` | `True` | No | Whether a **timed-out** request is retried. Narrower than it sounds: connection errors and the `retry_on_status` codes are retried regardless, so setting this `False` only stops retries on timeouts. It is separate because a timeout is ambiguous, the write may have been applied and only the response lost, so replaying it is a judgment call. To disable transport retries entirely, use `transport_max_retries=0`. |
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
 raises (pick one).
 
-**Retries: `max_retries` is the simple knob.** A write actually retries at two levels (see
-[Retries on a write](#retries-on-a-write-two-layers)). `max_retries=N` sets both to `N`, so you don't
-have to know that:
-
-```python
-EsWriteConfig(..., max_retries=5)                 # 5 retries at every level
-```
-
-To set the levels differently, name them individually instead:
-
-```python
-EsWriteConfig(..., transport_max_retries=5, max_retries_per_doc=2)
-```
-
-Use one style or the other. Combining `max_retries` with either individual field raises, so the
-effective value is never in doubt.
+Retries have two levels on a write, and `max_retries=N` sets both at once. See
+[Retries on a write](#retries-on-a-write-two-layers).
 
 ### Write behavior (`EsWriteConfig`)
 
@@ -438,7 +424,7 @@ effective value is never in doubt.
 | `id_field` | `str \| None` | `None` | No | Column used as the deterministic `_id` → idempotent upserts. If unset, ES assigns random IDs (replays duplicate). If set, the column must be non-null in every row. |
 | `chunk_size` | `int` | `500` | No | Docs per bulk request. |
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
-| `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses are worth retrying. `429` = ES write queue full. Empty with a non-zero `max_retries_per_doc` raises. |
+| `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses to retry. `429` is ES's write queue being full, the one reliably transient case. Adding `503` (a shard briefly unavailable, e.g. during relocation) is the main sensible extension: `retry_on_doc_status=(429, 503)`. Do **not** add deterministic statuses like `400` (malformed doc) or `409` (version conflict): the retry fails identically and only delays the real error. Empty with a non-zero `max_retries_per_doc` raises. |
 | `require_existing_index` | `bool` | `True` | No | Verify the index exists before writing. ES auto-creates a missing index, so a **typo'd index name** otherwise produces a brand-new dynamically-mapped index and a perfect-looking `written` count. One `indices.exists` call on the driver. Set `False` to allow auto-creation (e.g. with an index template). |
 
 #### Retries on a write: two layers
@@ -447,9 +433,9 @@ A bulk request sends N documents in one HTTP call, and ES answers with a **singl
 per-item status in the response *body*. "The request succeeded" and "the documents succeeded" are
 therefore different questions, so a write has two retry layers:
 
-| | `transport_max_retries` | `max_retries_per_doc` |
+| | [`transport_max_retries`](#connection-shared-by-both-configs) | [`max_retries_per_doc`](#write-behavior-eswriteconfig) |
 |---|---|---|
-| Defined on | `EsConnection` ([above](#connection-shared-by-both-configs)) | `EsWriteConfig` (the table above) |
+| Defined on | `EsConnection` | `EsWriteConfig` |
 | Default | `3` | `3` |
 | Retries on | `429, 502, 503, 504` (whole request) | `429` (per item, via `retry_on_doc_status`) |
 | Retry unit | The entire request, all N documents | Only the failed subset |
@@ -460,6 +446,16 @@ cluster rejected this document". `transport_max_retries` cannot see the second o
 per-item statuses live in a response body the transport layer never reads. That is why
 `max_retries_per_doc` exists, and why leaving it at `0` while raising `transport_max_retries` warns:
 rejected documents would get no retries at all.
+
+**Setting them.** `max_retries=N` is shorthand for both levels at once:
+
+```python
+EsWriteConfig(..., max_retries=5)                                  # 5 at both levels
+EsWriteConfig(..., transport_max_retries=5, max_retries_per_doc=2)  # or set each
+```
+
+Use one style or the other; combining `max_retries` with either individual field raises, so the
+effective value is never in doubt.
 
 **Keep `max_retries_per_doc` low.** Each per-document retry sleeps in the executor with exponential
 backoff (2s, doubling, capped at 600s), so `8` can stall a partition for ~8.5 minutes. The transport
