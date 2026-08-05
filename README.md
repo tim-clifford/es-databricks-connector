@@ -499,8 +499,7 @@ cross-batch ordering caveat.
 
 ### Read behavior (`EsReadConfig`)
 
-`EsReadConfig` = the connection fields above **plus** these read-specific fields. (No retry fields
-here: a read only has the transport level, set via the connection fields.)
+`EsReadConfig` = the connection fields above **plus** these read-specific fields.
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
