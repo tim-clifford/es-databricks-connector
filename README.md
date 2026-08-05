@@ -144,36 +144,29 @@ Notes for serverless:
 #### A failed micro-batch fails the stream (`on_error`, default `"raise"`)
 
 Structured Streaming commits a micro-batch's checkpoint offset when `foreachBatch` **returns
-normally**. It has no visibility into what happened to the documents inside. So a helper that
-swallowed a failed write would let a batch in which Elasticsearch rejected *every* document be
-recorded as a success: the offset advances past those rows and **they are never retried**. That is
-silent, permanent data loss with a green job in the UI and nothing to alert on. (This was the
-behavior before 0.6.0.)
+normally**, with no visibility into what happened to the documents inside. So a helper that returned
+after a failed write would advance the offset past the rejected rows and they would never be
+retried: silent, permanent loss behind a green job.
 
 `make_foreach_batch` therefore **raises `EsWriteError` by default**, failing the batch so Spark
-retries it and the checkpoint does not advance. With `id_field` set, that retry is an idempotent
-upsert rather than a duplicate, which is exactly why deterministic IDs matter here.
+retries it and the checkpoint holds. With `id_field` set, that retry is an idempotent upsert rather
+than a duplicate.
 
 ```python
-fb = make_foreach_batch(cfg)                      # default: raise, checkpoint holds
+fb = make_foreach_batch(cfg)                      # raise, checkpoint holds
 fb = make_foreach_batch(cfg, on_error="log")      # warn, checkpoint ADVANCES (rows not retried)
-fb = make_foreach_batch(cfg, on_error="ignore")   # pre-0.6.0 behavior: silent loss
+fb = make_foreach_batch(cfg, on_error="ignore")   # same, silently
 ```
 
-A write counts as failed when `errors > 0` (ES rejected documents) **or** `unaccounted > 0` (rows
-lost below the per-document level). Expected delete-404 no-ops (`ignored`) are not failures, so a
-CDF replay that deletes already-absent docs does not trip it. `on_batch` runs *before* the policy is
-applied, so a metrics or dead-letter hook still observes the failing batch.
+A write counts as failed when `errors > 0` (ES rejected documents) or `unaccounted > 0` (rows lost
+below the per-document level). Delete-404 no-ops (`ignored`) are not failures, so a CDF replay that
+deletes already-absent docs does not trip it. `on_batch` runs *before* the policy, so a metrics or
+dead-letter hook still sees the failing batch.
 
-> **Which failures were already loud, and what "not raising" actually meant.** `ConnectionError`,
-> `ConnectionTimeout` and `SerializationError` are **not** `ApiError` subclasses, so the connector's
-> `raise_on_exception=False` never suppressed them: a network failure has always propagated, failed
-> the Spark task, and been retried. What the pre-0.6.0 path did with a per-document *rejection* was
-> narrower than "hide it": the count was always returned in the result dict, so the information was
-> there. It simply was not **enforced** — nothing acted on it unless the caller wrote the check, and
-> a caller who only logged it got a green batch. So the gap was an unenforced signal, not a hidden
-> one. Worth knowing when triaging: the failure mode that sounds most alarming (the network) was
-> always the safe one.
+> **Triage note.** `ConnectionError`, `ConnectionTimeout` and `SerializationError` are not `ApiError`
+> subclasses, so the connector's `raise_on_exception=False` does not suppress them: a network failure
+> propagates, fails the Spark task, and is retried by Spark. Only per-document rejections are returned
+> as counts, which is what the `on_error` policy acts on.
 
 ### Deletes
 
@@ -341,21 +334,21 @@ declare the schema explicitly. (ES also has no array type: a field declared `arr
 list even if ES returned a scalar.)
 
 **A declared type that doesn't fit the stored value raises `ReadSchemaMismatch`** rather than
-coercing. Every available fallback produced plausible-looking *wrong* data, which is worse than an
-error because nothing downstream can detect it:
+coercing, because every coercion here yields plausible-looking wrong data that nothing downstream can
+detect:
 
-| Stored in ES | Declared | Before 0.6.0 | Now |
-|---|---|---|---|
-| `["prod", "urgent"]` | `string` | the literal string `"['prod', 'urgent']"` | raises, tells you to declare `array<string>` |
-| `{"k": 1}` | `string` | the literal string `"{'k': 1}"` | raises, tells you to declare a `struct` |
-| `3.7` | `int` | `3` (silently truncated) | raises |
-| `3.0` | `int` | `3` | `3` (exact, still allowed) |
+| Stored in ES | Declared | Result |
+|---|---|---|
+| `["prod", "urgent"]` | `string` | raises: declare `array<string>` |
+| `{"k": 1}` | `string` | raises: declare a matching `struct` |
+| `3.7` | `int` | raises: lossy |
+| `3.0` | `int` | `3` (exact, allowed) |
 
-The multi-value case is the one to watch: **ES has no array type**, so *any* field can hold multiple
-values under the very same mapping, and nothing in `GET /_mapping` reveals which fields do. If a
-field is multi-valued anywhere, declare it `array<T>` (a single stored scalar still reads back as a
-one-element list, which is the documented behavior). Only *lossy* numeric conversions are rejected:
-an integral float like `3.0` arriving for an `int` column is normal, since JSON has one number type.
+Watch the multi-value case: **ES has no array type**, so any field can hold multiple values under the
+same mapping and `GET /_mapping` will not tell you which do. Declare `array<T>` wherever
+multi-values are possible; a single stored scalar still reads back as a one-element list. Only lossy
+numeric conversions are rejected, since JSON has one number type and an integral float arriving for an
+`int` column is normal.
 
 > **Dynamic-mapping gotcha:** if you don't pre-create an index mapping, ES infers each field's type
 > from the **first** document it sees and keeps it. A later doc whose value doesn't fit is silently
@@ -367,17 +360,13 @@ an integral float like `3.0` arriving for an `int` column is normal, since JSON 
 > long-string fields, pre-create an explicit mapping. (Same root cause as the `term`/`.keyword`
 > gotcha above.)
 
-> **Do not use a `read_index` round-trip as your mapping verification.** This follows directly from
-> the note above, and it is easy to get backwards. Because reads come from `_source` and `_source` is
-> a verbatim copy of what you sent, a write-then-read-back comparison **cannot fail** for a mapping
-> mismatch: it compares your data against a copy of your own data. Verified against a live 8.19
-> cluster: with `amount` dynamically mapped as `long` from a first document, writing `100.75` gives
-> `written=1, errors=0`, the round-trip returns `100.75`, and yet the *indexed* value is `100`, so
-> `range: {amount: {gt: 100.5}}` finds **zero** documents. Everything you can observe is green while
-> the customer's queries are wrong. To actually verify a mapping, read the **indexed** value: a
-> search with `"fields": ["amount"]`, or an aggregation, or just `GET /<index>/_mapping` compared
-> against the schema you intended. `read_index` verifies transport and transform fidelity, not
-> mapping correctness.
+> **A `read_index` round-trip cannot verify a mapping.** Follows from the note above: reads come from
+> `_source`, which is a verbatim copy of what you sent, so a write-then-read-back comparison compares
+> your data against a copy of itself and **cannot fail** on a mapping mismatch. With `amount`
+> dynamically mapped `long`, writing `100.75` gives `errors=0` and round-trips as `100.75` while the
+> indexed value is `100` and `range: {amount: {gt: 100.5}}` finds nothing. To verify a mapping, read
+> the **indexed** value: a search with `"fields": [...]`, an aggregation, or `GET /<index>/_mapping`
+> compared against the schema you intended.
 
 ## Configuration
 
@@ -392,8 +381,13 @@ the driver. Each one takes the same **connection fields** (hosts, auth, TLS, cli
 fields specific to its direction. So a config is `connection + write behavior` or
 `connection + read behavior`; the three tables below split exactly along that line.
 
-> **`EsConfig` is a backward-compatible alias for `EsWriteConfig`** (its name before the config
-> split), so existing write code keeps working unchanged. New code should use `EsWriteConfig`.
+> **`EsConfig` is an alias for `EsWriteConfig`**, so code using the older name keeps working. New
+> code should use `EsWriteConfig`.
+
+The package also exports the pure value transforms for direct use or testing: `coerce_value` and
+`to_es_source` (Spark value → ES `_source`), `read_coerce` (the declared-type inverse), and
+`sanitize_for_arrow` (Spark-side, called automatically by `bulk_write`). Plus `reconcile_or_raise` and
+the exceptions `EsWriteError`, `AmbiguousDeleteFlag`, `ReadSchemaMismatch`.
 
 ### Connection (shared by both configs)
 
@@ -413,49 +407,41 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `max_retries` | `int` | - | No | **Umbrella**: sets every retry layer at once (`transport_max_retries`, plus `max_retries_per_doc` on a write config). A constructor convenience, not a stored field. Passing it *together with* a per-layer field raises. |
 | `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
-> **Two retry layers, because Elasticsearch fails in two places.** A bulk request sends N documents
-> in one HTTP call; ES processes each independently and answers with a **single HTTP 200** plus a
-> per-item status in the response *body*. So "the request succeeded" and "the documents succeeded"
-> are different questions, and each needs its own retry:
->
-> | | `transport_max_retries` (`EsConnection`) | `max_retries_per_doc` (`EsWriteConfig`) |
-> |---|---|---|
-> | **Default** | `3` | `3` (the `elasticsearch-py` default is **0**) |
-> | **Layer** | HTTP transport | Bulk response body |
-> | **Retries on** | `429, 502, 503, 504` (whole request) | `429` (per item, via `retry_on_doc_status`) |
-> | **Retry unit** | The entire request, all N documents | Only the failed subset |
-> | **Catches** | ES unreachable, LB 503, gateway timeout, connection reset | A document ES refused because its write queue is full |
-> | **Applies to** | Reads **and** writes | Writes only |
->
-> The overlap is what makes this confusing: a **429 means different things at each layer**. At the
-> transport layer it means "the cluster rejected your request"; in the response body it means "the
-> cluster rejected this document". Only the second silently loses data, and `transport_max_retries`
-> cannot see it.
->
-> **Configure them with one knob or two, but not both.**
->
-> ```python
-> EsWriteConfig(..., max_retries=5)                 # umbrella: 5 at every layer
-> EsWriteConfig(..., transport_max_retries=5,       # granular: tune each layer
->                    max_retries_per_doc=2)
-> ```
->
-> `max_retries` expands into the per-layer fields at construction, so there is no stored value that
-> could disagree with them. Passing it *together with* a per-layer field **raises**, rather than
-> resolving by precedence: the effective retry count should never depend on a rule you cannot see at
-> the call site. Reading `cfg.max_retries` gives the shared value when the layers agree and `None`
-> when they were set granularly, since no single number describes that.
->
-> **One asymmetry before you raise the umbrella.** Per-document retries sleep **blockingly** in the
-> executor with exponential backoff (`elasticsearch-py`: 2s, doubling, capped at 600s), so
-> `max_retries=8` is up to ~8.5 minutes of sleep per partition, while the same value costs the
-> transport layer almost nothing. Use the granular form when you want a high transport count without
-> that stall.
->
-> The config also warns if you configure the layers granularly such that
-> `transport_max_retries` is raised above its default while `max_retries_per_doc=0`, since that leaves
-> rejected documents with no retries at all and is almost never intended. (The umbrella cannot produce
-> that combination.)
+#### Two retry layers
+
+A bulk request sends N documents in one HTTP call, and ES answers with a **single HTTP 200** plus a
+per-item status in the response *body*. "The request succeeded" and "the documents succeeded" are
+therefore different questions, each with its own retry:
+
+| | `transport_max_retries` | `max_retries_per_doc` |
+|---|---|---|
+| Default | `3` | `3` |
+| Retries on | `429, 502, 503, 504` (whole request) | `429` (per item, via `retry_on_doc_status`) |
+| Retry unit | The entire request, all N documents | Only the failed subset |
+| Catches | ES unreachable, LB 503, gateway timeout, connection reset | A document ES refused because its write queue is full |
+| Applies to | Reads and writes | Writes only |
+
+A **429 means different things at each layer**: "the cluster rejected your request" versus "the
+cluster rejected this document". Only the second loses data quietly, and `transport_max_retries`
+cannot see it.
+
+Configure with one knob or two, not both:
+
+```python
+EsWriteConfig(..., max_retries=5)                 # umbrella: 5 at every layer
+EsWriteConfig(..., transport_max_retries=5,       # granular: tune each layer
+                   max_retries_per_doc=2)
+```
+
+`max_retries` expands into the per-layer fields at construction, so no stored value can disagree with
+them. Passing it together with a per-layer field raises rather than resolving by precedence. Reading
+`cfg.max_retries` gives the shared value when the layers agree, `None` when they differ.
+
+Per-document retries sleep **blockingly** in the executor with exponential backoff (2s, doubling,
+capped at 600s), so `max_retries=8` is up to ~8.5 minutes per partition while costing the transport
+layer almost nothing. Use the granular form for a high transport count. Setting
+`transport_max_retries` above its default with `max_retries_per_doc=0` warns, since that leaves
+rejected documents with no retries at all.
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
@@ -485,16 +471,14 @@ raises (pick one).
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
-| `has_deletes` | `bool` | `False` | No | `False` (default) = every row is an index/upsert (historical behavior, unchanged). `True` routes rows whose `delete_flag_column` is truthy to an ES delete-by-`_id`. |
-| `delete_flag_column` | `str \| None` | `None` | when `has_deletes` | Boolean-ish column; a truthy value (`True`/`1`/`"true"`/…) deletes that `_id`. Null/absent = not a delete. The column is pruned from the `_source` of kept rows so it is never indexed. |
+| `has_deletes` | `bool` | `False` | No | `False` = every row is an index/upsert. `True` routes rows whose `delete_flag_column` is truthy to an ES delete-by-`_id`. |
+| `delete_flag_column` | `str \| None` | `None` | when `has_deletes` | Boolean-ish column; a truthy value deletes that `_id`. Null/absent = not a delete. The column is pruned from the `_source` of kept rows so it is never indexed. |
 
-> **Prefer a real boolean for the delete flag.** Strings are parsed against an explicit allow-list in
-> both directions: `"true"/"t"/"1"/"yes"/"y"` delete, `"false"/"f"/"0"/"no"/"n"` (and empty) do not,
-> case-insensitive and whitespace-trimmed. **Anything else raises `AmbiguousDeleteFlag`** rather than
-> defaulting. Values like `"on"`, `"enabled"`, `"delete"`, `"2"` and `"-1"` read as truthy to a human
-> but would previously have meant "keep the document", leaving a doc in Elasticsearch that should
-> have been deleted, with no error and no count. Cast the column with `.cast("boolean")` in Spark and
-> the ambiguity cannot arise.
+> **Prefer a real boolean for the delete flag.** Strings are parsed against an allow-list in both
+> directions, case-insensitive and whitespace-trimmed: `"true"/"t"/"1"/"yes"/"y"` delete,
+> `"false"/"f"/"0"/"no"/"n"` and empty do not. Anything else raises `AmbiguousDeleteFlag` rather than
+> defaulting, since a value like `"on"` or `"2"` reads as truthy to a human but has no defined meaning
+> here. `.cast("boolean")` in Spark avoids the question entirely.
 
 When `has_deletes=True` the constructor requires both `id_field` (you cannot delete without an
 `_id`) and `delete_flag_column`, and raises `ValueError` otherwise. Setting `delete_flag_column`

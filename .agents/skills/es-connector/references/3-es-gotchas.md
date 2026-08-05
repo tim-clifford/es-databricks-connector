@@ -5,24 +5,22 @@ behavior**, not connector bugs, but the connector's design (schema-agnostic writ
 dynamic mapping, no explicit mapping created) makes users hit them, so the connector's docs must
 explain them. Each is verified (live serverless probes and/or Elastic docs), not asserted from memory.
 
-## 1. Timezone: `timestamp` epoch is session-independent (fixed in fidelity-hardening)
+## 1. Timezone: `timestamp` epoch is session-independent
 
-**The bug (present 0.1.0 -> pre-fix):** Spark's Arrow export renders a `TimestampType` instant to a
-naive pandas Timestamp using `spark.sql.session.timeZone`, the session-LOCAL wall-clock with the
-zone dropped. `coerce_value` then reads that naive value as UTC, so under a non-UTC session the
-stored epoch was shifted by the session's offset (e.g. -5h under `America/New_York`). The write was
-RELABELING the wall-clock as UTC, not converting.
+**The hazard:** Spark's Arrow export renders a `TimestampType` instant to a naive pandas Timestamp
+using `spark.sql.session.timeZone`, i.e. the session-LOCAL wall-clock with the zone dropped. Reading
+that naive value as UTC would RELABEL the wall-clock rather than convert it, shifting the stored epoch
+by the session's offset (e.g. -5h under `America/New_York`).
 
-**The fix:** `normalize_timestamps_for_utc` (in `spark_prep.py`) converts every `TimestampType` (at
-any nesting depth) to its true epoch-millis via Spark `unix_millis` **before** the Arrow export.
-`unix_millis` operates on the instant, so it's independent of the session zone. No session mutation.
-Mirrors elasticsearch-hadoop's approach.
+**How the connector avoids it:** `normalize_timestamps_for_utc` (`spark_prep.py`) converts every
+`TimestampType` (at any nesting depth) to its true epoch-millis via Spark `unix_millis` **before** the
+Arrow export. `unix_millis` operates on the instant, so it is independent of the session zone. No
+session mutation. Mirrors elasticsearch-hadoop's approach.
 
-**Why it hid for so long:** a symmetric round-trip under a single UTC session cancels the error on
-both sides. It only surfaces under a NON-UTC session, which is exactly why
+**Why a UTC-only test cannot prove this:** a symmetric round-trip under a single UTC session cancels
+the error on both sides, so it only surfaces under a NON-UTC session. That is why
 `integration_tests/test_timezone_utc.py` and `test_datatype_coverage.py` run under
-`America/New_York`. Lesson: when reasoning about timezones, run real code under a non-UTC session;
-don't trust a UTC-only test.
+`America/New_York`. When reasoning about timezones, run real code under a non-UTC session.
 
 **ES side (verified):** ES stores `date` fields as UTC epoch-millis internally; a numeric epoch is
 taken as the literal UTC instant with no per-index tz shift. Only date STRINGS without an offset get
@@ -58,11 +56,18 @@ Consequences:
 - **Direct ES query: sees the coerced/truncated value.** A `sum` aggregation reads the coerced `long`
   (returns 20, not 20.7, for `10 + 10.7`); a `term` on `.keyword` can't find a string that exceeded
   `ignore_above`. This is the surprise, and it's ES behavior.
+- **A `_source` round-trip therefore cannot verify a mapping.** This is the trap to watch for in
+  review: a write-then-`read_index` comparison compares the data against a verbatim copy of itself, so
+  it passes no matter how wrong the mapping is. Any check claiming to validate a mapping must read the
+  INDEXED value (`"fields": [...]`, an aggregation, or `GET /_mapping`). Verified live: `amount`
+  dynamically mapped `long`, write `100.75` -> `errors=0`, round-trip `100.75`, indexed `100`,
+  `range > 100.5` finds nothing.
 - **Advice:** for heterogeneous-type or long-string fields, pre-create an explicit mapping.
 
 Proven live in `integration_tests/test_dynamic_mapping_coercion.py` (both halves, with the two
 "surprise" assertions being genuinely red-able if ES ever stopped coercing/truncating). Documented in
-the README "Dynamic-mapping gotcha" note.
+the README "Dynamic-mapping gotcha" note. The demos repo carries a shared `es_verify/` helper that
+performs the indexed-value comparison.
 
 ## General principle
 

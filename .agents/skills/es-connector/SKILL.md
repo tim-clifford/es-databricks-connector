@@ -24,9 +24,10 @@ the README explicitly documents as one-way.
 ## Architecture in one screen
 
 **Public API** (`src/databricks_es_connector/__init__.py`): `bulk_write`, `read_index`,
-`make_foreach_batch`, configs (`EsWriteConfig`, `EsReadConfig`, `EsConnection`, and the `EsConfig`
-alias = `EsWriteConfig`), plus the pure transforms `coerce_value` / `read_coerce` / `to_es_source` /
-`sanitize_for_arrow`.
+`make_foreach_batch`, `reconcile_or_raise`, configs (`EsWriteConfig`, `EsReadConfig`, `EsConnection`,
+and the `EsConfig` alias = `EsWriteConfig`), the pure transforms `coerce_value` / `read_coerce` /
+`to_es_source` / `sanitize_for_arrow`, and the exceptions `EsWriteError` / `AmbiguousDeleteFlag` /
+`ReadSchemaMismatch`.
 
 **Write path** (`bulk_write` in `bulk.py`) runs, in order:
 1. `sanitize_for_arrow(df)` (`spark_prep.py`, Spark-side): serializes Arrow-hostile columns
@@ -37,9 +38,17 @@ alias = `EsWriteConfig`), plus the pure transforms `coerce_value` / `read_coerce
    (at any depth) to an epoch-millis long via `unix_millis`, so the stored epoch is the true UTC
    instant regardless of `spark.sql.session.timeZone`. Runs AFTER sanitize (sanitize strips the
    VARIANT columns that would break `df.schema`).
-3. `df.mapInPandas(writer, ...)` (per-partition, executor-side): each row dict goes through
+3. `_preflight(df, cfg)` (driver-side, once): validates `drop_fields` names against `df.columns` and
+   checks the target index exists, so a misspelled name fails closed instead of silently pruning
+   nothing or writing to an auto-created index. Runs after sanitize (`df.columns` is then safe) and
+   before any row is written. Never inside the `mapInPandas` closure, which would put an HTTP
+   round-trip on every executor.
+4. `df.mapInPandas(writer, ...)` (per-partition, executor-side): each row dict goes through
    `coerce_value` (`transform.py`), the pure-Python value shaper, then `build_action` /
-   `to_es_source` build the ES bulk action; `helpers.bulk` ships it.
+   `to_es_source` build the ES bulk action; `helpers.streaming_bulk` ships it, yielding one result
+   per document so each outcome is classified individually (`classify_bulk_result`).
+5. `_merge_partition_results(rows)` sums the per-partition counts and derives `unaccounted`.
+   `raise_on_error=True` then applies `reconcile_or_raise`.
 
 **Read path** (`read_index` in `read.py`): opens a Point-in-Time, fans out
 `spark.range(num_slices).mapInPandas(...)` (pass `num_slices=1` for a single unsliced reader on small
@@ -79,9 +88,10 @@ for the exact checklist and worked examples.
 
 ## Elasticsearch gotchas that generate questions
 
-Timezone (fixed, and why), `term`/`.keyword` on dynamically-mapped strings, and dynamic-mapping
-coercion (`_source` faithful vs. indexed value coerced). These are the recurring customer/reviewer
-questions. See [references/3-es-gotchas.md](references/3-es-gotchas.md).
+Timezone handling, `term`/`.keyword` on dynamically-mapped strings, and dynamic-mapping coercion
+(`_source` faithful vs. indexed value coerced, so a `_source` round-trip cannot verify a mapping).
+These are the recurring customer/reviewer questions. See
+[references/3-es-gotchas.md](references/3-es-gotchas.md).
 
 ## Testing and releasing
 
