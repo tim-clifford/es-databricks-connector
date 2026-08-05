@@ -29,18 +29,18 @@ checklist someone can skip, this enforces three invariants on the newest tier re
      was parametrized into two" (see below), and it silently accepts one test disappearing while
      another is added. Matching names catches the `all_tests` collapse, a partial run, and a
      renamed-but-never-wired test, and it says exactly which test is missing.
-  3. **Nothing that did not actually assert is counted as coverage.** `skipped` results are
-     reported by `dbx_test` as ordinary entries, so a `@pytest.mark.skip` added to a fixture keeps
-     every count matching while that test verifies nothing. A skipped test is therefore reported as
-     missing. `xfailed` is listed separately as a warning: it ran, but it proves a known-broken path
-     rather than a working one.
+  3. **Only a `passed` result counts as coverage**, as an allow-list rather than a deny-list of the
+     bad statuses. `dbx_test` reports `skipped`, `xpassed`, `failed` and `error` as ordinary entries
+     alongside `passed`, so a `@pytest.mark.skip` would otherwise keep every name matching while the
+     test verifies nothing. `xfailed` is allowed but warned: it ran, and it pins a known-broken path
+     rather than a working one. An unrecognized status fails closed.
 
-Why names rather than counts (learned the hard way, in review of the commit that added this file):
-`dbx_test` supports `@pytest.mark.parametrize` and expands ONE source method into N reported results
-named `test_thing[1]`, `test_thing[2]`, ... A strict count check therefore FAILS on a perfectly
-healthy parametrized fixture, which would have blocked a release with a message accusing the fixture
-of never running. Reported names are matched back to their source method by stripping the `[...]`
-suffix, so a parametrized method is satisfied by any of its expansions.
+Names rather than counts, because `dbx_test` supports `@pytest.mark.parametrize` and expands ONE
+source method into N reported results named `test_thing[1]`, `test_thing[2]`, ... A count check
+therefore fails a perfectly healthy parametrized fixture, and it also cannot see one test vanishing
+while another is added, nor say WHICH test is missing. Reported names are matched back to their
+source method by stripping the `Class.` prefix and any `[...]` suffix, so a parametrized method is
+satisfied by any of its expansions.
 
 Also fails when it finds no results at all, or no fixtures inside them, so a moved directory or an
 empty run cannot make the gate vacuous.
@@ -104,10 +104,22 @@ def source_test_names() -> dict[str, set[str]]:
 # Strip both decorations to recover the source method name.
 _REPORTED_NAME_RE = re.compile(r"^(?:.*\.)?(?P<method>[A-Za-z_]\w*)(?:\[.*\])?$")
 
-# Statuses that mean "this test did not assert anything about working behavior". `skipped` is the
-# dangerous one: it is reported as an ordinary entry, so a @pytest.mark.skip keeps every count
-# matching while the test verifies nothing.
-_NON_COVERING = {"skipped"}
+# `dbx_test` emits exactly six statuses (grep `status="` in its testing.py): passed, skipped,
+# xfailed, xpassed, failed, error. Only `passed` is evidence that a test asserted something about
+# working behavior, so coverage is an ALLOW-LIST rather than a deny-list of the bad ones. Written
+# this way on purpose: a deny-list silently admits anything it forgot, which is how an earlier
+# revision of this gate counted `failed` and `error` results as coverage and then printed
+# "ran and passed" over them. An unrecognized status must fail closed, not pass by default.
+#
+#   skipped  the test did not run at all; a @pytest.mark.skip otherwise keeps every name matching
+#            while the test verifies nothing
+#   xfailed  ran, but pins a known-broken path rather than a working one -> allowed, warned
+#   xpassed  an xfail-marked test unexpectedly PASSED, so the "known bug" premise is now wrong and
+#            the marker is stale -> not coverage of the working behavior it claims
+#   failed / error  the test ran and did NOT pass; a green tier summary cannot coexist with these,
+#            so seeing one here means the summary and the per-test results disagree
+_COVERING = {"passed"}
+_ALLOWED_WITH_WARNING = {"xfailed"}
 
 
 def _source_method(reported_name: str) -> str:
@@ -167,21 +179,26 @@ def check(results_path: Path) -> tuple[list[str], list[str], int]:
             name = entry.get("test_name") or ""
             status = (entry.get("status") or "").lower()
             method = _source_method(name)
-            if status in _NON_COVERING:
-                # Reported, but it asserted nothing. Left OUT of `covered` so it surfaces below as
-                # missing rather than silently satisfying the name match.
-                warnings.append(f"{stem}.{name}: reported as {status!r}, which is not coverage")
+            if status in _COVERING:
+                covered.add(method)
+                counted += 1
                 continue
-            if status == "xfailed":
-                # It ran, but it pins a known-broken path rather than a working one. Counted as
-                # covered (the method did execute) and flagged so it cannot hide.
-                warnings.append(f"{stem}.{name}: xfailed (a known-broken path, not a working one)")
-            covered.add(method)
-            counted += 1
+            if status in _ALLOWED_WITH_WARNING:
+                # It ran, so the method is covered, but say so out loud: it pins a known-broken path
+                # rather than a working one.
+                warnings.append(f"{stem}.{name}: {status} (a known-broken path, not a working one)")
+                covered.add(method)
+                counted += 1
+                continue
+            # Anything else (skipped, xpassed, failed, error, or a status this script has never seen)
+            # is NOT coverage. Left out of `covered` so it surfaces below as missing, naming the
+            # status so the reason is unambiguous.
+            problems.append(f"{stem}.{name}: reported as {status!r}, which is not evidence the test "
+                            "asserted anything about working behavior")
 
         for missing in sorted(expected[stem] - covered):
             problems.append(f"{stem}: source declares {missing}() but no passing result reports it "
-                            f"-- it did not run, was renamed without being wired up, or was skipped")
+                            f"-- it did not run, was renamed without being wired up, or did not pass")
 
     # A fixture that exists in source but is missing from the results entirely: it never ran, and
     # nothing in the summary would say so.
