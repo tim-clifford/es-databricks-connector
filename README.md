@@ -404,17 +404,19 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `http_compress` | `bool` | `True` | No | gzip both directions: compresses the request body on write and asks ES to gzip the response on read (`content-encoding` + `accept-encoding`). The egress-cost lever. |
 | `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
 | `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request** (transport level): a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see the two-layer note below. |
-| `max_retries` | `int` | - | No | **Umbrella**: sets every retry layer at once (`transport_max_retries`, plus `max_retries_per_doc` on a write config). A constructor convenience, not a stored field. Passing it *together with* a per-layer field raises. |
+| `max_retries` | `int` | - | No | **Umbrella**: sets every retry layer at once (`transport_max_retries`, plus [`max_retries_per_doc`](#write-behavior-eswriteconfig) on a write config). A constructor convenience, not a stored field. Passing it *together with* a per-layer field raises. |
 | `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
 #### Two retry layers
 
 A bulk request sends N documents in one HTTP call, and ES answers with a **single HTTP 200** plus a
 per-item status in the response *body*. "The request succeeded" and "the documents succeeded" are
-therefore different questions, each with its own retry:
+therefore different questions, each with its own retry. The two knobs live on different configs,
+because only a write has documents to retry:
 
 | | `transport_max_retries` | `max_retries_per_doc` |
 |---|---|---|
+| Defined on | `EsConnection` (the table above) | `EsWriteConfig` ([table below](#write-behavior-eswriteconfig)) |
 | Default | `3` | `3` |
 | Retries on | `429, 502, 503, 504` (whole request) | `429` (per item, via `retry_on_doc_status`) |
 | Retry unit | The entire request, all N documents | Only the failed subset |
