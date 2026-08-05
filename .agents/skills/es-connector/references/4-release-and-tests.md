@@ -57,7 +57,7 @@ dbx_test run \
 (`es-databricks-connector-demos`) has self-validating DAB jobs (`datatype_coverage`,
 `ocsf_schema_validation`) that are a second live check; deploy+run with `databricks bundle`.
 
-## The release gates (`scripts/`, both hard gates in RELEASING.md step 3)
+## The release gates (`scripts/`, all hard gates in RELEASING.md step 3)
 
 - **`scripts/check_requirements_match.py`**, resolves the built wheel's dependency closure in a
   throwaway venv and compares it name+version exact against `requirements.txt` (which pyproject's
@@ -68,10 +68,17 @@ dbx_test run \
   script is referenced by name in the README that should list it (whole-tree invariant; catches the
   drift a diff-scoped review can't). Exit 1 with the gaps. Matching is word-boundary aware
   (`transform.py` is NOT satisfied by `read_transform.py`).
+- **`scripts/check_version_consistency.py`**, asserts `pyproject.toml`'s version matches
+  `__init__.__version__`, `HANDOFF.md`'s header, and every wheel-filename reference in the docs, this
+  skill, and `integration_tests/config/test_config.yml`. That last file is the reason it exists: it
+  pins the wheel the live integration tier INSTALLS, so a stale pin silently validates the previous
+  release while reporting success. Also fails if it matches ZERO wheel references, so a moved file
+  cannot make the gate vacuous.
 
 ```bash
 python scripts/check_requirements_match.py    # exit 0 = match
 python scripts/check_readme_sync.py           # exit 0 = docs enumerate the code
+python scripts/check_version_consistency.py   # exit 0 = every version/wheel reference agrees
 ```
 
 ## Provenance discipline (a trap I have hit)

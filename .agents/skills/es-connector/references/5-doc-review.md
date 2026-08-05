@@ -1,9 +1,9 @@
 # Reference 5: Holistic documentation review
 
 The connector's prose docs describe the code but are **not executable**, so nothing fails when they
-drift. `scripts/check_readme_sync.py` catches one narrow class (a module/fixture/script that no
-README lists), but it cannot catch a stale *description*, a wrong version, or an out-of-date claim.
-This review is the human/agent backstop for the rest.
+drift. Two narrow classes ARE enforced: `scripts/check_readme_sync.py` (a module/fixture/script no
+README lists) and `scripts/check_version_consistency.py` (a stale version or wheel pin). Neither can
+catch a stale *description* or an out-of-date claim. This review is the backstop for the rest.
 
 **When to run it:** as a **pre-change step** at the start of a work session that will modify the repo
 (so you start from docs that match reality, and know what you're changing), AND as part of **code
@@ -42,7 +42,7 @@ Concrete rules:
 |-----|-----------|--------------------------------|
 | `README.md` | public API, datatype tables, config, reading, repo layout, build/release pointer | a datatype's transform changes; a public function/config field is added or renamed; a file is added |
 | `integration_tests/README.md` | each integration fixture's purpose | a fixture is added, removed, or changes what it owns |
-| `RELEASING.md` | the 4-step release process + the two gates | the release flow, gate scripts, FEVM paths, or step order change |
+| `RELEASING.md` | the 4-step release process + the hard gates | the release flow, gate scripts, FEVM paths, or step order change |
 | `HANDOFF.md` | production-readiness / known limitations, pinned to a version | a limitation is closed, a version ships, or a gap changes status (check the version in its header matches `pyproject.toml`) |
 | `.agents/skills/es-connector/SKILL.md` + `references/*` | this skill: architecture, fidelity model, datatype contract, ES gotchas, release | ANY of the above change, because the skill restates them; the skill is the doc most prone to silent drift |
 
@@ -50,9 +50,14 @@ Concrete rules:
 
 Run top to bottom; each item is a concrete "does the doc still match the code" check, not a vibe.
 
-1. **Version consistency.** `pyproject.toml` `[project].version`, `__init__.py` `__version__`, the
-   wheel filename in every `%pip install` line (README + demos), and `HANDOFF.md`'s header version
-   all agree. (HANDOFF has been pinned to an older version before; this catches it.)
+1. **Version consistency: ENFORCED, run the script.** `python scripts/check_version_consistency.py`
+   (exit 0). It compares `pyproject.toml` `[project].version` against `__init__.py` `__version__`,
+   `HANDOFF.md`'s header, and every `databricks_es_connector-<version>-...whl` reference in the
+   docs, the skill, and `integration_tests/config/test_config.yml`. That last one is why this was
+   promoted from a manual check: it pins the wheel the LIVE integration tier *installs*, so a stale
+   pin there means the whole tier validates the PREVIOUS release while reporting success. It sat at
+   0.5.0 while the source was 0.6.0. **The script cannot see the demos repo**, so still eyeball the
+   `%pip install` lines there by hand.
 2. **Public API.** Every name in `__init__.py`'s `__all__` is documented in the README, and the
    README names no function/config field that no longer exists. Config fields
    (`EsWriteConfig`/`EsReadConfig`) match `config.py`.
@@ -100,8 +105,12 @@ catch-up" pass later (that later pass is how drift accumulates in the first plac
 
 ## Why this isn't a script
 
-Item 1 (version consistency) and item 5's presence half are mechanizable (item 5 already is, via
-`check_readme_sync.py`). The rest, "is this description still accurate," is a judgment call that
-needs reading the code, exactly what a script can't do and a review can. If a check here becomes fully mechanical (e.g. version consistency), promote it to
-`scripts/` and cite it from RELEASING.md, don't leave it as a manual step. Keep the deterministic
-parts enforced and the judgment parts reviewed.
+Two items are now scripts: version consistency (`check_version_consistency.py`) and item 5's
+presence half (`check_readme_sync.py`). Everything else, "is this description still accurate," is a
+judgment call that needs reading the code, which is exactly what a script can't do and a review can.
+
+**Keep promoting.** When a check here becomes fully mechanical, move it into `scripts/`, cite it from
+RELEASING.md, and rewrite the checklist item to say "run the script" rather than leaving it as prose
+someone can skip. Both promotions so far were prompted by the check failing in reality first, so
+treat a drift that this checklist *should* have caught as a signal to mechanize it, not just to fix
+the instance.

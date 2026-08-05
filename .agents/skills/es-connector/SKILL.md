@@ -98,16 +98,17 @@ These are the recurring customer/reviewer questions. See
 Two tiers: `tests/` (pure-Python, `pytest`, the fast gate, the transform core is 100% line-covered)
 and `integration_tests/` (live Spark + ES on FEVM serverless via `dbx_test`, the release gate). The
 Spark-side code in `spark_prep.py` can only be proven in the integration tier. Releases follow
-`RELEASING.md` with two hard gate scripts (`scripts/check_requirements_match.py`,
-`scripts/check_readme_sync.py`). See
+`RELEASING.md` with three hard gate scripts (`scripts/check_requirements_match.py`,
+`scripts/check_readme_sync.py`, `scripts/check_version_consistency.py`). See
 [references/4-release-and-tests.md](references/4-release-and-tests.md) for how to run each and the
 exact FEVM commands.
 
 ## Documentation review (pre-change and at review time)
 
 The prose docs (README, `integration_tests/README.md`, `RELEASING.md`, `HANDOFF.md`, and THIS skill)
-are not executable, so nothing fails when they drift; `scripts/check_readme_sync.py` catches only
-missing file listings, not stale descriptions or wrong versions. Run the holistic doc-review
+are not executable, so nothing fails when they drift. Two classes are scripted
+(`check_readme_sync.py` for missing file listings, `check_version_consistency.py` for stale
+versions/wheel pins); stale descriptions and out-of-date claims are not. Run the holistic doc-review
 checklist in [references/5-doc-review.md](references/5-doc-review.md) as a **pre-change step** when
 starting a session that will modify the repo, and as part of **code review** for any PR that changes
 behavior, the public API, datatype handling, the release process, or the file set. The skill itself
