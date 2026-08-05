@@ -24,11 +24,13 @@ not. Per the connector skill's rule that a mechanizable check belongs in `script
 checklist someone can skip, this enforces three invariants on the newest tier results:
 
   1. **No fixture reported zero tests.** A zero-test fixture is a skipped fixture, never a pass.
-  2. **Every `test_*` method in a fixture's source is present in that fixture's results, BY NAME.**
-     Names, not counts: a count comparison cannot tell "ran 12 of 13" from "ran 13, one of which
+  2. **A fixture's reported test names EQUAL its source's `test_*` method names**, in both
+     directions. Names, not counts: a count cannot tell "ran 12 of 13" from "ran 13, one of which
      was parametrized into two" (see below), and it silently accepts one test disappearing while
-     another is added. Matching names catches the `all_tests` collapse, a partial run, and a
-     renamed-but-never-wired test, and it says exactly which test is missing.
+     another is added. Both directions, because either half alone is a false pass: a source method
+     with no result never ran, and a RESULT with no source method means the results describe some
+     other revision of this repo (a stale `results.json`, or a test renamed since), so nothing in
+     them can be trusted about this checkout.
   3. **Only a `passed` result counts as coverage**, as an allow-list rather than a deny-list of the
      bad statuses. `dbx_test` reports `skipped`, `xpassed`, `failed` and `error` as ordinary entries
      alongside `passed`, so a `@pytest.mark.skip` would otherwise keep every name matching while the
@@ -195,8 +197,18 @@ def check(results_path: Path) -> tuple[list[str], list[str], int]:
             problems.append(f"{stem}: reported {len(entries)} test(s) but there is no "
                             f"integration_tests/{stem}.py to compare against")
             continue
+        if not expected[stem]:
+            # A fixture file with no discoverable test at all. Whatever the results say about it
+            # cannot be checked against anything, so accepting it would be accepting an unverifiable
+            # claim. Usually a fixture whose tests were renamed into `test__` helpers, or one that
+            # only defines run_setup.
+            problems.append(f"integration_tests/{stem}.py declares no discoverable test_* method, "
+                            f"yet the results report {len(entries)} for it -- nothing there can be "
+                            "verified; give it real tests or delete the file")
+            continue
 
-        # 2. every source method must appear by name, and must have actually asserted something.
+        # 2. the reported set and the source set must be EQUAL, in both directions, and every
+        #    reported result must have actually asserted something.
         covered: set[str] = set()
         for entry in entries:
             name = entry.get("test_name") or ""
@@ -222,6 +234,15 @@ def check(results_path: Path) -> tuple[list[str], list[str], int]:
         for missing in sorted(expected[stem] - covered):
             problems.append(f"{stem}: source declares {missing}() but no passing result reports it "
                             f"-- it did not run, was renamed without being wired up, or did not pass")
+        # The other direction, which a "does the source set fit inside the reported set" check would
+        # miss: a result naming a test the source does not declare. That means the results and the
+        # checkout disagree, so NOTHING here can be trusted to describe this code -- typically a
+        # stale results.json from before a rename or deletion, or a run against a different revision.
+        # Left unchecked it also inflates the reported total, which is the number a human reads.
+        for orphan in sorted(covered - expected[stem]):
+            problems.append(f"{stem}: results report {orphan}() but the source declares no such test "
+                            "-- these results do not match this checkout (stale run, or a test "
+                            "renamed/deleted since); re-run the tier")
 
     # A fixture that exists in source but is missing from the results entirely: it never ran, and
     # nothing in the summary would say so.
