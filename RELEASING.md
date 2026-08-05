@@ -1,7 +1,8 @@
 # Releasing
 
 The checklist for cutting a tagged release. Every release MUST pass these four steps in order.
-Step 3 is enforced by scripts (`scripts/check_requirements_match.py`, `scripts/check_readme_sync.py`
+Steps 2 and 3 are enforced by scripts (`scripts/check_tier_results.py`,
+`scripts/check_requirements_match.py`, `scripts/check_readme_sync.py`
 and `scripts/check_version_consistency.py`,
 each exits non-zero on drift); the others are manual but must be done and their evidence recorded in
 the release notes.
@@ -78,8 +79,26 @@ dbx_test run \
   --config integration_tests/config/test_config.yml
 ```
 
-Record the result line (e.g. `Total: 85, Passed: 85, Failed: 0`) in the release notes. Any failure
+Record the result line (e.g. `Total: 91, Passed: 91, Failed: 0`) in the release notes. Any failure
 blocks the release.
+
+**Then verify the tier actually ran what it claims to cover.** `Failed: 0` is not sufficient: a
+fixture whose `run_setup` raises reports ZERO tests, and `dbx_test` derives its failure count from
+the tests it ran, so zero tests means zero failures and the fixture prints as a pass. This is a HARD
+GATE, not an optional check:
+
+```bash
+python scripts/check_tier_results.py           # newest .dbx-test-results/*/results.json
+```
+
+Exits `0` only when every fixture appears in the results AND its reported test count matches the
+number of `test_*` methods in its source. Exits `1` naming any fixture that reported zero tests, a
+single opaque `all_tests` entry, a partial run, or that is missing entirely. This caught
+`test_bulk_write_roundtrip` silently not running for six consecutive tier runs while the summary
+printed `84/84` and `All tests passed` (its setup wrote to an index it never created, which
+`require_existing_index=True` began rejecting in 0.6.0). The headline total held steady because the
+8 tests it stopped reporting were almost exactly offset by a new 7-test fixture, so the number alone
+was no defence. **A non-zero exit blocks the release even when the tier says every test passed.**
 
 ### 3. Run the release gates (HARD GATES)
 
@@ -137,7 +156,9 @@ gh release view v<version> --json assets --jq '.assets[].name'
 ## Definition of done for a release
 
 - [ ] `pytest` green, integration tier green (result line recorded)
+- [ ] `scripts/check_tier_results.py` exits 0 (the tier RAN every test, not just reported no failures)
 - [ ] wheel rebuilt from the tagged commit; local md5 == uploaded md5 (recorded)
 - [ ] `scripts/check_requirements_match.py` exits 0
 - [ ] `scripts/check_readme_sync.py` exits 0
+- [ ] `scripts/check_version_consistency.py` exits 0
 - [ ] tag pushed from the reviewed commit; wheel attached to the GitHub release (verified)

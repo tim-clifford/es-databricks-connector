@@ -69,6 +69,14 @@ integration tier above is what has to be green.
   script is referenced by name in the README that should list it (whole-tree invariant; catches the
   drift a diff-scoped review can't). Exit 1 with the gaps. Matching is word-boundary aware
   (`transform.py` is NOT satisfied by `read_transform.py`).
+- **`scripts/check_tier_results.py`**, asserts the tier RAN what it claims to cover: every fixture
+  appears in the newest `results.json` and its reported test count equals the number of `test_*`
+  methods in its source. `Failed: 0` cannot establish this on its own, because `dbx_test` turns a
+  `run_setup` exception into "zero tests ran" and derives the failure count from the tests that ran,
+  so a skipped fixture reports as a pass. `test_bulk_write_roundtrip` was silently not running for
+  six tier runs while the summary printed `84/84` and `All tests passed`; the total looked stable only
+  because the 8 tests it dropped were nearly offset by a new 7-test fixture. Exit 1 on a zero-test
+  fixture, an opaque `all_tests` entry, a partial run, or a fixture missing entirely.
 - **`scripts/check_version_consistency.py`**, asserts `pyproject.toml`'s version matches
   `__init__.__version__`, `HANDOFF.md`'s header, and every wheel-filename reference in the docs, this
   skill, and `integration_tests/config/test_config.yml`. That last file is the reason it exists: it
@@ -77,6 +85,7 @@ integration tier above is what has to be green.
   cannot make the gate vacuous.
 
 ```bash
+python scripts/check_tier_results.py          # exit 0 = the tier ran every test it covers
 python scripts/check_requirements_match.py    # exit 0 = match
 python scripts/check_readme_sync.py           # exit 0 = docs enumerate the code
 python scripts/check_version_consistency.py   # exit 0 = every version/wheel reference agrees
