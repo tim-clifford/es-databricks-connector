@@ -33,9 +33,9 @@ INDEX = "connector-integration-streaming"   # throwaway; recreated + dropped by 
 ES_HOSTS = dbutils.secrets.get(SCOPE, "hosts")
 ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "password"))
 
-# A throwaway Delta source table + a checkpoint dir on a UC Volume. These mirror where the demos
-# live so the fixture runs in the same workspace, but nothing here is shared with a demo (distinct
-# names), both are dropped in cleanup.
+# A throwaway Delta source table + a checkpoint dir on a UC Volume, in the same catalog/schema the
+# rest of this workspace's fixtures use. The names are distinct so nothing is shared with any other
+# job in the workspace; both are dropped in cleanup.
 CATALOG = "tim_clifford_classic_dsl_lite_catalog"
 SCHEMA = "es_poc"
 SRC_TABLE = f"{CATALOG}.{SCHEMA}.connector_it_streaming_src"

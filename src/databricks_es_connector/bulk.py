@@ -83,11 +83,15 @@ def make_partition_writer(cfg: EsConfig):
         written = 0
         deleted = 0
         errors = 0
+        ignored = 0                # delete-404 no-ops: expected, but must be COUNTED so the caller
+                                   # can tell them apart from rows lost below the per-doc level
+        coerced_nonfinite = 0      # values silently turned to JSON null (inf/-inf/NaN)
         total_input = 0            # rows fed in, so the caller can reconcile against the outcomes
         error_samples = []         # bounded diagnostics for failed docs (see ERROR_SAMPLE_CAP)
         for pdf in iterator:
             rows = pdf.to_dict("records")
             total_input += len(rows)
+            _stats = {}
             actions = [
                 build_action(
                     row,
@@ -96,9 +100,11 @@ def make_partition_writer(cfg: EsConfig):
                     drop_fields=cfg.drop_fields,
                     has_deletes=cfg.has_deletes,
                     delete_flag_column=cfg.delete_flag_column,
+                    stats=_stats,
                 )
                 for row in rows
             ]
+            coerced_nonfinite += _stats.get("coerced_nonfinite", 0)
             if not actions:
                 continue
             # streaming_bulk with raise_on_error=False + yield_ok=True yields one
@@ -106,9 +112,17 @@ def make_partition_writer(cfg: EsConfig):
             # individually. We deliberately do NOT use helpers.bulk's ignore_status: that
             # would suppress a status across ALL op types (e.g. a 404 on an index would
             # also be swallowed). We need the suppression scoped to *delete* 404s only.
+            # max_retries + retry_on_status make streaming_bulk retry the individual documents ES
+            # rejected with a retryable status (429 = write queue full) with exponential backoff,
+            # re-sending only the failed subset. Without this the library default (max_retries=0)
+            # makes a transient 429 a permanent per-doc error on its first attempt; the
+            # transport-level EsConnection.max_retries does NOT cover it, because _bulk returns
+            # HTTP 200 even when individual items fail.
             for ok, result in helpers.streaming_bulk(
                 es, actions, chunk_size=cfg.chunk_size,
                 raise_on_error=False, raise_on_exception=False, yield_ok=True,
+                max_retries=cfg.max_retries_per_doc,
+                retry_on_status=tuple(cfg.retry_on_doc_status),
             ):
                 op_type, item = next(iter(result.items()))
                 outcome = classify_bulk_result(ok, op_type, item.get("status", 500))
@@ -116,15 +130,21 @@ def make_partition_writer(cfg: EsConfig):
                     written += 1
                 elif outcome == DELETED:
                     deleted += 1
+                elif outcome == IGNORED:
+                    # A delete-404 is an expected no-op, but it must be COUNTED: it is the one
+                    # outcome that legitimately makes written+deleted+errors < total_input, so
+                    # without this the reconciliation check cannot tell an expected no-op from a
+                    # row lost below the per-doc level.
+                    ignored += 1
                 elif outcome == ERROR:
                     errors += 1
                     if len(error_samples) < ERROR_SAMPLE_CAP:
                         error_samples.append(_extract_error_sample(op_type, item))
-                # IGNORED (delete-404) counts as nothing, an expected no-op.
         # error_samples is JSON-encoded into a single string column: mapInPandas needs a flat,
         # typed schema and can't carry a nested list<struct> of varying content cleanly.
         yield pd.DataFrame({
             "written": [written], "deleted": [deleted], "errors": [errors],
+            "ignored": [ignored], "coerced_nonfinite": [coerced_nonfinite],
             "total_input": [total_input], "error_samples": [json.dumps(error_samples)],
         })
 
@@ -134,40 +154,155 @@ def make_partition_writer(cfg: EsConfig):
 def _merge_partition_results(rows) -> dict:
     """Combine the per-partition summary rows into the final result dict.
 
-    Pure (no Spark) so it is unit-testable. Each row carries written/deleted/errors/total_input and
-    a JSON string of that partition's bounded error samples. Counts are summed exactly; the sample
-    lists are concatenated and re-capped at ERROR_SAMPLE_CAP so the driver result stays bounded even
-    across many partitions. `errors == 0 and total_input != written + deleted + <ignored>` is the
-    caller's signal that some rows were lost at chunk level (see raise_on_exception in the writer).
+    Pure (no Spark) so it is unit-testable. Each row carries
+    written/deleted/errors/ignored/coerced_nonfinite/total_input and a JSON string of that
+    partition's bounded error samples. Counts are summed exactly; the sample lists are concatenated
+    and re-capped at ERROR_SAMPLE_CAP so the driver result stays bounded even across many
+    partitions.
+
+    Also derives `unaccounted`: total_input - (written + deleted + errors + ignored). Every input row
+    produces exactly one of those four outcomes, so a non-zero value means rows vanished BELOW the
+    per-document level (a chunk-level transport/serialization failure), which the per-doc `errors`
+    count structurally cannot see. `ignored` is part of the identity precisely so an expected
+    delete-404 no-op does not masquerade as loss (see reconcile_or_raise).
     """
-    written = deleted = errors = total_input = 0
+    written = deleted = errors = ignored = coerced_nonfinite = total_input = 0
     samples = []
     for r in rows:
         written += int(r["written"] or 0)
         deleted += int(r["deleted"] or 0)
         errors += int(r["errors"] or 0)
+        # Optional keys are read with `in` rather than `.get()`: these rows are pyspark `Row`s in
+        # production, and Row has no `.get` (it raises ATTRIBUTE_NOT_SUPPORTED). `in` checks field
+        # names on a Row and keys on a dict, so it works for both. Tolerating absence means a
+        # stale/foreign row shape degrades to a zero/empty rather than crashing the whole write here.
+        ignored += int((r["ignored"] if "ignored" in r else 0) or 0)
+        coerced_nonfinite += int((r["coerced_nonfinite"] if "coerced_nonfinite" in r else 0) or 0)
         total_input += int(r["total_input"] or 0)
-        if len(samples) < ERROR_SAMPLE_CAP and r["error_samples"]:
-            samples.extend(json.loads(r["error_samples"]))
+        _samples_json = r["error_samples"] if "error_samples" in r else None
+        if len(samples) < ERROR_SAMPLE_CAP and _samples_json:
+            samples.extend(json.loads(_samples_json))
     return {
-        "written": written, "deleted": deleted, "errors": errors,
-        "total_input": total_input, "error_samples": samples[:ERROR_SAMPLE_CAP],
+        "written": written, "deleted": deleted, "errors": errors, "ignored": ignored,
+        "coerced_nonfinite": coerced_nonfinite,
+        "total_input": total_input,
+        "unaccounted": total_input - (written + deleted + errors + ignored),
+        "error_samples": samples[:ERROR_SAMPLE_CAP],
     }
 
 
-def bulk_write(df, cfg: EsConfig) -> dict:
+class EsWriteError(RuntimeError):
+    """A write did not fully succeed: Elasticsearch rejected documents, or rows went unaccounted for.
+
+    Carries the full `bulk_write` result dict on `.result` so a caller catching this still has the
+    counts and error samples for logging or a dead-letter path.
+    """
+
+    def __init__(self, message: str, result: dict):
+        super().__init__(message)
+        self.result = result
+
+
+def reconcile_or_raise(result: dict, *, index: str = "") -> dict:
+    """Raise EsWriteError if `result` shows rejected documents or unaccounted-for rows.
+
+    Two independent failure signals, both of which a plain `written` count hides:
+      - `errors > 0`: Elasticsearch rejected specific documents (mapping conflict, 429 after
+        retries, ...). Each has a diagnostic in `error_samples`.
+      - `unaccounted > 0`: rows that produced no per-document outcome at all, i.e. loss below the
+        per-doc level. `ignored` (delete-404 no-ops) is already subtracted, so an expected no-op
+        does not trip this.
+
+    Returns the result unchanged when the write was clean, so it can be used inline.
+    """
+    errors = int(result.get("errors", 0) or 0)
+    unaccounted = int(result.get("unaccounted", 0) or 0)
+    if not errors and unaccounted <= 0:
+        return result
+
+    where = f" to index {index!r}" if index else ""
+    parts = []
+    if errors:
+        parts.append(f"{errors} document(s) rejected by Elasticsearch")
+    if unaccounted > 0:
+        parts.append(f"{unaccounted} row(s) unaccounted for (lost below the per-document level)")
+    detail = (f" total_input={result.get('total_input')} written={result.get('written')} "
+              f"deleted={result.get('deleted')} errors={errors} ignored={result.get('ignored')}")
+    samples = result.get("error_samples") or []
+    sample_text = f" first failures: {samples[:3]}" if samples else ""
+    raise EsWriteError(f"write{where} did not fully succeed: {'; '.join(parts)}.{detail}.{sample_text}",
+                       result)
+
+
+def _preflight(df, cfg: EsConfig) -> None:
+    """Driver-side checks that must fail CLOSED before any row is written.
+
+    Both guard against a write that reports perfect success while doing the wrong thing, and both
+    run ONCE on the driver (never inside the mapInPandas closure, which would put an HTTP round-trip
+    on every executor):
+
+      - `require_existing_index`: ES auto-creates a missing index, so a TYPO'd index name silently
+        produces a new dynamically-mapped index and a clean `written` count. One `indices.exists`
+        call turns that into an error.
+      - `strict_drop_fields`: a misspelled `drop_fields` entry prunes nothing, so a field the caller
+        believes is withheld ships to ES. Since drop_fields is commonly a PII/egress control, an
+        unknown name must fail rather than silently no-op.
+    """
+    if cfg.strict_drop_fields and cfg.drop_fields:
+        # df.columns is cheap and safe here: sanitize_for_arrow has already removed the VARIANT
+        # columns that make schema access throw on Spark Connect.
+        present = set(df.columns)
+        unknown = [c for c in cfg.drop_fields if c not in present]
+        if unknown:
+            raise ValueError(
+                f"drop_fields names not present in the DataFrame: {sorted(unknown)}. "
+                f"Available columns: {sorted(present)}. A misspelled drop_fields entry prunes "
+                "nothing and would ship the field to Elasticsearch anyway; fix the name, or set "
+                "strict_drop_fields=False if the config is intentionally reused across schemas.")
+
+    if cfg.require_existing_index:
+        from elasticsearch import Elasticsearch
+        es = Elasticsearch(**cfg.client_kwargs())
+        try:
+            exists = bool(es.indices.exists(index=cfg.index))
+        finally:
+            try:
+                es.close()
+            except Exception:
+                pass
+        if not exists:
+            raise ValueError(
+                f"index {cfg.index!r} does not exist. Elasticsearch would auto-create it with a "
+                "dynamic mapping, so a misspelled index name looks like a successful write while "
+                "the documents land somewhere nobody queries. Create the index (with an explicit "
+                "mapping) first, or set require_existing_index=False to allow auto-creation.")
+
+
+def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     """Write a Spark DataFrame to Elasticsearch.
 
-    Returns {'written', 'deleted', 'errors', 'total_input', 'error_samples'}:
+    Returns {'written', 'deleted', 'errors', 'ignored', 'coerced_nonfinite', 'total_input',
+    'unaccounted', 'error_samples'}:
       - 'written': index/upsert ops that succeeded.
       - 'deleted': successful delete-by-id ops (only non-zero when cfg.has_deletes).
       - 'errors': docs ES rejected (exact count).
-      - 'total_input': rows handed to the writer. Reconcile: written+deleted+errors < total_input
-        means some rows were lost below the per-doc level (e.g. a chunk-level exception); equality
-        (accounting for delete-404 no-ops, which count as none) means every row was accounted for.
+      - 'ignored': delete-404 no-ops (deleting an already-absent doc: expected, not an error).
+      - 'coerced_nonfinite': values (inf/-inf/NaN) that had to become JSON null to be sent at all.
+        Non-zero means real numbers landed in ES as nulls, usually an upstream divide-by-zero.
+      - 'total_input': rows handed to the writer.
+      - 'unaccounted': total_input - (written+deleted+errors+ignored). Every row yields exactly one
+        of those outcomes, so a positive value means rows were lost BELOW the per-document level
+        (e.g. a chunk-level transport error) where the `errors` count cannot see them.
       - 'error_samples': up to ERROR_SAMPLE_CAP diagnostics ({_id, op_type, status, reason}) for
         rejected docs, so a failure is actionable rather than an opaque count. Bounded, not a full
         dead-letter log.
+
+    `raise_on_error=True` applies `reconcile_or_raise` to the result, raising EsWriteError when any
+    document was rejected or any row went unaccounted for. It defaults to False here so a BATCH
+    caller keeps full control of the result (and every shipped demo checks it explicitly), but note
+    the streaming path defaults the other way: `make_foreach_batch` raises unless told not to,
+    because there a swallowed error silently advances the checkpoint past the lost rows.
+
     Batch entry point; for streaming, use stream.make_foreach_batch.
 
     Arrow-hostile columns (VARIANT / INTERVAL, at any nesting depth) are serialized to strings
@@ -183,9 +318,15 @@ def bulk_write(df, cfg: EsConfig) -> dict:
     """
     df = sanitize_for_arrow(df)
     df = normalize_timestamps_for_utc(df)
+    # Preflight AFTER sanitize (so df.columns is safe to read) but BEFORE any row is written.
+    _preflight(df, cfg)
     writer = make_partition_writer(cfg)
     rows = df.mapInPandas(
         writer,
-        "written long, deleted long, errors long, total_input long, error_samples string",
+        "written long, deleted long, errors long, ignored long, coerced_nonfinite long, "
+        "total_input long, error_samples string",
     ).collect()
-    return _merge_partition_results(rows)
+    result = _merge_partition_results(rows)
+    if raise_on_error:
+        reconcile_or_raise(result, index=cfg.index)
+    return result

@@ -13,12 +13,12 @@ mechanism). The read schema is required (no mapping inference).
 """
 
 from .config import EsConnection, EsWriteConfig, EsReadConfig, EsConfig
-from .transform import to_es_source, coerce_value
-from .bulk import bulk_write
+from .transform import to_es_source, coerce_value, AmbiguousDeleteFlag
+from .bulk import bulk_write, reconcile_or_raise, EsWriteError
 from .stream import make_foreach_batch
 from .spark_prep import sanitize_for_arrow
 from .read import read_index
-from .read_transform import read_coerce
+from .read_transform import read_coerce, ReadSchemaMismatch
 
 __all__ = [
     "EsConnection",
@@ -28,10 +28,15 @@ __all__ = [
     "to_es_source",
     "coerce_value",
     "bulk_write",
+    "reconcile_or_raise",
     "make_foreach_batch",
     "sanitize_for_arrow",
     "read_index",
     "read_coerce",
+    # Exceptions a caller may want to catch by type.
+    "EsWriteError",         # a write rejected documents or lost rows (raised by the stream default)
+    "AmbiguousDeleteFlag",  # a delete-flag string that is neither clearly true nor false
+    "ReadSchemaMismatch",   # stored ES value does not fit the declared Spark type
 ]
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

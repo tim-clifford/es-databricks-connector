@@ -140,16 +140,31 @@ def test_resolve_num_slices_defaults_to_shard_count():
     es = _FakeES(settings={"i": {"settings": {"index.number_of_shards": "3"}}})
     assert _resolve_num_slices(es, "i", None) == 3
 
-def test_resolve_num_slices_falls_back_to_one_on_error():
+def test_resolve_num_slices_raises_on_error_by_default():
+    # 0.6.0: the serial fallback is a silent loss of parallelism, and a logging warning is easy to
+    # miss entirely on serverless, so the shard-count failure RAISES unless explicitly allowed.
     es = _FakeES(settings=None)   # get_settings raises
-    assert _resolve_num_slices(es, "i", None) == 1
+    with pytest.raises(RuntimeError, match="could not read the shard count"):
+        _resolve_num_slices(es, "i", None)
 
-def test_resolve_num_slices_warns_on_fallback(caplog):
-    # The serial single-slice fallback must not be silent: it forfeits parallelism.
+
+def test_resolve_num_slices_error_names_the_index_and_the_fix():
+    # The message has to be actionable: which index, and both escape hatches.
+    es = _FakeES(settings=None)
+    with pytest.raises(RuntimeError) as exc:
+        _resolve_num_slices(es, "my_index", None)
+    msg = str(exc.value)
+    assert "my_index" in msg
+    assert "num_slices" in msg and "strict_slices=False" in msg
+
+
+def test_resolve_num_slices_falls_back_to_one_when_not_strict(caplog):
+    # With strict=False the old behavior remains available, and must still WARN (naming the index)
+    # rather than degrade in total silence.
     import logging
     es = _FakeES(settings=None)   # get_settings raises
     with caplog.at_level(logging.WARNING, logger="databricks_es_connector.read"):
-        assert _resolve_num_slices(es, "my_index", None) == 1
+        assert _resolve_num_slices(es, "my_index", None, strict=False) == 1
     assert any("my_index" in r.message and "single" in r.message.lower()
                for r in caplog.records), "expected a WARNING naming the index on fallback"
 
@@ -354,7 +369,7 @@ def test_read_index_distributed_opens_pit_and_fans_out(monkeypatch):
     es = _FakeSearchES([])
     _install_fake_es(monkeypatch, es)
     # Force a known slice count so we can assert the fan-out width.
-    monkeypatch.setattr(read_mod, "_resolve_num_slices", lambda es, index, cfg_n: 4)
+    monkeypatch.setattr(read_mod, "_resolve_num_slices", lambda es, index, cfg_n, strict=True: 4)
     spark = _FakeSpark()
     schema = _Schema([("doc_id", "string")])
 
@@ -391,7 +406,7 @@ def test_read_index_distributed_swallows_client_close_failure(monkeypatch):
             raise RuntimeError("client close failed")
     es = _CloseBoomES([])
     _install_fake_es(monkeypatch, es)
-    monkeypatch.setattr(read_mod, "_resolve_num_slices", lambda es, index, cfg_n: 2)
+    monkeypatch.setattr(read_mod, "_resolve_num_slices", lambda es, index, cfg_n, strict=True: 2)
     spark = _FakeSpark()
     df = read_mod.read_index(spark, _rcfg(), _Schema([("doc_id", "string")]))
     assert spark.mapped["nparts"] == 2     # returned the lazy DF despite the close failure

@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.5.0)
+# Production Readiness / Known Limitations (0.6.0)
 
 `databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
 bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -44,14 +44,19 @@ before a customer relies on it.
 Hardening still needed before production for SIEM/audit data:
 
 - **Error capture / dead-letter.** Partially addressed. `bulk_write` returns
-  `{written, deleted, errors, total_input, error_samples}`: `error_samples` is a **bounded** sample
-  (≤20) of per-doc failure diagnostics (`_id`, op, status, ES reason), and `total_input` lets a
-  caller reconcile `written+deleted+errors` against rows-in to detect below-per-doc loss. This makes
-  a failed write diagnosable and detectable. **Still missing:** a durable **dead-letter path** that
-  captures *every* failed row (not just a sample): for SIEM/audit, silent loss of the un-sampled
-  failures beyond the cap is still a correctness gap. Route failures to a Delta table / DLQ.
+  `{written, deleted, errors, ignored, coerced_nonfinite, total_input, unaccounted, error_samples}`:
+  `error_samples` is a **bounded** sample (≤20) of per-doc failure diagnostics (`_id`, op, status, ES
+  reason), and `unaccounted` reports below-per-doc loss directly (every row yields exactly one of
+  written/deleted/errors/ignored). The streaming path raises on either signal, so a failure fails the
+  batch instead of advancing the checkpoint past it. **Still missing:** a durable **dead-letter path**
+  that captures *every* failed row (not just a sample): for SIEM/audit, silent loss of the un-sampled
+  failures beyond the cap is a correctness gap. Route failures to a Delta table / DLQ (the `on_batch`
+  hook runs before the raise, which is the seam for this).
 - **Backpressure / concurrency cap.** `mapInPandas` opens one ES client per Spark partition; a
-  large Databricks cluster can overrun a modest ES cluster (429s). No coordinated throttle exists.
+  large Databricks cluster can overrun a modest ES cluster (429s). Per-document retries with
+  exponential backoff (`max_retries_per_doc`, default 3) absorb a transient 429, and a batch that still
+  fails after retries fails the stream. That mitigates the symptom; a **coordinated** throttle
+  (bounding total concurrent writers across executors) is **not built**.
 - **Index templates + ILM / data streams.** The connector writes to a single target index.
   Time-series SIEM data wants an index template + ILM (rollover, retention, tiers) or data streams.
 - **Streaming: run as a job, and mind the semantics.** `make_foreach_batch` + `availableNow` +
@@ -59,6 +64,14 @@ Hardening still needed before production for SIEM/audit data:
   `spark.streams.awaitAnyTermination()`). Driving it interactively cell-by-cell on serverless /
   Spark Connect is unreliable: `query.start()` can intermittently hang, and `awaitTermination(timeout)`
   does not honor its timeout there. Do not certify the interactive path.
+- **Checkpoint semantics: what is and is not retried.** Structured Streaming commits a micro-batch's
+  offset when `foreachBatch` **returns normally**, with no visibility into the documents inside. So
+  `make_foreach_batch` raises `EsWriteError` by default (`on_error="raise"`), failing the batch so
+  Spark retries it and the offset holds; with `id_field` set that retry is an idempotent upsert.
+  Operators who opt into `on_error="log"`/`"ignore"` are accepting **unretried loss** and need external
+  alerting on the `errors`/`unaccounted` counts. Triage note: `ConnectionError`/`ConnectionTimeout`/
+  `SerializationError` are not `ApiError` subclasses, so transport failures propagate and are retried
+  by Spark regardless of policy; the policy governs per-document rejections.
 - **Streaming freshness expectations.** On serverless only `availableNow`/`Once` triggers work, so
   end-to-end latency is job-cadence (≈30s to 2min), not seconds. If a SIEM needs near-real-time, use a
   classic job cluster with `processingTime`, or a Kafka bridge. Set this expectation explicitly.
@@ -68,7 +81,16 @@ Hardening still needed before production for SIEM/audit data:
   "rows written this run" counter. Measure the ES doc-count delta, or push metrics from inside the
   batch (StatsD, a Delta audit table).
 - **Monitoring.** The `on_batch` hook is a seam for metrics but nothing sinks throughput / error
-  rate / lag.
+  rate / lag. A failed batch is visible as a failed Spark job, which is a floor, not a monitoring
+  story.
+- **Verifying a mapping needs an INDEXED read, not a round-trip.** A
+  write-then-`read_index` comparison cannot detect a mapping mismatch: reads come from `_source`,
+  which ES stores verbatim, so the check compares your data against a copy of itself. Verified live on
+  8.19: `amount` dynamically mapped `long`, writing `100.75` gives `errors=0` and round-trips as
+  `100.75`, while the indexed value is `100` and a `range > 100.5` query finds nothing. Any acceptance
+  test that claims to validate mapping must read indexed values (`fields`, an aggregation, or
+  `GET /_mapping`). Pre-creating explicit mappings is the real fix; an acceptance test should assert
+  on the indexed value rather than on a `read_index` round-trip.
 - **Updates & deletes.** Inserts/upserts via deterministic `_id`, and deletes via `has_deletes` +
   `delete_flag_column` (emitting delete-by-`_id` bulk actions with scoped 404 no-op suppression),
   are supported. The connector deletes exactly the rows the caller flags: it does **not** dedup or
@@ -102,6 +124,15 @@ Hardening still needed before production for SIEM/audit data:
 - **Read throughput not yet benchmarked.** The sliced-scroll fan-out is proven correct (all docs,
   once, across shards) but has no throughput/large-index benchmark. `num_slices` defaults to the
   shard count; the optimal slice count and `batch_size` for a large export are untuned.
+- **A declared type that doesn't fit raises `ReadSchemaMismatch`.** The trap to raise with a customer:
+  **ES has no array type**, so any field can hold multiple values under the same mapping and
+  `GET /_mapping` will not tell you which ones do. Declare `array<T>` wherever multi-values are
+  possible. Integral floats (`3.0` → `3`) are accepted; lossy conversions are not.
+- **A failed shard-count lookup raises rather than degrading silently.** With `num_slices=None` the
+  reader looks up the shard count; if that call fails, the only correct fallback is a single serial
+  reader, which forfeits all parallelism (and a `logging` warning is easy to miss on serverless, so a
+  large export just looks slow). Pass `num_slices` explicitly in production to skip the lookup, or set
+  `strict_slices=False` to accept the serial read.
 
 ## Open items: packaging & portability
 
@@ -138,6 +169,9 @@ Hardening still needed before production for SIEM/audit data:
 - [ ] API-key auth via secret scope, worked example
 - [ ] FIPS/FedRAMP requirements confirmed
 - [ ] Index template + ILM defined
-- [ ] Durable dead-letter path added (bounded `error_samples` + `total_input` exist; a full DLQ for every failed row is still needed)
+- [ ] Durable dead-letter path added (bounded `error_samples` + `unaccounted` exist and the stream fails on either; a full DLQ for every failed row is still needed)
 - [ ] Streaming run as a job with checkpoint + restart-idempotency
+- [ ] Streaming left on the default `on_error="raise"` (or external alerting on `errors`/`unaccounted` if not)
+- [ ] Explicit index mappings pre-created, and verified by reading INDEXED values (not a `_source` round-trip)
+- [ ] `num_slices` passed explicitly for large reads (so a shard-count lookup failure can't serialize the export)
 - [ ] ES major-version compatibility confirmed

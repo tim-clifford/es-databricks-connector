@@ -71,3 +71,5 @@ always check whether the gap is on the write side, the read side, or both.)
 - [ ] README write + read tables and ref 1 updated; one-way-delta list correct.
 - [ ] If Arrow-hostile/timestamp: `spark_prep.py` handles it, with `tests/test_spark_prep.py` cases.
 - [ ] `scripts/check_readme_sync.py` passes (new fixture/module documented).
+- [ ] `scripts/check_version_consistency.py` passes (only relevant if the change ships with a
+      version bump, but it is cheap and catches a stale wheel pin in the integration config).

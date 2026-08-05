@@ -103,11 +103,20 @@ def _slice_hits(es, pit_id, query, batch_size, keep_alive, slice_spec=None):
         pit_id = resp.get("pit_id", pit_id)   # PIT id can be refreshed across pages
 
 
-def _resolve_num_slices(es, index: str, configured: Optional[int]) -> int:
+def _resolve_num_slices(es, index: str, configured: Optional[int],
+                        strict: bool = True) -> int:
     """How many slices to fan out into: the caller's `num_slices`, else the index's shard count.
 
     Sliced scroll partitions best at (a multiple of) the shard count; defaulting to it gives one
-    slice per shard. Falls back to 1 (a single unsliced reader) if the shard count can't be read.
+    slice per shard.
+
+    If the shard count cannot be read (permissions, an alias spanning indices, a transient error),
+    the only correct fallback is 1: a single unsliced reader. That still returns every document, but
+    it is SERIAL, forfeiting the parallelism this reader exists for. Warning about it via `logging`
+    is not enough on Databricks serverless, where driver log output is easy to miss entirely, so a
+    large export would just look mysteriously slow. With `strict=True` (the default) the failure is
+    raised instead, naming the fix; pass an explicit `num_slices` to skip the lookup entirely, or
+    `strict_slices=False` to accept the serial fallback.
     """
     if configured is not None:
         return max(1, int(configured))
@@ -118,10 +127,13 @@ def _resolve_num_slices(es, index: str, configured: Optional[int]) -> int:
         shards = int(one["settings"]["index.number_of_shards"])
         return max(1, shards)
     except Exception as exc:
-        # Couldn't read the shard count (permissions, alias spanning indices, transient error).
-        # Falling back to a single unsliced reader is CORRECT but SERIAL, for a large index that
-        # silently forfeits the parallelism this reader exists for, so warn rather than hide it.
-        # Pass an explicit num_slices to skip this lookup entirely.
+        if strict:
+            raise RuntimeError(
+                f"read_index: could not read the shard count for index {index!r} ({exc}). Falling "
+                "back to a single unsliced reader would still be correct but SERIAL, silently "
+                "forfeiting parallelism on what may be a large index. Pass num_slices explicitly, "
+                "or set EsReadConfig.strict_slices=False to accept the serial fallback."
+            ) from exc
         _log.warning(
             "read_index: could not read shard count for index %r (%s); falling back to a single "
             "unsliced slice. Pass num_slices explicitly to parallelize.", index, exc)
@@ -203,7 +215,8 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
     from elasticsearch import Elasticsearch
     es = Elasticsearch(**cfg.client_kwargs())
     try:
-        num_slices = _resolve_num_slices(es, cfg.index, cfg.num_slices)
+        num_slices = _resolve_num_slices(es, cfg.index, cfg.num_slices,
+                                         strict=cfg.strict_slices)
         pit_id = es.open_point_in_time(index=cfg.index, keep_alive=cfg.pit_keep_alive)["id"]
     finally:
         # The driver client's only jobs are resolving the slice count and opening the PIT; each

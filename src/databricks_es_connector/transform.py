@@ -108,7 +108,7 @@ def _coerce_key(k: Any) -> str:
     return str(ck)
 
 
-def coerce_value(v: Any) -> Any:
+def coerce_value(v: Any, stats: Optional[dict] = None) -> Any:
     """Recursively make a value JSON/ES-serializable.
 
     - nulls (None, NaN, NaT, pd.NA) -> None
@@ -121,7 +121,19 @@ def coerce_value(v: Any) -> Any:
     - bytes/bytearray -> base64 str
     - int/float/str -> unchanged (JSON-native)
     - anything else -> str(v)  (total fallback: never let an unknown type crash the write)
+
+    `stats`, if given, is a mutable dict this function increments to make otherwise-invisible
+    coercions countable by the caller. Currently one key: `coerced_nonfinite`, bumped for every
+    inf/-inf/NaN turned into JSON null. Those are unrepresentable in JSON and MUST become null (ES
+    rejects the bare `NaN`/`Infinity` tokens), but an upstream divide-by-zero would otherwise land
+    in ES as a null with no error, no sample, and no count. NaN is indistinguishable from a genuine
+    null by the time it reaches here, so it is counted where it is detected (_is_null's float
+    branch), not guessed at afterwards.
     """
+    if v is not None and isinstance(v, float) and _math.isnan(v) and stats is not None:
+        # Count NaN before the generic null branch swallows it (a NaN is a real value that became
+        # null, unlike a None that was already null).
+        stats["coerced_nonfinite"] = stats.get("coerced_nonfinite", 0) + 1
     if _is_null(v):                                   # must precede datetime: NaT is a datetime
         return None
     if isinstance(v, bool):                           # bool is a subclass of int, keep as-is
@@ -129,9 +141,9 @@ def coerce_value(v: Any) -> Any:
     if isinstance(v, (_dt.datetime, _dt.date)):
         return _to_epoch_millis(v)
     if isinstance(v, dict):
-        return {_coerce_key(k): coerce_value(val) for k, val in v.items()}
+        return {_coerce_key(k): coerce_value(val, stats) for k, val in v.items()}
     if isinstance(v, (list, tuple)):
-        return [coerce_value(x) for x in v]
+        return [coerce_value(x, stats) for x in v]
     # numpy values from Arrow / mapInPandas: array<...> columns arrive as np.ndarray
     # and numeric columns as numpy scalars (np.int64, np.float64, ...). Neither is
     # JSON-serializable and neither is caught by the list/dict branches above, so a
@@ -140,7 +152,7 @@ def coerce_value(v: Any) -> Any:
     # scalar to a plain Python scalar; recurse UNCONDITIONALLY so an unwrapped scalar
     # (e.g. numpy inf -> Python inf) re-enters and hits the non-finite guard below.
     if type(v).__module__ == "numpy" and hasattr(v, "tolist"):
-        return coerce_value(v.tolist())
+        return coerce_value(v.tolist(), stats)
     if isinstance(v, _Decimal):
         # float => numeric + queryable in ES. Precision beyond ~15-17 sig figs is lost;
         # cast the source column to string in Spark first if exactness is required.
@@ -153,6 +165,8 @@ def coerce_value(v: Any) -> Any:
         # whole document fails to index and is silently lost to the error count. Coerce to
         # None (JSON null), mirroring the NaN handling in _is_null. (NaN is already caught by
         # _is_null above; this branch is reached only for inf/-inf.)
+        if stats is not None:
+            stats["coerced_nonfinite"] = stats.get("coerced_nonfinite", 0) + 1
         return None
     if isinstance(v, (int, float, str)):              # JSON-native scalars
         return v
@@ -166,6 +180,7 @@ def to_es_source(
     *,
     id_field: Optional[str] = None,
     drop_fields: Iterable[str] = (),
+    stats: Optional[dict] = None,
 ) -> dict:
     """Turn one row (dict) into the ES _source document.
 
@@ -173,11 +188,27 @@ def to_es_source(
       the id is kept in _source by default so the doc is self-describing).
     - coerces values (timestamps -> epoch millis, nested structs preserved).
 
+    `stats`, if given, is forwarded to `coerce_value` to count invisible coercions.
+
     Returns the _source dict. The _id is extracted separately by the caller
     (see build_action) so this stays a pure value transform.
     """
     drop = set(drop_fields)
-    return {k: coerce_value(v) for k, v in row.items() if k not in drop}
+    return {k: coerce_value(v, stats) for k, v in row.items() if k not in drop}
+
+
+_DELETE_TRUE_STRINGS = ("true", "t", "1", "yes", "y")
+_DELETE_FALSE_STRINGS = ("false", "f", "0", "no", "n")
+
+
+class AmbiguousDeleteFlag(ValueError):
+    """A delete-flag string that is neither clearly true nor clearly false.
+
+    Raised rather than defaulted because both defaults are silently wrong: reading it as False
+    leaves a doc in ES that should have been deleted (stale data, no error), and reading it as True
+    deletes a doc that should have stayed. The caller must cast the column to a real boolean in
+    Spark, or use one of the recognized string forms.
+    """
 
 
 def _is_delete_flagged(v: Any) -> bool:
@@ -185,13 +216,29 @@ def _is_delete_flagged(v: Any) -> bool:
 
     The flag arrives from Spark via mapInPandas, so it may be a Python bool, a numpy
     bool_, 0/1, or a string. Nulls (None/NaN/NaT/pd.NA) mean 'not a delete', a missing
-    flag must never be read as a delete. Strings are parsed leniently
-    ('true'/'t'/'1'/'yes'/'y', case-insensitive).
+    flag must never be read as a delete.
+
+    Strings are parsed against an explicit allow-list in BOTH directions
+    ('true'/'t'/'1'/'yes'/'y' vs 'false'/'f'/'0'/'no'/'n', case-insensitive, whitespace-trimmed).
+    An unrecognized non-empty string RAISES AmbiguousDeleteFlag instead of quietly meaning "not a
+    delete": values like 'on', 'enabled', 'delete', '2' and '-1' read as truthy to a human but would
+    have left the document in Elasticsearch forever with no error and no count. An empty/whitespace
+    string is treated as absent (not a delete), matching the null rule.
     """
     if _is_null(v):
         return False
     if isinstance(v, str):
-        return v.strip().lower() in ("true", "t", "1", "yes", "y")
+        s = v.strip().lower()
+        if not s:
+            return False                 # empty string == absent == not a delete
+        if s in _DELETE_TRUE_STRINGS:
+            return True
+        if s in _DELETE_FALSE_STRINGS:
+            return False
+        raise AmbiguousDeleteFlag(
+            f"delete flag {v!r} is neither true-like {_DELETE_TRUE_STRINGS} nor false-like "
+            f"{_DELETE_FALSE_STRINGS}. Cast the delete_flag_column to boolean in Spark rather than "
+            "relying on string parsing, so the intent is unambiguous.")
     # numpy bool_/int and Python bool/int both respond correctly to bool(); coerce numpy
     # scalars to a Python value first so bool() is well-defined.
     if type(v).__module__ == "numpy" and hasattr(v, "item"):
@@ -221,6 +268,7 @@ def build_action(
     drop_fields: Iterable[str] = (),
     has_deletes: bool = False,
     delete_flag_column: Optional[str] = None,
+    stats: Optional[dict] = None,
 ) -> dict:
     """Build one Elasticsearch bulk action dict from a row.
 
@@ -247,7 +295,7 @@ def build_action(
 
     # Index path. Drop the delete flag from the body so it isn't indexed as data.
     drop = tuple(drop_fields) + ((delete_flag_column,) if (has_deletes and delete_flag_column) else ())
-    source = to_es_source(row, id_field=id_field, drop_fields=drop)
+    source = to_es_source(row, id_field=id_field, drop_fields=drop, stats=stats)
     action = {"_index": index, "_source": source}
     if id_field is not None:
         action["_id"] = _require_id(row, id_field)

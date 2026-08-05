@@ -1,9 +1,9 @@
 # Reference 5: Holistic documentation review
 
 The connector's prose docs describe the code but are **not executable**, so nothing fails when they
-drift. `scripts/check_readme_sync.py` catches one narrow class (a module/fixture/script that no
-README lists), but it cannot catch a stale *description*, a wrong version, or an out-of-date claim.
-This review is the human/agent backstop for the rest.
+drift. Two narrow classes ARE enforced: `scripts/check_readme_sync.py` (a module/fixture/script no
+README lists) and `scripts/check_version_consistency.py` (a stale version or wheel pin). Neither can
+catch a stale *description* or an out-of-date claim. This review is the backstop for the rest.
 
 **When to run it:** as a **pre-change step** at the start of a work session that will modify the repo
 (so you start from docs that match reality, and know what you're changing), AND as part of **code
@@ -42,17 +42,23 @@ Concrete rules:
 |-----|-----------|--------------------------------|
 | `README.md` | public API, datatype tables, config, reading, repo layout, build/release pointer | a datatype's transform changes; a public function/config field is added or renamed; a file is added |
 | `integration_tests/README.md` | each integration fixture's purpose | a fixture is added, removed, or changes what it owns |
-| `RELEASING.md` | the 4-step release process + the two gates | the release flow, gate scripts, FEVM paths, or step order change |
+| `RELEASING.md` | the 4-step release process + the hard gates | the release flow, gate scripts, FEVM paths, or step order change |
 | `HANDOFF.md` | production-readiness / known limitations, pinned to a version | a limitation is closed, a version ships, or a gap changes status (check the version in its header matches `pyproject.toml`) |
 | `.agents/skills/es-connector/SKILL.md` + `references/*` | this skill: architecture, fidelity model, datatype contract, ES gotchas, release | ANY of the above change, because the skill restates them; the skill is the doc most prone to silent drift |
+| `CLAUDE.md` | the short auto-loaded pointer to this skill, plus the handful of rules most likely to be broken without it | a skill rule is added/changed/removed, a gate script is added, or a path in it moves. It EXISTS because `.agents/skills/` is not auto-discovered by the agent harness, so it is the only part of the skill that loads by default: if it drifts, the skill is effectively unenforced. Treat a change to SKILL.md as a prompt to re-read it. |
 
 ## The checklist
 
 Run top to bottom; each item is a concrete "does the doc still match the code" check, not a vibe.
 
-1. **Version consistency.** `pyproject.toml` `[project].version`, `__init__.py` `__version__`, the
-   wheel filename in every `%pip install` line (README + demos), and `HANDOFF.md`'s header version
-   all agree. (HANDOFF has been pinned to an older version before; this catches it.)
+1. **Version consistency: ENFORCED, run the script.** `python scripts/check_version_consistency.py`
+   (exit 0). It compares `pyproject.toml` `[project].version` against `__init__.py` `__version__`,
+   `HANDOFF.md`'s header, and every `databricks_es_connector-<version>-...whl` reference in the
+   docs, the skill, and `integration_tests/config/test_config.yml`. That last one is why this was
+   promoted from a manual check: it pins the wheel the LIVE integration tier *installs*, so a stale
+   pin there means the whole tier validates the PREVIOUS release while reporting success. It sat at
+   0.5.0 while the source was 0.6.0. The script only sees THIS repo, so any consumer that pins a
+   wheel filename of its own is out of its reach and has to be checked wherever it lives.
 2. **Public API.** Every name in `__init__.py`'s `__all__` is documented in the README, and the
    README names no function/config field that no longer exists. Config fields
    (`EsWriteConfig`/`EsReadConfig`) match `config.py`.
@@ -77,13 +83,23 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
    listed). Then eyeball that each listed description is still ACCURATE, not just present.
 6. **Release process.** `RELEASING.md` steps match the actual scripts (`scripts/*.py`), the FEVM
    paths/profile are current, and the step order still has build+upload BEFORE the integration run.
-7. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
+7. **`CLAUDE.md` vs. the skill.** It is the ONLY auto-loaded pointer to this skill
+   (`.agents/skills/` is not discovered by the harness). Check that every rule it states is still
+   true, that the paths it cites exist, and that a rule added to SKILL.md since the last review is
+   reflected if it is the kind someone would violate without reading the full skill. Keep it SHORT:
+   a signpost, not a second copy of the skill. One that grows into a summary of everything stops
+   being read, which is the failure mode it exists to fix.
+8. **No outbound references to a consumer.** This library ships to customers who have only the
+   wheel, so nothing here may name a downstream repo, demo, or example project. Grep for one before
+   finishing (a doc, a comment, or a skill reference is just as much of a leak as code). State what a
+   consumer must DO instead of pointing at where someone else did it. Awareness is inbound only.
+9. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
    critical rules still hold (write-path order, the serverless constraints, the five-places rule),
    and that refs 1, 3, 4 don't cite a function, path, or behavior that changed. Because the skill
    duplicates the READMEs by design, it drifts first, treat it as guilty until checked.
-8. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
+10. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
    out of open items or annotated, so the readiness doc doesn't understate the connector.
-9. **Conciseness and pruning (the counterbalance to items 3-8).** Items 3-8 push toward *adding*;
+11. **Conciseness and pruning (the counterbalance to items 3-10).** Items 3-10 push toward *adding*;
    this one pushes back. Read each doc as a first-time user would and cut what no longer earns its
    place: obsolete caveats/workarounds for since-fixed behavior, changelog-style "as of vX we..."
    narration, duplicate explanations of the same point across files, and depth that belongs in a
@@ -100,8 +116,12 @@ catch-up" pass later (that later pass is how drift accumulates in the first plac
 
 ## Why this isn't a script
 
-Item 1 (version consistency) and item 5's presence half are mechanizable (item 5 already is, via
-`check_readme_sync.py`). The rest, "is this description still accurate," is a judgment call that
-needs reading the code, exactly what a script can't do and a review can. If a check here becomes fully mechanical (e.g. version consistency), promote it to
-`scripts/` and cite it from RELEASING.md, don't leave it as a manual step. Keep the deterministic
-parts enforced and the judgment parts reviewed.
+Two items are now scripts: version consistency (`check_version_consistency.py`) and item 5's
+presence half (`check_readme_sync.py`). Everything else, "is this description still accurate," is a
+judgment call that needs reading the code, which is exactly what a script can't do and a review can.
+
+**Keep promoting.** When a check here becomes fully mechanical, move it into `scripts/`, cite it from
+RELEASING.md, and rewrite the checklist item to say "run the script" rather than leaving it as prose
+someone can skip. Both promotions so far were prompted by the check failing in reality first, so
+treat a drift that this checklist *should* have caught as a signal to mechanize it, not just to fix
+the instance.

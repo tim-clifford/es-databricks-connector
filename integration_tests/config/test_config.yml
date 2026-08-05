@@ -17,7 +17,7 @@ cluster:
   # Serverless (no cluster_id / size). dbx_test builds an inline environment from these libraries.
   # Both the test framework and the connector-under-test are installed into the run.
   libraries:
-    - whl: "/Volumes/tim_clifford_classic_dsl_lite_catalog/es_poc/artifacts/databricks_es_connector-0.5.0-py3-none-any.whl"
+    - whl: "/Volumes/tim_clifford_classic_dsl_lite_catalog/es_poc/artifacts/databricks_es_connector-0.6.0-py3-none-any.whl"
     - pypi:
         package: "git+https://github.com/jsparhamii/dbx_test.git"
     # dbx_test imports pytest at import time (pytest_compat), and serverless has no pytest
