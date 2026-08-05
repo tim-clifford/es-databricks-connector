@@ -343,6 +343,19 @@ detect:
 | `{"k": 1}` | `string` | raises: declare a matching `struct` |
 | `3.7` | `int` | raises: lossy |
 | `3.0` | `int` | `3` (exact, allowed) |
+| `"maybe"` | `boolean` | raises: no defined meaning (see below) |
+| any | `char` / `varchar` / `void` | raises: unsupported declared type (see below) |
+
+**Booleans stored as strings are parsed, not trusted to `bool()`.** Reading an index the connector
+did not write, a field may hold the *string* `"false"`, and `bool("false")` is `True`, so the value
+would invert with nothing to notice it. Strings are matched against the same allow-list the write side
+uses: `"true"/"t"/"1"/"yes"/"y"` and `"false"/"f"/"0"/"no"/"n"`, case-insensitive and
+whitespace-trimmed. Anything else raises. Real JSON booleans and `0`/`1` are unaffected.
+
+**`char`, `varchar` and `void` cannot be declared.** Spark cannot carry `CharType`, `VarcharType`, or
+`NullType` through the `mapInPandas` the reader uses, so they raise `ReadSchemaMismatch` naming the
+fix (`StringType`, or the column's real type). They fail fast at coercion rather than surfacing later
+as Spark's `Invalid return type in mapInPandas`, which names neither the field nor the cause.
 
 Watch the multi-value case: **ES has no array type**, so any field can hold multiple values under the
 same mapping and `GET /_mapping` will not tell you which do. Declare `array<T>` wherever
@@ -423,7 +436,7 @@ per-document level, and `max_retries=N` sets both at once, see
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
 | `index` | `str` | `""` | **Yes** | Target index. `bulk_write`/`build_action` raise if empty. |
-| `id_field` | `str \| None` | `None` | No | Column used as the deterministic `_id` → idempotent upserts. If unset, ES assigns random IDs (replays duplicate). If set, the column must be non-null in every row. |
+| `id_field` | `str \| None` | `None` | No | Column used as the deterministic `_id` → idempotent upserts. If unset, ES assigns random IDs (replays duplicate). If set, the column must **exist** (`bulk_write` raises before writing) and be non-null in every row. |
 | `chunk_size` | `int` | `500` | No | Docs per bulk request. |
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
 | `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses to retry. `429` is ES's write queue being full, the one reliably transient case. Adding `503` (a shard briefly unavailable, e.g. during relocation) is the main sensible extension: `retry_on_doc_status=(429, 503)`. Do **not** add deterministic statuses like `400` (malformed doc) or `409` (version conflict): the retry fails identically and only delays the real error. Empty with a non-zero `max_retries_per_doc` raises. |
@@ -476,7 +489,15 @@ than raising `max_retries`.
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
 | `has_deletes` | `bool` | `False` | No | `False` = every row is an index/upsert. `True` routes rows whose `delete_flag_column` is truthy to an ES delete-by-`_id`. |
-| `delete_flag_column` | `str \| None` | `None` | when `has_deletes` | Boolean-ish column; a truthy value deletes that `_id`. Null/absent = not a delete. The column is pruned from the `_source` of kept rows so it is never indexed. |
+| `delete_flag_column` | `str \| None` | `None` | when `has_deletes` | Boolean-ish column; a truthy value deletes that `_id`. A null value = not a delete. The column is pruned from the `_source` of kept rows so it is never indexed. It must **exist** in the DataFrame: `bulk_write` raises if it does not (see below). |
+
+> **A `delete_flag_column` that isn't in the DataFrame fails the write.** If the name is misspelled,
+> every row reads as not-flagged, so each intended delete would be applied as an **upsert** and the
+> documents would stay in Elasticsearch, reporting `deleted: 0`, `errors: 0` and a clean
+> reconciliation. `bulk_write` therefore checks the column exists before writing anything. This is not
+> optional: `has_deletes=True` has no meaning without a real flag column. (`id_field` and, under
+> `strict_drop_fields`, `drop_fields` are validated in the same pass, for the same reason: a config
+> field that names a column must fail closed when the name is wrong.)
 
 > **Prefer a real boolean for the delete flag.** Strings are parsed against an allow-list in both
 > directions, case-insensitive and whitespace-trimmed: `"true"/"t"/"1"/"yes"/"y"` delete,
@@ -681,6 +702,7 @@ integration_tests/             # live-Spark/ES tests run on Databricks serverles
   test_datatype_coverage.py    #   every Spark datatype + edge cases, round-tripped through ES
   test_bulk_write_roundtrip.py #   the bulk_write result contract (counts, total_input, error_samples)
   test_deletes_roundtrip.py    #   has_deletes routing live: delete-by-id, delete-404 no-op
+  test_preflight_column_guards.py # a config field naming a missing column fails before any write
   test_streaming_sink.py       #   make_foreach_batch on real Structured Streaming + restart idempotency
   test_read_roundtrip.py       #   write->read fidelity + distributed sliced read (multi-shard)
   test_timezone_utc.py         #   timestamp epoch is session-timezone-independent (UTC + non-UTC)

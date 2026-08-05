@@ -75,31 +75,44 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
    understates the connector, and a removed gotcha left in the docs misleads. **State the new
    behavior in the present tense (see "the goal" above), don't narrate the change; and delete any
    now-obsolete caveat rather than layering a correction on top of it.**
-4. **Datatype tables.** The README "Datatype coverage" (write) and "Read fidelity" (read) tables, and
+4. **Class closure (for any PR that fixes a failure MODE).** When a change hardens one instance of a
+   class of failure, enumerate the whole class and state which members are now covered. Ask: "what
+   OTHER field/type/path fails the same way?" Then either fix them in the same PR or say explicitly
+   why not. A diff-scoped review structurally cannot ask this, which is why it belongs here.
+   The worked example: the 0.6.0 hardening added `strict_drop_fields` because a misspelled
+   `drop_fields` entry silently pruned nothing. Three config fields name a DataFrame column
+   (`id_field`, `drop_fields`, `delete_flag_column`) and all three misbehave silently on a bad name,
+   but only `drop_fields` was fixed. The `delete_flag_column` gap was worse than the one addressed:
+   every intended delete became an upsert, with `deleted=0`, `errors=0` and a clean reconciliation,
+   so documents that should have been erased stayed in Elasticsearch. Two PR reviews and a green
+   live tier all passed it, because each asked "is this diff correct?" and not "is the class now
+   closed?" Where the class can be named in code, name it (`bulk._COLUMN_NAMING_FIELDS`) and pin it
+   with a test, so a future member fails until someone decides about it.
+5. **Datatype tables.** The README "Datatype coverage" (write) and "Read fidelity" (read) tables, and
    this skill's `references/1-fidelity-model.md`, all match `coerce_value` / `read_coerce`, and the
    one-way-delta list is exactly three (decimal, sub-ms timestamp, float32) unless a change
    deliberately added a fourth (which must be documented in all three places). See ref 2.
-5. **File enumeration.** `scripts/check_readme_sync.py` exits 0 (modules, fixtures, scripts are
+6. **File enumeration.** `scripts/check_readme_sync.py` exits 0 (modules, fixtures, scripts are
    listed). Then eyeball that each listed description is still ACCURATE, not just present.
-6. **Release process.** `RELEASING.md` steps match the actual scripts (`scripts/*.py`), the FEVM
+7. **Release process.** `RELEASING.md` steps match the actual scripts (`scripts/*.py`), the FEVM
    paths/profile are current, and the step order still has build+upload BEFORE the integration run.
-7. **`CLAUDE.md` vs. the skill.** It is the ONLY auto-loaded pointer to this skill
+8. **`CLAUDE.md` vs. the skill.** It is the ONLY auto-loaded pointer to this skill
    (`.agents/skills/` is not discovered by the harness). Check that every rule it states is still
    true, that the paths it cites exist, and that a rule added to SKILL.md since the last review is
    reflected if it is the kind someone would violate without reading the full skill. Keep it SHORT:
    a signpost, not a second copy of the skill. One that grows into a summary of everything stops
    being read, which is the failure mode it exists to fix.
-8. **No outbound references to a consumer.** This library ships to customers who have only the
+9. **No outbound references to a consumer.** This library ships to customers who have only the
    wheel, so nothing here may name a downstream repo, demo, or example project. Grep for one before
    finishing (a doc, a comment, or a skill reference is just as much of a leak as code). State what a
    consumer must DO instead of pointing at where someone else did it. Awareness is inbound only.
-9. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
+10. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
    critical rules still hold (write-path order, the serverless constraints, the five-places rule),
    and that refs 1, 3, 4 don't cite a function, path, or behavior that changed. Because the skill
    duplicates the READMEs by design, it drifts first, treat it as guilty until checked.
-10. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
+11. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
    out of open items or annotated, so the readiness doc doesn't understate the connector.
-11. **Conciseness and pruning (the counterbalance to items 3-10).** Items 3-10 push toward *adding*;
+12. **Conciseness and pruning (the counterbalance to items 3-11).** Items 3-11 push toward *adding*;
    this one pushes back. Read each doc as a first-time user would and cut what no longer earns its
    place: obsolete caveats/workarounds for since-fixed behavior, changelog-style "as of vX we..."
    narration, duplicate explanations of the same point across files, and depth that belongs in a
@@ -116,7 +129,7 @@ catch-up" pass later (that later pass is how drift accumulates in the first plac
 
 ## Why this isn't a script
 
-Two items are now scripts: version consistency (`check_version_consistency.py`) and item 5's
+Two items are now scripts: version consistency (`check_version_consistency.py`) and item 6's
 presence half (`check_readme_sync.py`). Everything else, "is this description still accurate," is a
 judgment call that needs reading the code, which is exactly what a script can't do and a review can.
 

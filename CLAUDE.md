@@ -20,6 +20,11 @@ repo's correctness depends on and that are easy to violate without knowing them:
 - **Three hard release gates** (`scripts/check_requirements_match.py`, `check_readme_sync.py`,
   `check_version_consistency.py`). Run all three before claiming a change is complete.
 - **A mechanizable check belongs in `scripts/`**, not in a checklist a reviewer can skip.
+- **Fixing one instance of a failure mode is not fixing the class.** Enumerate every member before
+  calling it done, and name the class in code where you can (`bulk._COLUMN_NAMING_FIELDS`) so a new
+  member fails a test instead of being silently uncovered. A misspelled `delete_flag_column` turned
+  every delete into an upsert for a full release because only its sibling field got guarded, and
+  diff-scoped review cannot catch that. `references/5-doc-review.md` item 4.
 - **This repo knows nothing about its consumers.** It is a standalone library: customers install the
   wheel without access to any demo or example repo, so no file here may name one. Describe what a
   consumer must DO ("compare the indexed value against what you sent"), never where some other repo

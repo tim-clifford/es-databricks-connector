@@ -11,8 +11,8 @@ Three types, sharing one connection base:
                      bulk_write / make_foreach_batch.
   - EsReadConfig: connection + read behavior (index, query, slicing, paging). Used by read_index.
 
-`EsConfig` remains as a backward-compatible alias for `EsWriteConfig` (the pre-0.4.0 name), so
-existing write code keeps working; new code should name the read/write config explicitly.
+`EsConfig` is a backward-compatible alias for `EsWriteConfig` (the legacy name), so existing write
+code keeps working; new code should name the read/write config explicitly.
 
 RETRIES: ONE UMBRELLA OR TWO LAYERS
 -----------------------------------
@@ -150,7 +150,7 @@ class EsWriteConfig(EsConnection):
     require_existing_index: bool = True
 
     # --- deletes ---
-    # has_deletes=False (default) is the historical behavior: every row is an index/upsert.
+    # has_deletes=False (default): every row is an index/upsert.
     # Set has_deletes=True *and* delete_flag_column to route rows whose flag is truthy to an
     # ES delete-by-id instead of an index. Requires id_field (you cannot delete without an _id).
     has_deletes: bool = False
@@ -200,8 +200,8 @@ class EsWriteConfig(EsConnection):
 class EsReadConfig(EsConnection):
     """Connection + read behavior for read_index.
 
-    v0.4.0: the caller declares the Spark schema separately (no mapping inference); this config
-    carries only connection + which index / query / how to page and slice it.
+    The caller declares the Spark schema separately (no mapping inference); this config carries
+    only connection + which index / query / how to page and slice it.
     """
     index: str = ""                         # source index (required by read_index)
     id_field: Optional[str] = None          # if the declared schema names this, it is filled from _id
@@ -320,6 +320,6 @@ for _cls in (EsConnection, EsWriteConfig, EsReadConfig):
     _support_max_retries_umbrella(_cls)
 
 
-# Backward-compatible alias: pre-0.4.0, the (write) config was named EsConfig. Keep it working so
+# Backward-compatible alias: the write config was originally named EsConfig. Keep it working so
 # existing write code and tests don't break; new code should use EsWriteConfig / EsReadConfig.
 EsConfig = EsWriteConfig

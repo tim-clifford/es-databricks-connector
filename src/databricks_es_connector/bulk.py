@@ -12,11 +12,14 @@ so nothing non-serializable is captured on the driver.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Iterator
 
 from .config import EsConfig
 from .spark_prep import sanitize_for_arrow, normalize_timestamps_for_utc
 from .transform import build_action
+
+_log = logging.getLogger(__name__)
 
 # Per-document outcomes from classify_bulk_result. Kept as module constants so the
 # writer loop and the unit tests agree on the exact strings.
@@ -30,6 +33,17 @@ ERROR = "error"
 # all-failures batch can't blow up executor or driver memory. A handful is enough to diagnose the
 # cause (mapping conflict, term-limit, etc.); it is a breadcrumb, not a dead-letter queue.
 ERROR_SAMPLE_CAP = 20
+
+# Every EsWriteConfig field whose VALUE is the name of a DataFrame column. Each one silently
+# misbehaves when the name doesn't exist, so `_preflight` validates all of them:
+#   id_field           -> a per-row KeyError on the executor, mid-write, after partial commits
+#   drop_fields        -> prunes nothing, shipping a field the caller believes was withheld
+#   delete_flag_column -> every intended delete becomes an upsert, with clean counts (proven live)
+# Declared as one tuple, rather than left implicit in the checks, so the class is enumerated in one
+# place: hardening these fields one at a time is how `delete_flag_column` stayed open while
+# `drop_fields` was guarded. A test asserts this tuple exactly, so adding a fourth such field fails
+# until someone decides whether it needs validating.
+_COLUMN_NAMING_FIELDS = ("id_field", "drop_fields", "delete_flag_column")
 
 
 def _extract_error_sample(op_type: str, item: dict) -> dict:
@@ -206,17 +220,31 @@ class EsWriteError(RuntimeError):
 def reconcile_or_raise(result: dict, *, index: str = "") -> dict:
     """Raise EsWriteError if `result` shows rejected documents or unaccounted-for rows.
 
-    Two independent failure signals, both of which a plain `written` count hides:
+    Three independent failure signals, all of which a plain `written` count hides:
       - `errors > 0`: Elasticsearch rejected specific documents (mapping conflict, 429 after
         retries, ...). Each has a diagnostic in `error_samples`.
       - `unaccounted > 0`: rows that produced no per-document outcome at all, i.e. loss below the
         per-doc level. `ignored` (delete-404 no-ops) is already subtracted, so an expected no-op
         does not trip this.
+    A NEGATIVE `unaccounted` (more outcomes than input rows) is structurally impossible and would
+    mean a counting bug in this library rather than anything wrong with the caller's data. It is
+    LOGGED, never raised: raising would fail a healthy write, and on the streaming path that means an
+    infinite retry loop on a batch that can never pass, with no escape but `on_error="log"` (which
+    would also switch off real loss detection). So the inconsistency is surfaced without wedging a
+    pipeline over a library defect.
 
     Returns the result unchanged when the write was clean, so it can be used inline.
     """
     errors = int(result.get("errors", 0) or 0)
     unaccounted = int(result.get("unaccounted", 0) or 0)
+    if unaccounted < 0:
+        _log.error(
+            "write to index %r reported %s more per-document outcomes than input rows "
+            "(total_input=%s written=%s deleted=%s errors=%s ignored=%s). That is impossible and "
+            "indicates an accounting bug in databricks-es-connector, not a problem with your data. "
+            "The write itself is not failed over it; please report this result dict.",
+            index, -unaccounted, result.get("total_input"), result.get("written"),
+            result.get("deleted"), errors, result.get("ignored"))
     if not errors and unaccounted <= 0:
         return result
 
@@ -237,21 +265,37 @@ def reconcile_or_raise(result: dict, *, index: str = "") -> dict:
 def _preflight(df, cfg: EsConfig) -> None:
     """Driver-side checks that must fail CLOSED before any row is written.
 
-    Both guard against a write that reports perfect success while doing the wrong thing, and both
-    run ONCE on the driver (never inside the mapInPandas closure, which would put an HTTP round-trip
-    on every executor):
+    Every check here guards against a write that reports perfect success while doing the wrong
+    thing, and all of them run ONCE on the driver (never inside the mapInPandas closure, which would
+    put an HTTP round-trip on every executor):
 
+      - every config field that NAMES A DATAFRAME COLUMN (`_COLUMN_NAMING_FIELDS`) must name a
+        column that exists. This is the class; see the per-field notes below for what each one
+        silently does otherwise.
       - `require_existing_index`: ES auto-creates a missing index, so a TYPO'd index name silently
         produces a new dynamically-mapped index and a clean `written` count. One `indices.exists`
         call turns that into an error.
-      - `strict_drop_fields`: a misspelled `drop_fields` entry prunes nothing, so a field the caller
-        believes is withheld ships to ES. Since drop_fields is commonly a PII/egress control, an
-        unknown name must fail rather than silently no-op.
+
+    Why the driver is the ONLY place the column checks can live: below this layer a row is just a
+    dict, and `row.get(name)` returns None both for a column that is absent and for a column that is
+    present-but-null. Those two cases must behave DIFFERENTLY (a null flag is legitimately "not a
+    delete"; an absent flag is a misconfiguration) and only `df.columns` can tell them apart.
     """
+    # df.columns is cheap and safe here: sanitize_for_arrow has already removed the VARIANT
+    # columns that make schema access throw on Spark Connect.
+    present = set(df.columns)
+
+    if cfg.id_field is not None and cfg.id_field not in present:
+        # Without this, _require_id raises per-row on the executor mid-write, after earlier
+        # partitions may already have committed their documents. One driver-side failure before any
+        # write beats a partial write plus an opaque KeyError from inside mapInPandas.
+        raise ValueError(
+            f"id_field {cfg.id_field!r} is not a column in the DataFrame. "
+            f"Available columns: {sorted(present)}. Every row needs this column to derive its "
+            "deterministic _id; fix the name, or leave id_field unset to let Elasticsearch assign "
+            "random ids (note: replays then duplicate instead of upserting).")
+
     if cfg.strict_drop_fields and cfg.drop_fields:
-        # df.columns is cheap and safe here: sanitize_for_arrow has already removed the VARIANT
-        # columns that make schema access throw on Spark Connect.
-        present = set(df.columns)
         unknown = [c for c in cfg.drop_fields if c not in present]
         if unknown:
             raise ValueError(
@@ -259,6 +303,21 @@ def _preflight(df, cfg: EsConfig) -> None:
                 f"Available columns: {sorted(present)}. A misspelled drop_fields entry prunes "
                 "nothing and would ship the field to Elasticsearch anyway; fix the name, or set "
                 "strict_drop_fields=False if the config is intentionally reused across schemas.")
+
+    if cfg.has_deletes and cfg.delete_flag_column not in present:
+        # The worst of this class, and the reason it was hardened: with a misspelled flag column
+        # every row reads as "not flagged", so NO row is routed to a delete and every intended
+        # deletion is applied as an upsert instead. Verified live: deleted=0, errors=0,
+        # unaccounted=0, raise_on_error=True passing clean, and the documents that were supposed to
+        # be erased still in the index -- with the flag column itself indexed alongside them.
+        # Unconditional (no opt-out knob): has_deletes=True is meaningless without a real flag
+        # column, so there is no legitimate configuration this rejects.
+        raise ValueError(
+            f"delete_flag_column {cfg.delete_flag_column!r} is not a column in the DataFrame. "
+            f"Available columns: {sorted(present)}. With has_deletes=True every row would read as "
+            "not-flagged, so each intended DELETE would silently be applied as an upsert and the "
+            "documents would stay in Elasticsearch (deleted=0, errors=0, reconciliation clean). "
+            "Fix the name, or set has_deletes=False if this write has no deletes.")
 
     if cfg.require_existing_index:
         from elasticsearch import Elasticsearch

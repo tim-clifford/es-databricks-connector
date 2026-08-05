@@ -46,7 +46,15 @@ Each fixture owns one concern:
   with `has_deletes=True`, flagged rows delete-by-`_id` while unflagged rows index; `deleted` is
   counted exactly; the delete-flag column is never indexed; and a delete of an absent `_id` is a
   **404 no-op** (neither a delete nor an error): the `classify_bulk_result` suppression rule that
-  unit tests cover in isolation, proven live. Includes an idempotent re-delete.
+  unit tests cover in isolation, proven live. Includes an idempotent re-delete. Every config here
+  names columns that exist; the misspelled-name case belongs to `test_preflight_column_guards.py`.
+- **`test_preflight_column_guards.py`**: live ES. Owns the **fail-closed contract for config fields
+  that name a column** (`_COLUMN_NAMING_FIELDS`: `id_field`, `drop_fields`, `delete_flag_column`).
+  The negative counterpart to the fixture above: a misspelled `delete_flag_column` used to route
+  **no** row to a delete, so every intended deletion became an upsert while reporting `deleted=0`,
+  `errors=0` and passing `raise_on_error=True` clean. Asserts each misspelling raises before any
+  document is written (ES state unchanged, not partially upserted), and that a correct config still
+  deletes, so the guards can't pass by simply blocking everything.
 - **`test_streaming_sink.py`**: live ES + a throwaway Delta table + a UC-Volume checkpoint. Owns
   the **streaming sink**: `make_foreach_batch` as a real `foreachBatch` on `readStream` +
   `trigger(availableNow=True)`. Proves one doc per source row and restart idempotency (re-running

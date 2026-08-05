@@ -1,8 +1,8 @@
 """Pure-Python inverse of `transform.coerce_value`: ES `_source` value -> the value Spark expects
 for a declared target type. No Spark, no ES client: unit-testable, and the single coercion oracle
-shared by the driver-side reader (read.py) and the future distributed reader.
+shared by the distributed reader (read.py).
 
-The read path requires the caller to declare a Spark schema (v0.4.0). That is deliberate: several
+The read path requires the caller to declare a Spark schema. That is deliberate: several
 write transforms are documented as one-way and are NOT invertible from `_source` alone:
   - a `date`/`timestamp` is stored as an epoch-millis integer (indistinguishable from a plain long),
   - a `decimal` is stored as a float,
@@ -71,6 +71,32 @@ def _reject_non_scalar(value: Any, target: Any) -> None:
             "Declare a matching struct<...> type.")
 
 
+# Recognized boolean spellings for a `boolean`-declared field whose stored value is a STRING. Kept
+# symmetric with transform._DELETE_TRUE_STRINGS / _DELETE_FALSE_STRINGS so the write and read sides
+# agree on what a boolean-ish string means. Anything outside both lists raises rather than defaulting.
+_BOOL_TRUE_STRINGS = ("true", "t", "1", "yes", "y")
+_BOOL_FALSE_STRINGS = ("false", "f", "0", "no", "n")
+
+# Declared Spark types the reader cannot honor, mapped to the fix. Their simpleString() tokens match
+# no branch below, so before this check they fell through the unknown-token passthrough with the
+# value UNTOUCHED -- skipping even the _reject_non_scalar guard that "string" applies. Spark then
+# rejects the column from mapInPandas with `Invalid return type`, naming neither the field nor the
+# real cause. Failing here names both.
+_UNSUPPORTED_SCALAR_TOKENS = {
+    "char": "CharType is not supported by read_index; declare StringType instead",
+    "varchar": "VarcharType is not supported by read_index; declare StringType instead",
+    "void": "NullType is not supported by read_index; declare the column's real type",
+}
+
+
+def _reject_unsupported_token(t: str, target: Any) -> None:
+    """Raise ReadSchemaMismatch for a declared type read_index cannot carry through mapInPandas."""
+    base = t.split("(", 1)[0].strip()
+    fix = _UNSUPPORTED_SCALAR_TOKENS.get(base)
+    if fix is not None:
+        raise ReadSchemaMismatch(f"declared type {target!r} cannot be read: {fix}.")
+
+
 _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 
 
@@ -115,7 +141,13 @@ def read_coerce(value: Any, target: Any) -> Any:
     null/missing -> None for every type. Each non-null branch is the inverse of a coerce_value
     transform; anything already JSON-native (string/number/bool) passes through with the target's
     interpretation applied.
+
+    A declared type the reader cannot honor (char/varchar/void) raises ReadSchemaMismatch. That is
+    checked BEFORE the null branch: the type is wrong whatever the value happens to be, so a column
+    that is null in the first document read must not look supported.
     """
+    if not isinstance(target, tuple):
+        _reject_unsupported_token(target.strip().lower(), target)
     if _is_null(value):
         return None
 
@@ -181,6 +213,23 @@ def read_coerce(value: Any, target: Any) -> Any:
 
     if t == "boolean":
         _reject_non_scalar(value, target)
+        if isinstance(value, str):
+            # bool() on a string is truthiness, so a stored "false"/"0"/"no" would read back as
+            # True: the value inverts, silently, and a boolean column is exactly where nobody
+            # re-checks. Parse an explicit allow-list in BOTH directions and refuse anything else,
+            # mirroring transform._is_delete_flagged on the write side (same reasoning: both
+            # possible defaults are wrong). Strings arise when reading an index the connector did
+            # not write; a connector round-trip stores real JSON booleans and skips this branch.
+            s = value.strip().lower()
+            if s in _BOOL_TRUE_STRINGS:
+                return True
+            if s in _BOOL_FALSE_STRINGS:
+                return False
+            raise ReadSchemaMismatch(
+                f"stored value {value!r} is a string that is neither true-like "
+                f"{_BOOL_TRUE_STRINGS} nor false-like {_BOOL_FALSE_STRINGS}, but the declared type "
+                f"is {target!r}. bool() would read ANY non-empty string as True, so 'false' would "
+                "come back True. Declare StringType and convert in Spark, or fix the source data.")
         return bool(value)
 
     # --- string family, incl. the variant/interval-as-string round-trip (passthrough).
