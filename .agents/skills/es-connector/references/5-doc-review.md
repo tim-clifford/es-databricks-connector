@@ -45,7 +45,7 @@ Concrete rules:
 | `RELEASING.md` | the 4-step release process + the hard gates | the release flow, gate scripts, FEVM paths, or step order change |
 | `HANDOFF.md` | production-readiness / known limitations, pinned to a version | a limitation is closed, a version ships, or a gap changes status (check the version in its header matches `pyproject.toml`) |
 | `.agents/skills/es-connector/SKILL.md` + `references/*` | this skill: architecture, fidelity model, datatype contract, ES gotchas, release | ANY of the above change, because the skill restates them; the skill is the doc most prone to silent drift |
-| `CLAUDE.md` (this repo AND the demos repo) | the short auto-loaded pointer to this skill, plus the handful of rules most likely to be broken without it | a skill rule is added/changed/removed, a gate script is added, or a path in it moves. It EXISTS because `.agents/skills/` is not auto-discovered by the agent harness, so it is the only part of the skill that loads by default: if it drifts, the skill is effectively unenforced. Treat a change to SKILL.md as a prompt to re-read it. |
+| `CLAUDE.md` | the short auto-loaded pointer to this skill, plus the handful of rules most likely to be broken without it | a skill rule is added/changed/removed, a gate script is added, or a path in it moves. It EXISTS because `.agents/skills/` is not auto-discovered by the agent harness, so it is the only part of the skill that loads by default: if it drifts, the skill is effectively unenforced. Treat a change to SKILL.md as a prompt to re-read it. |
 
 ## The checklist
 
@@ -57,8 +57,8 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
    docs, the skill, and `integration_tests/config/test_config.yml`. That last one is why this was
    promoted from a manual check: it pins the wheel the LIVE integration tier *installs*, so a stale
    pin there means the whole tier validates the PREVIOUS release while reporting success. It sat at
-   0.5.0 while the source was 0.6.0. **The script cannot see the demos repo**, so still eyeball the
-   `%pip install` lines there by hand.
+   0.5.0 while the source was 0.6.0. The script only sees THIS repo, so any consumer that pins a
+   wheel filename of its own is out of its reach and has to be checked wherever it lives.
 2. **Public API.** Every name in `__init__.py`'s `__all__` is documented in the README, and the
    README names no function/config field that no longer exists. Config fields
    (`EsWriteConfig`/`EsReadConfig`) match `config.py`.
@@ -83,19 +83,23 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
    listed). Then eyeball that each listed description is still ACCURATE, not just present.
 6. **Release process.** `RELEASING.md` steps match the actual scripts (`scripts/*.py`), the FEVM
    paths/profile are current, and the step order still has build+upload BEFORE the integration run.
-7. **`CLAUDE.md` vs. the skill.** Both repos have one, and they are the ONLY auto-loaded pointer to
-   this skill (`.agents/skills/` is not discovered by the harness). Check that every rule each one
-   states is still true, that the paths it cites exist, and that a rule added to SKILL.md since the
-   last review is reflected if it is the kind of rule someone would violate without reading the full
-   skill. Keep them SHORT: they are a signpost, not a second copy of the skill. A CLAUDE.md that has
-   grown into a summary of everything stops being read, which is the failure mode it exists to fix.
-8. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
+7. **`CLAUDE.md` vs. the skill.** It is the ONLY auto-loaded pointer to this skill
+   (`.agents/skills/` is not discovered by the harness). Check that every rule it states is still
+   true, that the paths it cites exist, and that a rule added to SKILL.md since the last review is
+   reflected if it is the kind someone would violate without reading the full skill. Keep it SHORT:
+   a signpost, not a second copy of the skill. One that grows into a summary of everything stops
+   being read, which is the failure mode it exists to fix.
+8. **No outbound references to a consumer.** This library ships to customers who have only the
+   wheel, so nothing here may name a downstream repo, demo, or example project. Grep for one before
+   finishing (a doc, a comment, or a skill reference is just as much of a leak as code). State what a
+   consumer must DO instead of pointing at where someone else did it. Awareness is inbound only.
+9. **The skill vs. the code.** Spot-check that SKILL.md's "architecture in one screen" and the
    critical rules still hold (write-path order, the serverless constraints, the five-places rule),
    and that refs 1, 3, 4 don't cite a function, path, or behavior that changed. Because the skill
    duplicates the READMEs by design, it drifts first, treat it as guilty until checked.
-9. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
+10. **HANDOFF status.** Any "Open item" that has since been addressed (e.g. the timezone fix) is moved
    out of open items or annotated, so the readiness doc doesn't understate the connector.
-10. **Conciseness and pruning (the counterbalance to items 3-9).** Items 3-9 push toward *adding*;
+11. **Conciseness and pruning (the counterbalance to items 3-10).** Items 3-10 push toward *adding*;
    this one pushes back. Read each doc as a first-time user would and cut what no longer earns its
    place: obsolete caveats/workarounds for since-fixed behavior, changelog-style "as of vX we..."
    narration, duplicate explanations of the same point across files, and depth that belongs in a

@@ -53,9 +53,10 @@ dbx_test run \
   --config integration_tests/config/test_config.yml
 ```
 
-`test_config.yml` pins the wheel path, it must name the version you're releasing. The demos repo
-(`es-databricks-connector-demos`) has self-validating DAB jobs (`datatype_coverage`,
-`ocsf_schema_validation`) that are a second live check; deploy+run with `databricks bundle`.
+`test_config.yml` pins the wheel path, it must name the version you're releasing;
+`scripts/check_version_consistency.py` enforces that. Any downstream consumer that installs the wheel
+is a useful second live check on a release candidate, but it is not part of this repo's gate: the
+integration tier above is what has to be green.
 
 ## The release gates (`scripts/`, all hard gates in RELEASING.md step 3)
 

@@ -20,6 +20,10 @@ repo's correctness depends on and that are easy to violate without knowing them:
 - **Three hard release gates** (`scripts/check_requirements_match.py`, `check_readme_sync.py`,
   `check_version_consistency.py`). Run all three before claiming a change is complete.
 - **A mechanizable check belongs in `scripts/`**, not in a checklist a reviewer can skip.
+- **This repo knows nothing about its consumers.** It is a standalone library: customers install the
+  wheel without access to any demo or example repo, so no file here may name one. Describe what a
+  consumer must DO ("compare the indexed value against what you sent"), never where some other repo
+  does it. Awareness is one-way, inbound only.
 
 Both test tiers: `pytest tests/` (fast, pure-Python) and the live `integration_tests/` tier on FEVM
 serverless via `dbx_test`. The Spark-side code in `spark_prep.py` can ONLY be proven in the

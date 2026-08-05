@@ -89,8 +89,8 @@ Hardening still needed before production for SIEM/audit data:
   8.19: `amount` dynamically mapped `long`, writing `100.75` gives `errors=0` and round-trips as
   `100.75`, while the indexed value is `100` and a `range > 100.5` query finds nothing. Any acceptance
   test that claims to validate mapping must read indexed values (`fields`, an aggregation, or
-  `GET /_mapping`). Pre-creating explicit mappings is the real fix; the demos assert on the indexed
-  value via the shared `es_verify/` helper.
+  `GET /_mapping`). Pre-creating explicit mappings is the real fix; an acceptance test should assert
+  on the indexed value rather than on a `read_index` round-trip.
 - **Updates & deletes.** Inserts/upserts via deterministic `_id`, and deletes via `has_deletes` +
   `delete_flag_column` (emitting delete-by-`_id` bulk actions with scoped 404 no-op suppression),
   are supported. The connector deletes exactly the rows the caller flags: it does **not** dedup or

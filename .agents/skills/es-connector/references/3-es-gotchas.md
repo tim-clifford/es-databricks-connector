@@ -66,8 +66,7 @@ Consequences:
 
 Proven live in `integration_tests/test_dynamic_mapping_coercion.py` (both halves, with the two
 "surprise" assertions being genuinely red-able if ES ever stopped coercing/truncating). Documented in
-the README "Dynamic-mapping gotcha" note. The demos repo carries a shared `es_verify/` helper that
-performs the indexed-value comparison.
+the README "Dynamic-mapping gotcha" note.
 
 ## General principle
 
