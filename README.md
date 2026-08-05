@@ -411,7 +411,9 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
 raises (pick one).
 
-Retries have two levels on a write, and `max_retries=N` sets both at once. See
+**How many retry levels apply depends on the direction.** A **read** has only the transport level
+above, so `transport_max_retries` and `max_retries` are equivalent there. A **write** has a second,
+per-document level, and `max_retries=N` sets both at once, see
 [Retries on a write](#retries-on-a-write-two-layers).
 
 ### Write behavior (`EsWriteConfig`)
@@ -497,11 +499,8 @@ cross-batch ordering caveat.
 
 ### Read behavior (`EsReadConfig`)
 
-`EsReadConfig` = the connection fields above **plus** these read-specific fields.
-
-A read has only **one** retry level, the transport one, since there are no documents being written to
-retry individually. So `transport_max_retries` and `max_retries` are equivalent here, and
-`max_retries_per_doc` does not apply.
+`EsReadConfig` = the connection fields above **plus** these read-specific fields. (No retry fields
+here: a read only has the transport level, set via the connection fields.)
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
