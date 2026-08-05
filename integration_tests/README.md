@@ -110,7 +110,11 @@ runs each fixture as a notebook, and reports console + JUnit + JSON results (JUn
 
 ## Notes on the dbx_test dependency
 
-- Installed from `main` (`git+https://github.com/jsparhamii/dbx_test.git`). Each fixture ends with
-  the documented no-arg `run_notebook_tests()`, which discovers the fixture class in the notebook's
-  scope.
+- Installed from `main` (`git+https://github.com/jsparhamii/dbx_test.git`). `run_notebook_tests()`
+  takes no arguments and discovers the fixture class in the notebook's scope.
+- **End every fixture with `dbutils.notebook.exit(json.dumps(run_notebook_tests()))`**, not a bare
+  `run_notebook_tests()`. Only the notebook-exit payload carries the per-test results back to the
+  runner. Call it bare and the tier still reports the fixture as **passing**, but as a single opaque
+  `all_tests` entry instead of one line per test, so a green tells you nothing about which
+  assertions ran. Check the console output names your tests individually before trusting a pass.
 

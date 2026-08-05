@@ -148,4 +148,7 @@ class TestPreflightColumnGuards(NotebookTestFixture):
 
 
 # COMMAND ----------
-run_notebook_tests()
+# Return the results through notebook.exit so the runner reports each test by NAME. Calling
+# run_notebook_tests() bare makes the tier count the whole fixture as one opaque pass, which cannot
+# be attributed to the assertions that actually ran.
+dbutils.notebook.exit(json.dumps(run_notebook_tests()))
