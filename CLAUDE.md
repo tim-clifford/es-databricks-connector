@@ -17,8 +17,13 @@ repo's correctness depends on and that are easy to violate without knowing them:
   review time. If a doc change is net-additive only, the pruning step was skipped.
 - **Serverless constraints are load-bearing.** No RDD APIs; `df.schema`/`df.columns` throw on a
   VARIANT column; executors build their own ES client from a frozen config. Do not "simplify" these.
-- **Three hard release gates** (`scripts/check_requirements_match.py`, `check_readme_sync.py`,
-  `check_version_consistency.py`). Run all three before claiming a change is complete.
+- **Four hard release gates** (`scripts/check_requirements_match.py`, `check_readme_sync.py`,
+  `check_version_consistency.py`, `check_tier_results.py`). Run all four before claiming a change is
+  complete.
+- **A green test tier is not evidence the tests ran.** `dbx_test` reports a fixture whose `run_setup`
+  raises as ZERO tests, and derives failures from the tests that ran, so a skipped fixture prints as
+  a pass and `All tests passed`. Never read a total as coverage: `check_tier_results.py` compares each
+  fixture's reported count against its source. Two runs of "84/84" hid a fixture that ran nothing.
 - **A mechanizable check belongs in `scripts/`**, not in a checklist a reviewer can skip.
 - **Fixing one instance of a failure mode is not fixing the class.** Enumerate every member before
   calling it done, and name the class in code where you can (`bulk._COLUMN_NAMING_FIELDS`) so a new

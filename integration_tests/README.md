@@ -117,4 +117,15 @@ runs each fixture as a notebook, and reports console + JUnit + JSON results (JUn
   runner. Call it bare and the tier still reports the fixture as **passing**, but as a single opaque
   `all_tests` entry instead of one line per test, so a green tells you nothing about which
   assertions ran. Check the console output names your tests individually before trusting a pass.
+- **A failure in `run_setup` reports as a PASS.** `dbx_test` catches it, prints
+  `Skipping tests due to setup failure`, and returns an empty result list; the summary then derives
+  `total=0, failed=0` from that, which every downstream reader treats as success (one `all_tests`
+  entry, `Failed: 0`, `All tests passed`). So a fixture that never ran a single assertion is
+  indistinguishable from a clean one in the headline numbers. `scripts/check_tier_results.py` is the
+  gate for this and runs as part of RELEASING.md step 2: it compares each fixture's reported test
+  count against the `test_*` methods in its source. Do not accept a tier result without it.
+- **Every fixture must CREATE each index it writes to**, with an explicit mapping, rather than
+  relying on Elasticsearch auto-creation: `require_existing_index` defaults to `True`, so a write to
+  a missing index raises, and per the point above that raise inside `run_setup` silently costs you
+  the whole fixture.
 

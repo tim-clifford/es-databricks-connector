@@ -68,7 +68,12 @@ class TestBulkWriteResultContract(NotebookTestFixture):
         # and the reconciliation identity holds, yet ES ends up with FEWER docs than rows fed in.
         # A client exporting a table with non-unique id_field values sees a lower doc count with no
         # error signal: this pins that documented behavior. Fresh index so the count is unambiguous.
+        # CREATE it explicitly rather than leaning on ES auto-creation: `require_existing_index`
+        # (default True) rejects a write to a missing index, so an auto-created one would fail this
+        # setup, and a setup failure reports as zero tests run rather than as a failure.
         requests.delete(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30)
+        requests.put(f"{ES_HOSTS}/{DUP_INDEX}", auth=ES_AUTH, verify=False, timeout=30,
+                     headers={"Content-Type": "application/json"}, data=json.dumps(body))
         dup_cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
                            index=DUP_INDEX, id_field="doc_id", http_compress=True)
         dup = spark.sql("""
