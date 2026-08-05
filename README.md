@@ -499,6 +499,10 @@ cross-batch ordering caveat.
 
 `EsReadConfig` = the connection fields above **plus** these read-specific fields.
 
+A read has only **one** retry level, the transport one, since there are no documents being written to
+retry individually. So `transport_max_retries` and `max_retries` are equivalent here, and
+`max_retries_per_doc` does not apply.
+
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
 | `index` | `str` | `""` | **Yes** | Source index. `read_index` raises if empty. |
