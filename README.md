@@ -407,47 +407,24 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `max_retries` | `int` | - | No | **Umbrella**: sets every retry layer at once (`transport_max_retries`, plus [`max_retries_per_doc`](#write-behavior-eswriteconfig) on a write config). A constructor convenience, not a stored field. Passing it *together with* a per-layer field raises. |
 | `retry_on_timeout` | `bool` | `True` | No | Retry on timeout as well as connection errors. |
 
-#### Two retry layers
-
-A bulk request sends N documents in one HTTP call, and ES answers with a **single HTTP 200** plus a
-per-item status in the response *body*. "The request succeeded" and "the documents succeeded" are
-therefore different questions, each with its own retry. The two knobs live on different configs,
-because only a write has documents to retry:
-
-| | `transport_max_retries` | `max_retries_per_doc` |
-|---|---|---|
-| Defined on | `EsConnection` (the table above) | `EsWriteConfig` ([table below](#write-behavior-eswriteconfig)) |
-| Default | `3` | `3` |
-| Retries on | `429, 502, 503, 504` (whole request) | `429` (per item, via `retry_on_doc_status`) |
-| Retry unit | The entire request, all N documents | Only the failed subset |
-| Catches | ES unreachable, LB 503, gateway timeout, connection reset | A document ES refused because its write queue is full |
-| Applies to | Reads and writes | Writes only |
-
-A **429 means different things at each layer**: "the cluster rejected your request" versus "the
-cluster rejected this document". Only the second loses data quietly, and `transport_max_retries`
-cannot see it.
-
-Configure with one knob or two, not both:
-
-```python
-EsWriteConfig(..., max_retries=5)                 # umbrella: 5 at every layer
-EsWriteConfig(..., transport_max_retries=5,       # granular: tune each layer
-                   max_retries_per_doc=2)
-```
-
-`max_retries` expands into the per-layer fields at construction, so no stored value can disagree with
-them. Passing it together with a per-layer field raises rather than resolving by precedence. Reading
-`cfg.max_retries` gives the shared value when the layers agree, `None` when they differ.
-
-Per-document retries sleep **blockingly** in the executor with exponential backoff (2s, doubling,
-capped at 600s), so `max_retries=8` is up to ~8.5 minutes per partition while costing the transport
-layer almost nothing. Use the granular form for a high transport count. Setting
-`transport_max_retries` above its default with `max_retries_per_doc=0` warns, since that leaves
-rejected documents with no retries at all.
-
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
 raises (pick one).
+
+**Setting retries with one knob.** `max_retries=N` sets every retry layer at once, on any config:
+
+```python
+EsReadConfig(...,  max_retries=5)                 # the transport layer
+EsWriteConfig(..., max_retries=5)                 # transport AND per-document
+EsWriteConfig(..., transport_max_retries=5,       # or tune each layer
+                   max_retries_per_doc=2)
+```
+
+It expands into the per-layer fields at construction, so no stored value can disagree with them.
+Passing it together with a per-layer field raises rather than resolving by precedence. Reading
+`cfg.max_retries` gives the shared value when the layers agree, `None` when they differ. A write has
+a second layer the transport knob cannot reach, see
+[Retries on a write](#retries-on-a-write-two-layers) below.
 
 ### Write behavior (`EsWriteConfig`)
 
@@ -461,6 +438,31 @@ raises (pick one).
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
 | `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses are worth retrying. `429` = ES write queue full. Empty with a non-zero `max_retries_per_doc` raises. |
 | `require_existing_index` | `bool` | `True` | No | Verify the index exists before writing. ES auto-creates a missing index, so a **typo'd index name** otherwise produces a brand-new dynamically-mapped index and a perfect-looking `written` count. One `indices.exists` call on the driver. Set `False` to allow auto-creation (e.g. with an index template). |
+
+#### Retries on a write: two layers
+
+A bulk request sends N documents in one HTTP call, and ES answers with a **single HTTP 200** plus a
+per-item status in the response *body*. "The request succeeded" and "the documents succeeded" are
+therefore different questions, so a write has two retry layers:
+
+| | `transport_max_retries` | `max_retries_per_doc` |
+|---|---|---|
+| Defined on | `EsConnection` ([above](#connection-shared-by-both-configs)) | `EsWriteConfig` (the table above) |
+| Default | `3` | `3` |
+| Retries on | `429, 502, 503, 504` (whole request) | `429` (per item, via `retry_on_doc_status`) |
+| Retry unit | The entire request, all N documents | Only the failed subset |
+| Catches | ES unreachable, LB 503, gateway timeout, connection reset | A document ES refused because its write queue is full |
+
+A **429 means different things at each layer**: "the cluster rejected your request" versus "the
+cluster rejected this document". Only the second loses data quietly, and `transport_max_retries`
+cannot see it, because the per-item statuses are in a response body the transport layer never
+inspects.
+
+Per-document retries sleep **blockingly** in the executor with exponential backoff (2s, doubling,
+capped at 600s), so `max_retries=8` is up to ~8.5 minutes per partition while costing the transport
+layer almost nothing. Tune the layers separately for a high transport count. Setting
+`transport_max_retries` above its default with `max_retries_per_doc=0` warns, since that leaves
+rejected documents with no retries at all.
 
 **Doc shaping**
 
