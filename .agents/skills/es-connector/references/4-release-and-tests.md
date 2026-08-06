@@ -70,13 +70,20 @@ integration tier above is what has to be green.
   drift a diff-scoped review can't). Exit 1 with the gaps. Matching is word-boundary aware
   (`transform.py` is NOT satisfied by `read_transform.py`).
 - **`scripts/check_tier_results.py`**, asserts the tier RAN what it claims to cover: every fixture
-  appears in the newest `results.json` and its reported test count equals the number of `test_*`
-  methods in its source. `Failed: 0` cannot establish this on its own, because `dbx_test` turns a
-  `run_setup` exception into "zero tests ran" and derives the failure count from the tests that ran,
-  so a skipped fixture reports as a pass. `test_bulk_write_roundtrip` was silently not running for
-  six tier runs while the summary printed `84/84` and `All tests passed`; the total looked stable only
-  because the 8 tests it dropped were nearly offset by a new 7-test fixture. Exit 1 on a zero-test
-  fixture, an opaque `all_tests` entry, a partial run, or a fixture missing entirely.
+  appears in the newest `results.json` and every `test_*` method in its source is reported BY NAME
+  with a status that asserted something. `Failed: 0` cannot establish this on its own, because
+  `dbx_test` turns a `run_setup` exception into "zero tests ran" and derives the failure count from
+  the tests that ran, so a skipped fixture reports as a pass. `test_bulk_write_roundtrip` was silently
+  not running for six tier runs while the summary printed `84/84` and `All tests passed`; the total
+  looked stable only because the 8 tests it dropped were nearly offset by a new 7-test fixture.
+  Exit 1 on a zero-test fixture, an opaque `all_tests` entry, a partial run, a renamed-but-unwired
+  test, a `skipped` test, or a fixture missing entirely. Matching NAMES rather than counts is
+  deliberate: `dbx_test` expands a `@pytest.mark.parametrize` method into `test_thing[1]`,
+  `test_thing[2]`, ..., so a count check would fail a healthy parametrized fixture, and a count also
+  cannot see one test vanishing while another is added. The gate reimplements the framework's
+  discovery with `ast` (the fixtures are notebooks and cannot be imported off-cluster), including
+  per-case parametrize expansion, so it must stay in step with `_get_test_methods`:
+  `tests/test_check_tier_results.py` pins that parity along with every failure shape.
 - **`scripts/check_version_consistency.py`**, asserts `pyproject.toml`'s version matches
   `__init__.__version__`, `HANDOFF.md`'s header, and every wheel-filename reference in the docs, this
   skill, and `integration_tests/config/test_config.yml`. That last file is the reason it exists: it

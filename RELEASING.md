@@ -91,9 +91,14 @@ GATE, not an optional check:
 python scripts/check_tier_results.py           # newest .dbx-test-results/*/results.json
 ```
 
-Exits `0` only when every fixture appears in the results AND its reported test count matches the
-number of `test_*` methods in its source. Exits `1` naming any fixture that reported zero tests, a
-single opaque `all_tests` entry, a partial run, or that is missing entirely. This caught
+Exits `0` only when every fixture appears in the results AND every `test_*` method in its source is
+reported BY NAME with a status that actually asserted something. Exits `1` naming any fixture that
+reported zero tests, a single opaque `all_tests` entry, a partial run, a test that was renamed
+without being wired up, a `skipped` test (reported as an ordinary entry, so it would otherwise keep
+the numbers matching while verifying nothing), or a fixture missing entirely. An `xfailed` test is
+allowed but printed as a warning: it ran, but it pins a known-broken path. Parametrized methods
+(`test_thing[1]`, `test_thing[2]`, ...) are matched back to their source method, so they neither
+inflate nor fail the check. This caught
 `test_bulk_write_roundtrip` silently not running for six consecutive tier runs while the summary
 printed `84/84` and `All tests passed` (its setup wrote to an index it never created, which
 `require_existing_index=True` began rejecting in 0.6.0). The headline total held steady because the
