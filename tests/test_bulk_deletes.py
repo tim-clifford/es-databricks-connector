@@ -319,7 +319,7 @@ def test_merge_concatenates_and_caps_samples():
 def test_merge_empty_is_all_zero():
     out = _merge_partition_results([])
     assert out == {"written": 0, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
-                   "total_input": 0, "unaccounted": 0, "error_samples": []}
+                   "total_input": 0, "unaccounted": 0, "overcounted": 0, "error_samples": []}
 
 
 # --- bulk_write orchestration wiring (fake Spark; symmetry with read_index's unit test) --------

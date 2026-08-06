@@ -72,7 +72,7 @@ def make_foreach_batch(cfg: EsConfig, on_batch: Optional[Callable] = None,
                 # micro-batch" from "0 written of N".
                 on_batch(batch_id, {"written": 0, "deleted": 0, "errors": 0, "ignored": 0,
                                     "coerced_nonfinite": 0, "total_input": 0, "unaccounted": 0,
-                                    "error_samples": [], "empty": True})
+                                    "overcounted": 0, "error_samples": [], "empty": True})
             return
         result = bulk_write(batch_df, cfg)
         # The metrics hook runs first so it sees a failing batch too (it may be the dead-letter path).

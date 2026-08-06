@@ -228,6 +228,7 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   "coerced_nonfinite": 0,  # inf/-inf/NaN values that had to become JSON null to be sent
   "total_input": 1000,     # rows handed to the writer
   "unaccounted": 0,        # rows that produced NO per-document outcome (loss below that level)
+  "overcounted": 0,        # more outcomes than input rows: impossible, so a bug in THIS library
   "error_samples": [       # bounded diagnostics for rejected docs (up to 20)
     {"_id": "abc", "op_type": "index", "status": 400,
      "reason": "failed to parse field [ts] of type [date]"},
@@ -236,12 +237,19 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 ```
 
 - **`unaccounted` is the reconciliation check, pre-computed.** Every input row yields exactly one of
-  `written`/`deleted`/`errors`/`ignored`, so `unaccounted = total_input - (those four)` and a
-  positive value means rows vanished below the per-document level (e.g. a chunk-level
-  serialization/transport error) where the `errors` count structurally cannot see them. `ignored` is
-  part of the identity precisely so an expected delete-404 no-op does not masquerade as loss.
-  `bulk_write(df, cfg, raise_on_error=True)` (or `reconcile_or_raise(result)`) turns both signals
-  into an `EsWriteError`; the streaming path does this by default.
+  `written`/`deleted`/`errors`/`ignored`, so any shortfall means rows vanished below the per-document
+  level (e.g. a chunk-level serialization/transport error) where the `errors` count structurally
+  cannot see them. `ignored` is part of the identity precisely so an expected delete-404 no-op does
+  not masquerade as loss. `bulk_write(df, cfg, raise_on_error=True)` (or `reconcile_or_raise(result)`)
+  turns both signals into an `EsWriteError`; the streaming path does this by default.
+- **`overcounted` should always be 0.** It counts the reverse discrepancy, more per-document outcomes
+  than input rows, which is impossible by construction and so indicates a counting bug in this
+  library rather than anything wrong with your data. It is reported and logged but does **not** fail
+  the write, because failing a healthy write over our defect would wedge a streaming pipeline in a
+  retry loop on a batch that can never pass. It is a separate field rather than a negative
+  `unaccounted` so that it can never net against real loss: the two are accumulated per partition, so
+  one partition over-counting cannot cancel out another partition genuinely losing rows. If you ever
+  see a non-zero value, please report the result dict.
 - **`coerced_nonfinite` catches invisible nulls.** `inf`/`-inf`/`NaN` have no JSON representation
   (ES rejects the bare `Infinity`/`NaN` tokens), so they must become JSON null to be sent at all.
   That is the right behavior, but it means an upstream divide-by-zero lands in ES as a null with no
