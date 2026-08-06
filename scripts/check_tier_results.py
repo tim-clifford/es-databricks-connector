@@ -69,7 +69,7 @@ def newest_results() -> Path:
     """The results.json from the most recent tier run, by directory name (timestamped)."""
     candidates = sorted(RESULTS_DIR.glob("*/results.json"))
     if not candidates:
-        sys.exit(f"no results found under {RESULTS_DIR.relative_to(ROOT)}/*/results.json -- "
+        sys.exit(f"no results found under {_display(RESULTS_DIR)}/*/results.json -- "
                  "run the integration tier first (RELEASING.md step 2)")
     return candidates[-1]
 
@@ -106,11 +106,24 @@ def _expansion_names(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]
     not enough: three of four expansions still de-parametrize to the same single name, so the method
     looks fully covered while one case silently never ran.
 
-    Returns `None` when the parameter sets are not a literal in the source (e.g. a name or a
-    comprehension). The count is then unknowable statically, so the caller falls back to requiring
-    the bare method name -- weaker, but honest, and it never fails a healthy run.
+    Returns `None` when the names cannot be computed from the source alone -- parameter sets that are
+    not a literal (a name, a comprehension) or that use `pytest.param(...)`. The caller then falls
+    back to requiring the bare method name: weaker, but honest, and it never fails a healthy run.
+
+    Two framework details this copies rather than improves on:
+
+    - **The FIRST parametrize mark wins; there is no cross product.** `_get_parametrize_info` returns
+      on its first match in `method.pytestmark` order, which for stacked decorators is the BOTTOM one
+      (decorators apply upward, appending as they go). Real pytest would cross-product 2x2 = 4 cases;
+      this framework yields 2. Matching pytest instead of the framework would demand names that are
+      never reported.
+    - **`pytest.param(...)` entries are objects, not literals**, and the framework reads their `.id`
+      / `.values` at runtime. `ast.literal_eval` cannot evaluate a Call, so rather than guess an id,
+      treat the decorator as unknowable and fall back.
     """
-    for dec in method.decorator_list:
+    # REVERSED: `decorator_list` is source order (top first), but decorators apply bottom-up and each
+    # appends to `pytestmark`, so the framework's first mark is the BOTTOM decorator.
+    for dec in reversed(method.decorator_list):
         if not isinstance(dec, ast.Call):
             continue
         # Match `pytest.mark.parametrize(...)` / `mark.parametrize(...)` / `parametrize(...)`.
@@ -118,8 +131,17 @@ def _expansion_names(method: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]
         tail = attr.attr if isinstance(attr, ast.Attribute) else getattr(attr, "id", None)
         if tail != "parametrize" or len(dec.args) < 2:
             continue
+        # A `pytest.param(...)` element is a Call, so the list is not a literal. `literal_eval` below
+        # would raise and reach the same `return None`, so this branch changes no behavior; it is here
+        # to name the case, since "we cannot read pytest.param ids from source" is a deliberate
+        # limitation rather than an incidental parse failure. Mutation-testing it therefore shows it as
+        # redundant, which is expected: the test for this case pins the FALLBACK, not this line.
+        argvalues = dec.args[1]
+        if isinstance(argvalues, (ast.List, ast.Tuple)) and any(
+                isinstance(el, ast.Call) for el in argvalues.elts):
+            return None
         try:
-            values = ast.literal_eval(dec.args[1])
+            values = ast.literal_eval(argvalues)
             ids = None
             for kw in dec.keywords:
                 if kw.arg == "ids":
@@ -241,7 +263,7 @@ def check(results_path: Path) -> tuple[list[str], list[str], int]:
         return ([f"{shown} contains no test entries at all, so this check would verify nothing"],
                 warnings, 0)
     if not expected:
-        return ([f"no test_*.py fixtures found under {FIXTURE_DIR.relative_to(ROOT)}, so this check "
+        return ([f"no test_*.py fixtures found under {_display(FIXTURE_DIR)}, so this check "
                  "would verify nothing"], warnings, 0)
 
     counted = 0

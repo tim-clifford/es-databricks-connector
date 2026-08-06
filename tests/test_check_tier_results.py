@@ -107,10 +107,26 @@ def test_fixture_absent_from_results_is_rejected(tier):
 
 @pytest.mark.parametrize("status", ["failed", "error", "xpassed", "skipped", "brand_new_status"])
 def test_non_passing_status_is_not_coverage(tier, status):
-    """Only `passed` proves a test asserted something. A deny-list once let these through."""
+    """Only `passed` proves a test asserted something. A deny-list once let these through.
+
+    Asserts BOTH problems the gate must raise, and asserts them separately. A single
+    `any(status in p ...)` would pass even if the status check were deleted, because dropping the
+    status still leaves `test_a` uncovered and so still yields the missing-test problem: the test
+    would then be green for a reason unrelated to what it claims to pin.
+    """
     problems, _, _ = tier(PLAIN, [("TestThing.test_a", status), ("TestThing.test_b", "passed")])
-    assert problems, f"status {status!r} must not count as coverage"
-    assert any(status in p for p in problems)
+    status_problems = [p for p in problems if status in p and "not evidence" in p]
+    missing_problems = [p for p in problems if "test_a" in p and "no passing result" in p]
+    assert status_problems, f"status {status!r} must be reported as not-coverage: {problems}"
+    assert missing_problems, f"test_a must also be reported as uncovered: {problems}"
+
+
+def test_counted_excludes_non_covering_results(tier):
+    """`counted` is the number printed on success, so it must count only real coverage."""
+    problems, _, counted = tier(
+        PLAIN, [("TestThing.test_a", "skipped"), ("TestThing.test_b", "passed")])
+    assert problems
+    assert counted == 1, "a skipped result must not be counted as a run test"
 
 
 def test_xfailed_counts_but_warns(tier):
@@ -195,6 +211,37 @@ class TestThing:
     problems, _, _ = tier(src, [("TestThing.test_p[1-2]", "passed"),
                                 ("TestThing.test_p[3-4]", "passed")])
     assert problems == []
+
+
+def test_stacked_parametrize_uses_the_bottom_decorator_only(tier):
+    """`dbx_test` takes the FIRST parametrize mark and does not cross-product.
+
+    Decorators apply bottom-up and each appends to `pytestmark`, so the bottom one is first. Real
+    pytest would produce 2x2 = 4 cases here; this framework produces 2, and the gate must demand the
+    framework's set or it blocks a healthy release. Verified against the live framework.
+    """
+    src = """
+class TestThing:
+    @pytest.mark.parametrize("x", [1, 2])
+    @pytest.mark.parametrize("y", [3, 4])
+    def test_p(self, x, y): pass
+"""
+    problems, _, _ = tier(src, [("TestThing.test_p[3]", "passed"),
+                                ("TestThing.test_p[4]", "passed")])
+    assert problems == [], problems
+
+
+def test_pytest_param_entries_fall_back_to_bare_name(tier):
+    """`pytest.param(...)` is a Call, so its id cannot be read from source; requiring a guessed
+    name would fail a healthy run. Falling back must accept the framework's expanded names."""
+    src = """
+class TestThing:
+    @pytest.mark.parametrize("x", [pytest.param(1, id="one"), pytest.param(2, id="two")])
+    def test_p(self, x): pass
+"""
+    problems, _, _ = tier(src, [("TestThing.test_p[one]", "passed"),
+                                ("TestThing.test_p[two]", "passed")])
+    assert problems == [], problems
 
 
 def test_non_literal_parametrize_falls_back_to_bare_name(tier):
@@ -309,6 +356,48 @@ def test_source_method_strips_class_and_case(reported, expected):
 def test_strip_class_keeps_the_case_suffix(reported, expected):
     """The case suffix has to survive, or a partial parametrized run becomes invisible again."""
     assert gate._strip_class(reported) == expected
+
+
+def test_no_fixtures_at_all_is_rejected_without_crashing(tmp_path, monkeypatch):
+    """An empty fixture dir must REPORT that nothing can be verified, not raise.
+
+    This once crashed: the message built the path with a bare `relative_to(ROOT)`, which raises
+    ValueError for any directory outside the repo. A gate that dies instead of failing cleanly gives
+    the operator a traceback where it owes them a reason.
+    """
+    empty = tmp_path / "no_fixtures"
+    empty.mkdir()
+    monkeypatch.setattr(gate, "FIXTURE_DIR", empty)
+    results = tmp_path / "r.json"
+    results.write_text(json.dumps({"summary": {}, "tests": [
+        {"notebook": "/W/test_x", "test_name": "T.test_a", "status": "passed"}]}))
+    problems, _, _ = gate.check(results)
+    assert problems and "no test_*.py fixtures" in problems[0]
+
+
+def test_display_handles_paths_outside_the_repo(tmp_path):
+    """`--results` may point anywhere; the display helper must not raise on an outside path."""
+    assert gate._display(ROOT / "a" / "b.json") == "a/b.json"
+    outside = tmp_path / "b.json"
+    assert gate._display(outside) == str(outside)
+
+
+def test_newest_results_picks_the_latest_timestamped_run(tmp_path, monkeypatch):
+    """Directory names are fixed-width YYYYMMDD_HHMMSS, so lexicographic == chronological."""
+    monkeypatch.setattr(gate, "RESULTS_DIR", tmp_path)
+    for stamp in ("20260101_120000", "20260105_090000", "20260103_235959"):
+        d = tmp_path / stamp
+        d.mkdir()
+        (d / "results.json").write_text("{}")
+    assert gate.newest_results().parent.name == "20260105_090000"
+
+
+def test_newest_results_exits_when_there_are_none(tmp_path, monkeypatch):
+    """No results at all must be a clean exit with a pointer to RELEASING.md, not a traceback."""
+    monkeypatch.setattr(gate, "RESULTS_DIR", tmp_path / "nothing")
+    with pytest.raises(SystemExit) as exc:
+        gate.newest_results()
+    assert "run the integration tier first" in str(exc.value)
 
 
 @pytest.mark.parametrize("name,discoverable", [
