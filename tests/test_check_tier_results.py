@@ -164,7 +164,35 @@ def test_renamed_test_reports_both_halves(tier):
 def test_duplicate_names_cannot_pad_a_fixture(tier):
     """Reporting one test twice must not stand in for the test that never ran."""
     problems, _, _ = tier(PLAIN, [("TestThing.test_a", "passed"), ("TestThing.test_a", "passed")])
-    assert problems and "test_b" in problems[0]
+    assert problems
+    assert any("test_b" in p for p in problems), problems
+
+
+def test_the_same_test_reported_twice_is_rejected(tier):
+    """A duplicate cannot fake coverage (`covered` is a set) but WOULD inflate the printed total.
+
+    Results that are not one entry per test are not a clean record of the run -- typically two runs'
+    output concatenated -- so the count cannot be trusted even though the names all match.
+    """
+    problems, _, counted = tier(
+        PLAIN, [("TestThing.test_a", "passed"), ("TestThing.test_a", "passed"),
+                ("TestThing.test_b", "passed")])
+    assert problems, "the same test credited twice must fail"
+    assert any("more than one result" in p for p in problems), problems
+    assert counted == 2, f"the count must not include the duplicate, got {counted}"
+
+
+def test_a_foreign_class_crediting_the_same_method_is_rejected(tier):
+    """`TestOther.test_a` reported under a fixture whose only class is `TestThing`.
+
+    Both strip to `test_a`, so without a duplicate check the foreign result is silently absorbed and
+    the total overstates the run.
+    """
+    problems, _, _ = tier(
+        PLAIN, [("TestOther.test_a", "passed"), ("TestThing.test_a", "passed"),
+                ("TestThing.test_b", "passed")])
+    assert problems, "two classes crediting one method name must fail"
+    assert any("more than one result" in p for p in problems), problems
 
 
 # --- parametrize: expanded per case, so a partial run is visible ----------------------------------

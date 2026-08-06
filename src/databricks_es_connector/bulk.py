@@ -148,7 +148,11 @@ def make_partition_writer(cfg: EsConfig):
                     # A delete-404 is an expected no-op, but it must be COUNTED: it is the one
                     # outcome that legitimately makes written+deleted+errors < total_input, so
                     # without this the reconciliation check cannot tell an expected no-op from a
-                    # row lost below the per-doc level.
+                    # row lost below the per-doc level. Counting it here is what makes
+                    # written+deleted+errors+ignored == total_input the invariant `unaccounted`
+                    # measures. Note this is about a row producing NO write, not about two rows
+                    # collapsing onto one `_id`: duplicate ids each report success, so they keep the
+                    # identity intact and `unaccounted` stays 0 (see the README's duplicate-id note).
                     ignored += 1
                 elif outcome == ERROR:
                     errors += 1

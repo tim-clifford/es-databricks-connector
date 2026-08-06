@@ -308,10 +308,30 @@ def check(results_path: Path) -> tuple[list[str], list[str], int]:
             return reported if reported in want else _source_method(reported)
 
         covered: set[str] = set()
+        seen: set[str] = set()           # every credited name, to catch the same test reported twice
         for entry in entries:
             name = entry.get("test_name") or ""
             status = (entry.get("status") or "").lower()
             method = _credit(_strip_class(name))
+            if status in _COVERING or status in _ALLOWED_WITH_WARNING:
+                # Only an EXACT name match is expected to appear once. A name credited through the
+                # `_source_method` fallback legitimately repeats: when the source could not be
+                # expanded (`pytest.param(...)`, a non-literal list), every real case of that method
+                # collapses onto the bare name, so N results crediting it is correct rather than
+                # duplicated. Flagging those would fail a healthy run.
+                exact = _strip_class(name) in want
+                if exact and method in seen:
+                    # Two results crediting one test. `covered` is a set, so this cannot fake
+                    # coverage, but it WOULD inflate the count printed on success and it means the
+                    # results are not a clean one-per-test record of the run: typically two classes
+                    # in one fixture sharing a method name, or results concatenated from two runs.
+                    problems.append(
+                        f"{stem}: {method} is credited by more than one result (e.g. {name!r}) -- "
+                        "the results are not one entry per test, so the reported total overstates "
+                        "what ran; re-run the tier against a clean results directory")
+                    continue
+                if exact:
+                    seen.add(method)
             if status in _COVERING:
                 covered.add(method)
                 counted += 1
