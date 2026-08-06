@@ -59,6 +59,12 @@ def make_foreach_batch(cfg: EsConfig, on_batch: Optional[Callable] = None,
     A write "failed" when Elasticsearch rejected any document (`errors > 0`) or any row went
     unaccounted for (`unaccounted > 0`, i.e. loss below the per-document level). Expected
     delete-404 no-ops (`ignored`) are NOT failures.
+
+    `overcounted > 0` is never a batch failure: it means more per-document outcomes than input rows,
+    which is impossible, so it indicates a counting bug in this library rather than a problem with
+    the data. It is logged at ERROR under both "raise" and "log" so the signal does not depend on the
+    policy chosen, and it never fails a batch (that would wedge the stream on our defect). "ignore"
+    is silent by definition and stays silent.
     """
     if on_error not in _ON_ERROR_POLICIES:
         raise ValueError(f"on_error must be one of {_ON_ERROR_POLICIES}, got {on_error!r}")
@@ -90,5 +96,18 @@ def make_foreach_batch(cfg: EsConfig, on_batch: Optional[Callable] = None,
                     "total_input=%s first_failures=%s",
                     batch_id, cfg.index, result.get("errors"), result.get("unaccounted"),
                     result.get("total_input"), (result.get("error_samples") or [])[:3])
+            # Reported independently of the failure branch above, because it is a different KIND of
+            # problem: not the caller's rows going missing, but an impossible count that means a bug
+            # in this library. `reconcile_or_raise` surfaces it on the RAISE path, so without this
+            # the signal would exist in the default mode and vanish in this one.
+            if (result.get("overcounted") or 0) > 0:
+                _log.error(
+                    "batch %s to index %r reported %s more per-document outcomes than input rows "
+                    "(total_input=%s written=%s deleted=%s errors=%s ignored=%s). That is impossible "
+                    "and indicates an accounting bug in databricks-es-connector, not a problem with "
+                    "your data. The batch is not failed over it; please report this result dict.",
+                    batch_id, cfg.index, result.get("overcounted"), result.get("total_input"),
+                    result.get("written"), result.get("deleted"), result.get("errors"),
+                    result.get("ignored"))
 
     return _foreach_batch

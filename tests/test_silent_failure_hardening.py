@@ -985,6 +985,48 @@ def test_every_result_producer_agrees_on_the_key_set():
             "KeyError on an empty micro-batch")
 
 
+def test_overcount_is_surfaced_under_both_raise_and_log(monkeypatch, caplog):
+    """The signal must not depend on the on_error policy.
+
+    `reconcile_or_raise` logs an impossible count on the RAISE path. The LOG path has its own
+    reporting branch and checked only errors/unaccounted, so an over-count was surfaced in the
+    default mode and silently dropped in the other: the same "fixed one branch, left its sibling"
+    shape this suite exists to catch. Neither mode fails the batch over it.
+    """
+    import logging
+
+    monkeypatch.setattr(stream_mod, "bulk_write",
+                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+
+    for policy in (RAISE, LOG):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR):
+            make_foreach_batch(_cfg(), on_error=policy)(_FakeDF(), 1)   # must NOT raise
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "impossible" in msgs, f"on_error={policy!r} swallowed the impossible count"
+        assert "accounting bug" in msgs, f"on_error={policy!r} must name it as OUR bug"
+
+
+def test_overcount_stays_silent_under_ignore(monkeypatch, caplog):
+    # "ignore" is documented as silent by definition; pinned so the fix above does not leak into it.
+    import logging
+
+    monkeypatch.setattr(stream_mod, "bulk_write",
+                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        make_foreach_batch(_cfg(), on_error=IGNORE)(_FakeDF(), 1)
+    assert caplog.records == [], f"on_error='ignore' must stay silent, got {caplog.text}"
+
+
+def test_an_overcount_alone_never_fails_a_batch(monkeypatch):
+    # Guard-rail on the fix: surfacing the over-count must not start FAILING batches over a library
+    # bug, which on the streaming path is an unescapable retry loop.
+    monkeypatch.setattr(stream_mod, "bulk_write",
+                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+    make_foreach_batch(_cfg(), on_error=RAISE)(_FakeDF(), 1)   # returns cleanly
+
+
 def test_positive_unaccounted_still_raises():
     # The guard-rail for the above: loosening the negative case must not weaken real loss detection.
     result = {"written": 7, "deleted": 0, "errors": 0, "ignored": 0, "total_input": 10,
