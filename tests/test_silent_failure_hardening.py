@@ -879,10 +879,152 @@ def test_merge_then_reconcile_surfaces_impossible_counts(caplog):
     rows = [{"written": 12, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
              "total_input": 10, "error_samples": "[]"}]
     merged = _merge_partition_results(rows)
-    assert merged["unaccounted"] == -2
+    # The over-count is reported in its OWN field, never as a negative `unaccounted`: a negative
+    # would subtract from real loss found in another partition (see the cancellation test below).
+    assert merged["overcounted"] == 2
+    assert merged["unaccounted"] == 0
     with caplog.at_level("ERROR", logger="databricks_es_connector.bulk"):
         reconcile_or_raise(merged, index="i")
     assert caplog.records
+
+
+def test_overcount_in_one_partition_cannot_cancel_real_loss_in_another(caplog):
+    """The cancellation bug: two opposite discrepancies netting to a clean verdict.
+
+    `unaccounted` used to be derived ONCE from the summed counts, so a partition that over-counted
+    subtracted from a partition that genuinely lost rows. Both signals vanished and the write
+    reported complete success while rows were gone. They are now accumulated per partition and kept
+    apart, because they mean opposite things: one is the caller's data going missing, the other is a
+    defect in this library.
+    """
+    lost = {"written": 95, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+            "total_input": 100, "error_samples": "[]"}          # 5 rows produced no outcome
+    overcounted = {"written": 105, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+                   "total_input": 100, "error_samples": "[]"}   # 5 outcomes too many
+
+    merged = _merge_partition_results([lost, overcounted])
+    # Pre-fix this was `total_input(200) - written(200) == 0`, i.e. perfectly clean.
+    assert merged["unaccounted"] == 5, "real loss must survive an over-count elsewhere"
+    assert merged["overcounted"] == 5, "the library bug must be reported in its own right"
+
+    with caplog.at_level("ERROR", logger="databricks_es_connector.bulk"):
+        with pytest.raises(EsWriteError, match="unaccounted"):
+            reconcile_or_raise(merged, index="i")
+    assert caplog.records, "the impossible count must still be surfaced alongside the raise"
+
+
+def test_partition_order_does_not_change_the_verdict():
+    # Sign-splitting must be order-independent: whichever partition is seen first, the same two
+    # totals come out. An order-dependent verdict would be its own silent-failure mode.
+    lost = {"written": 95, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+            "total_input": 100, "error_samples": "[]"}
+    over = {"written": 105, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+            "total_input": 100, "error_samples": "[]"}
+    a = _merge_partition_results([lost, over])
+    b = _merge_partition_results([over, lost])
+    assert (a["unaccounted"], a["overcounted"]) == (b["unaccounted"], b["overcounted"]) == (5, 5)
+
+
+def test_many_partitions_accumulate_both_signs_independently():
+    # Three lossy partitions and two over-counting ones: each side sums on its own.
+    lossy = [{"written": 8, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+              "total_input": 10, "error_samples": "[]"} for _ in range(3)]      # 2 lost each
+    over = [{"written": 13, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+             "total_input": 10, "error_samples": "[]"} for _ in range(2)]       # 3 extra each
+    merged = _merge_partition_results(lossy + over)
+    assert merged["unaccounted"] == 6      # 3 x 2
+    assert merged["overcounted"] == 6      # 2 x 3
+
+
+def test_delete_404_no_ops_are_still_not_counted_as_loss():
+    # `ignored` must remain part of the per-partition identity. A delete-404 is an expected no-op, so
+    # a partition of pure no-ops is CLEAN, not 3 rows lost.
+    rows = [{"written": 0, "deleted": 0, "errors": 0, "ignored": 3, "coerced_nonfinite": 0,
+             "total_input": 3, "error_samples": "[]"}]
+    merged = _merge_partition_results(rows)
+    assert merged["unaccounted"] == 0 and merged["overcounted"] == 0
+    assert reconcile_or_raise(merged, index="i") is merged
+
+
+def test_legacy_signed_unaccounted_is_still_surfaced(caplog):
+    # A result dict from before this split (single signed `unaccounted`, no `overcounted` key) must
+    # degrade to the new semantics rather than silently reading as clean.
+    legacy = {"written": 12, "deleted": 0, "errors": 0, "ignored": 0, "total_input": 10,
+              "unaccounted": -2, "error_samples": []}
+    with caplog.at_level("ERROR", logger="databricks_es_connector.bulk"):
+        assert reconcile_or_raise(legacy, index="i") is legacy    # still must not raise
+    assert caplog.records and "impossible" in caplog.records[0].getMessage()
+
+
+def test_every_result_producer_agrees_on_the_key_set():
+    """The result dict's shape is stated in three places; they must not drift apart.
+
+    `_merge_partition_results` builds it, `bulk_write`'s docstring documents it, and `stream.py`'s
+    empty-batch stand-in mimics it. When `overcounted` was added, all three needed it: a callback
+    doing `result["overcounted"]` would KeyError on an empty micro-batch otherwise. A subset check
+    would not have caught that, so this compares the sets exactly.
+    """
+    import re
+
+    produced = set(_merge_partition_results([]))
+
+    # 1. bulk_write's docstring must list exactly the keys that are produced.
+    doc = bulk_mod.bulk_write.__doc__
+    listed = set(re.findall(r"'(\w+)'", doc[doc.index("Returns {"):doc.index("}:")]))
+    assert listed == produced, (
+        f"bulk_write docstring and _merge_partition_results disagree: "
+        f"only in docstring={listed - produced}, only produced={produced - listed}")
+
+    # 2. The streaming empty-batch stand-in must carry every produced key (plus its `empty` flag),
+    #    since callbacks read the same keys whether or not the batch had rows.
+    src = inspect.getsource(stream_mod)
+    stand_in = src[src.index('"written": 0'):src.index('"empty": True')]
+    for key in produced - {"error_samples"}:
+        assert f'"{key}"' in stand_in, (
+            f"stream.py's empty-batch result is missing {key!r}; a callback reading it would "
+            "KeyError on an empty micro-batch")
+
+
+def test_overcount_is_surfaced_under_both_raise_and_log(monkeypatch, caplog):
+    """The signal must not depend on the on_error policy.
+
+    `reconcile_or_raise` logs an impossible count on the RAISE path. The LOG path has its own
+    reporting branch and checked only errors/unaccounted, so an over-count was surfaced in the
+    default mode and silently dropped in the other: the same "fixed one branch, left its sibling"
+    shape this suite exists to catch. Neither mode fails the batch over it.
+    """
+    import logging
+
+    monkeypatch.setattr(stream_mod, "bulk_write",
+                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+
+    for policy in (RAISE, LOG):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR):
+            make_foreach_batch(_cfg(), on_error=policy)(_FakeDF(), 1)   # must NOT raise
+        msgs = " ".join(r.getMessage() for r in caplog.records)
+        assert "impossible" in msgs, f"on_error={policy!r} swallowed the impossible count"
+        assert "accounting bug" in msgs, f"on_error={policy!r} must name it as OUR bug"
+
+
+def test_overcount_stays_silent_under_ignore(monkeypatch, caplog):
+    # "ignore" is documented as silent by definition; pinned so the fix above does not leak into it.
+    import logging
+
+    monkeypatch.setattr(stream_mod, "bulk_write",
+                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        make_foreach_batch(_cfg(), on_error=IGNORE)(_FakeDF(), 1)
+    assert caplog.records == [], f"on_error='ignore' must stay silent, got {caplog.text}"
+
+
+def test_an_overcount_alone_never_fails_a_batch(monkeypatch):
+    # Guard-rail on the fix: surfacing the over-count must not start FAILING batches over a library
+    # bug, which on the streaming path is an unescapable retry loop.
+    monkeypatch.setattr(stream_mod, "bulk_write",
+                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+    make_foreach_batch(_cfg(), on_error=RAISE)(_FakeDF(), 1)   # returns cleanly
 
 
 def test_positive_unaccounted_still_raises():

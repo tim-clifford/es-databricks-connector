@@ -228,6 +228,7 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   "coerced_nonfinite": 0,  # inf/-inf/NaN values that had to become JSON null to be sent
   "total_input": 1000,     # rows handed to the writer
   "unaccounted": 0,        # rows that produced NO per-document outcome (loss below that level)
+  "overcounted": 0,        # more outcomes than input rows: impossible, so a bug in THIS library
   "error_samples": [       # bounded diagnostics for rejected docs (up to 20)
     {"_id": "abc", "op_type": "index", "status": 400,
      "reason": "failed to parse field [ts] of type [date]"},
@@ -236,12 +237,19 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 ```
 
 - **`unaccounted` is the reconciliation check, pre-computed.** Every input row yields exactly one of
-  `written`/`deleted`/`errors`/`ignored`, so `unaccounted = total_input - (those four)` and a
-  positive value means rows vanished below the per-document level (e.g. a chunk-level
-  serialization/transport error) where the `errors` count structurally cannot see them. `ignored` is
-  part of the identity precisely so an expected delete-404 no-op does not masquerade as loss.
-  `bulk_write(df, cfg, raise_on_error=True)` (or `reconcile_or_raise(result)`) turns both signals
-  into an `EsWriteError`; the streaming path does this by default.
+  `written`/`deleted`/`errors`/`ignored`, so any shortfall means rows vanished below the per-document
+  level (e.g. a chunk-level serialization/transport error) where the `errors` count structurally
+  cannot see them. `ignored` is part of the identity precisely so an expected delete-404 no-op does
+  not masquerade as loss. `bulk_write(df, cfg, raise_on_error=True)` (or `reconcile_or_raise(result)`)
+  turns both signals into an `EsWriteError`; the streaming path does this by default.
+- **`overcounted` should always be 0.** It counts the reverse discrepancy, more per-document outcomes
+  than input rows, which is impossible by construction and so indicates a counting bug in this
+  library rather than anything wrong with your data. It is reported and logged but does **not** fail
+  the write, because failing a healthy write over our defect would wedge a streaming pipeline in a
+  retry loop on a batch that can never pass. It is a separate field rather than a negative
+  `unaccounted` so that it can never net against real loss: the two are accumulated per partition, so
+  one partition over-counting cannot cancel out another partition genuinely losing rows. If you ever
+  see a non-zero value, please report the result dict.
 - **`coerced_nonfinite` catches invisible nulls.** `inf`/`-inf`/`NaN` have no JSON representation
   (ES rejects the bare `Infinity`/`NaN` tokens), so they must become JSON null to be sent at all.
   That is the right behavior, but it means an upstream divide-by-zero lands in ES as a null with no
@@ -553,7 +561,7 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped). The `timestamp` epoch is the true UTC instant, independent of `spark.sql.session.timeZone` (see below) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `timestamp_ntz` | **epoch milliseconds** of the wall-clock read as UTC (see below) | `2021-06-01 12:00:00` → `1622548800000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
-| `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
+| `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type. **A `decimal` key inherits the decimal precision loss, and for a key that means colliding keys drop entries (see note)** | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
 | `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
 | `null` (any type) | present as JSON `null` (the field is kept, its value is `null`) | `None` → `null` |
 | `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
@@ -564,6 +572,18 @@ holds the nearest float32, whose true value is `0.10000000149011612`. The connec
 exact value (widened to a 64-bit double) rather than reformatting it back to `0.1`, so the stored
 number is faithful to what Spark actually held, not to the source literal. Use `DOUBLE` if you need
 `0.1` to store as `0.1`.
+
+**`decimal` map keys lose entries, not just digits:** a `map<decimal(p,s), V>` key goes through the
+same `decimal` → float conversion as a decimal *value*, so it inherits the same ~15-17 significant
+figure limit. For a **key** that limit is destructive rather than merely lossy: two distinct keys that
+differ only beyond it render to the same string, and the later entry **overwrites** the earlier one,
+so the map comes back with fewer entries than it went in with. The row still produces exactly one
+document, so the write reports success and reconciliation stays clean, there is no error and no
+count. For example, `decimal(38,0)` keys `10000000000000000000000000000000000001` and
+`...002` both render `"1e+37"`, and `Decimal("1.000000000000000001")` and `Decimal("1.000000000000000002")`
+both render `"1.0"`. Only `decimal` keys are affected: an `int`/`bigint` key never passes through a
+float (Python integers are arbitrary precision), and `date`/`binary`/`string` keys render losslessly.
+**Use a `string` or integer key type if your keys need more than ~15-17 significant figures.**
 
 **Timestamp precision:** epoch-millis is floored to the containing millisecond, consistently for
 pre- and post-epoch instants (matches Spark/Java `unix_millis`). Elasticsearch `date` is

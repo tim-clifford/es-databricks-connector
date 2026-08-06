@@ -96,7 +96,18 @@ def _coerce_key(k: Any) -> str:
     decimal, binary, ...); `json.dumps` silently stringifies int/bool/float/None keys but RAISES on
     date/decimal/bytes/struct keys, crashing helpers.bulk on the executor. So coerce the key with
     the SAME value transform (date -> epoch-millis, decimal -> float, bytes -> base64, ...) and then
-    render it to a string. Spark maps are homogeneously typed, so distinct keys stay distinct.
+    render it to a string.
+
+    CAVEAT, `map<decimal(p,s), V>`: because the key goes through the same transform as a decimal
+    VALUE, it inherits the documented decimal->float precision loss, and for a KEY that loss is
+    worse than for a value. Two keys differing only beyond float's ~15-17 significant figures render
+    to the SAME string, so the later entry overwrites the earlier one: the map comes back with fewer
+    entries than it had, and because the row still produces exactly one document the write reports
+    success and reconciliation stays clean. Concretely, keys 1e37+1 and 1e37+2 both render '1e+37',
+    and Decimal("1.000000000000000001")/("...002") both render '1.0'. Only `decimal` keys are
+    affected: `int`/`bigint` keys never pass through float (Python ints are arbitrary precision), and
+    date/binary/string keys are rendered losslessly. Documented in the README's datatype table; use a
+    string or integer key type if you need high-precision keys preserved.
     """
     ck = coerce_value(k)
     if isinstance(ck, str):

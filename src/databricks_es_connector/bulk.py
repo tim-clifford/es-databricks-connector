@@ -178,13 +178,24 @@ def _merge_partition_results(rows) -> dict:
     and re-capped at ERROR_SAMPLE_CAP so the driver result stays bounded even across many
     partitions.
 
-    Also derives `unaccounted`: total_input - (written + deleted + errors + ignored). Every input row
-    produces exactly one of those four outcomes, so a non-zero value means rows vanished BELOW the
-    per-document level (a chunk-level transport/serialization failure), which the per-doc `errors`
+    Also derives `unaccounted`: rows that produced no per-document outcome at all, i.e. loss BELOW
+    the per-document level (a chunk-level transport/serialization failure), which the per-doc `errors`
     count structurally cannot see. `ignored` is part of the identity precisely so an expected
     delete-404 no-op does not masquerade as loss (see reconcile_or_raise).
+
+    The discrepancy is computed PER PARTITION and split by sign, because the two signs mean opposite
+    things and must not net against each other:
+
+      - `unaccounted` (positive): input rows with no outcome. Real data loss.
+      - `overcounted` (negative side): more outcomes than input rows. Structurally impossible, so it
+        indicates a counting bug in THIS library, not a problem with the caller's data.
+
+    Summing the raw counts and subtracting once at the end would let one cancel the other: a
+    partition that lost 5 rows plus a partition that over-counted 5 nets to zero, and the write
+    reports a clean success while 5 rows are gone. Both totals are now reported independently.
     """
     written = deleted = errors = ignored = coerced_nonfinite = total_input = 0
+    unaccounted = overcounted = 0
     samples = []
     for r in rows:
         written += int(r["written"] or 0)
@@ -194,9 +205,22 @@ def _merge_partition_results(rows) -> dict:
         # production, and Row has no `.get` (it raises ATTRIBUTE_NOT_SUPPORTED). `in` checks field
         # names on a Row and keys on a dict, so it works for both. Tolerating absence means a
         # stale/foreign row shape degrades to a zero/empty rather than crashing the whole write here.
-        ignored += int((r["ignored"] if "ignored" in r else 0) or 0)
+        _ignored = int((r["ignored"] if "ignored" in r else 0) or 0)
+        ignored += _ignored
         coerced_nonfinite += int((r["coerced_nonfinite"] if "coerced_nonfinite" in r else 0) or 0)
-        total_input += int(r["total_input"] or 0)
+        _total = int(r["total_input"] or 0)
+        total_input += _total
+        # Derive the discrepancy PER PARTITION and keep the two signs apart. Summing the counts and
+        # subtracting once at the end lets a negative in one partition cancel a positive in another:
+        # 100 rows in / 95 outcomes here (5 rows LOST) plus 100 in / 105 outcomes there (a counting
+        # bug) totals to zero, and the write reports a clean success while 5 rows are gone. The two
+        # mean opposite things and must never net against each other.
+        _delta = _total - (int(r["written"] or 0) + int(r["deleted"] or 0)
+                           + int(r["errors"] or 0) + _ignored)
+        if _delta > 0:
+            unaccounted += _delta          # rows that produced no per-doc outcome: real loss
+        elif _delta < 0:
+            overcounted += -_delta         # more outcomes than inputs: a bug in THIS library
         _samples_json = r["error_samples"] if "error_samples" in r else None
         if len(samples) < ERROR_SAMPLE_CAP and _samples_json:
             samples.extend(json.loads(_samples_json))
@@ -204,7 +228,11 @@ def _merge_partition_results(rows) -> dict:
         "written": written, "deleted": deleted, "errors": errors, "ignored": ignored,
         "coerced_nonfinite": coerced_nonfinite,
         "total_input": total_input,
-        "unaccounted": total_input - (written + deleted + errors + ignored),
+        "unaccounted": unaccounted,
+        # Impossible-by-construction, so non-zero means a defect in this library rather than anything
+        # wrong with the caller's data. Reported separately so it can be surfaced without being
+        # allowed to mask `unaccounted` (see reconcile_or_raise).
+        "overcounted": overcounted,
         "error_samples": samples[:ERROR_SAMPLE_CAP],
     }
 
@@ -230,24 +258,33 @@ def reconcile_or_raise(result: dict, *, index: str = "") -> dict:
       - `unaccounted > 0`: rows that produced no per-document outcome at all, i.e. loss below the
         per-doc level. `ignored` (delete-404 no-ops) is already subtracted, so an expected no-op
         does not trip this.
-    A NEGATIVE `unaccounted` (more outcomes than input rows) is structurally impossible and would
-    mean a counting bug in this library rather than anything wrong with the caller's data. It is
-    LOGGED, never raised: raising would fail a healthy write, and on the streaming path that means an
-    infinite retry loop on a batch that can never pass, with no escape but `on_error="log"` (which
-    would also switch off real loss detection). So the inconsistency is surfaced without wedging a
-    pipeline over a library defect.
+    `overcounted > 0` (more per-document outcomes than input rows in some partition) is structurally
+    impossible and means a counting bug in this library rather than anything wrong with the caller's
+    data. It is LOGGED, never raised: raising would fail a healthy write, and on the streaming path
+    that means an infinite retry loop on a batch that can never pass, with no escape but
+    `on_error="log"` (which would also switch off real loss detection). So the inconsistency is
+    surfaced without wedging a pipeline over a library defect.
+
+    Crucially, `overcounted` does NOT suppress `unaccounted`: they are accumulated separately per
+    partition, so an over-count can never cancel real loss and turn it into a clean verdict.
 
     Returns the result unchanged when the write was clean, so it can be used inline.
     """
     errors = int(result.get("errors", 0) or 0)
     unaccounted = int(result.get("unaccounted", 0) or 0)
+    overcounted = int(result.get("overcounted", 0) or 0)
+    # Tolerate a pre-0.6.1 result shape (no `overcounted` key) that carried the discrepancy as a
+    # single signed `unaccounted`, so an older cached summary degrades instead of hiding a negative.
     if unaccounted < 0:
+        overcounted += -unaccounted
+        unaccounted = 0
+    if overcounted:
         _log.error(
             "write to index %r reported %s more per-document outcomes than input rows "
             "(total_input=%s written=%s deleted=%s errors=%s ignored=%s). That is impossible and "
             "indicates an accounting bug in databricks-es-connector, not a problem with your data. "
             "The write itself is not failed over it; please report this result dict.",
-            index, -unaccounted, result.get("total_input"), result.get("written"),
+            index, overcounted, result.get("total_input"), result.get("written"),
             result.get("deleted"), errors, result.get("ignored"))
     if not errors and unaccounted <= 0:
         return result
@@ -345,7 +382,7 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     """Write a Spark DataFrame to Elasticsearch.
 
     Returns {'written', 'deleted', 'errors', 'ignored', 'coerced_nonfinite', 'total_input',
-    'unaccounted', 'error_samples'}:
+    'unaccounted', 'overcounted', 'error_samples'}:
       - 'written': index/upsert ops that succeeded.
       - 'deleted': successful delete-by-id ops (only non-zero when cfg.has_deletes).
       - 'errors': docs ES rejected (exact count).
@@ -353,9 +390,13 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
       - 'coerced_nonfinite': values (inf/-inf/NaN) that had to become JSON null to be sent at all.
         Non-zero means real numbers landed in ES as nulls, usually an upstream divide-by-zero.
       - 'total_input': rows handed to the writer.
-      - 'unaccounted': total_input - (written+deleted+errors+ignored). Every row yields exactly one
-        of those outcomes, so a positive value means rows were lost BELOW the per-document level
-        (e.g. a chunk-level transport error) where the `errors` count cannot see them.
+      - 'unaccounted': input rows that produced none of those outcomes. Every row yields exactly one
+        of them, so a positive value means rows were lost BELOW the per-document level (e.g. a
+        chunk-level transport error) where the `errors` count cannot see them.
+      - 'overcounted': the reverse discrepancy, more outcomes than input rows. Impossible by
+        construction, so non-zero means a counting bug in this library, not a problem with the data.
+        Reported and logged but not raised; kept separate from 'unaccounted' so an over-count in one
+        partition can never cancel real loss in another.
       - 'error_samples': up to ERROR_SAMPLE_CAP diagnostics ({_id, op_type, status, reason}) for
         rejected docs, so a failure is actionable rather than an opaque count. Bounded, not a full
         dead-letter log.
