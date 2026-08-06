@@ -553,7 +553,7 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped). The `timestamp` epoch is the true UTC instant, independent of `spark.sql.session.timeZone` (see below) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `timestamp_ntz` | **epoch milliseconds** of the wall-clock read as UTC (see below) | `2021-06-01 12:00:00` → `1622548800000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
-| `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
+| `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type. **A `decimal` key inherits the decimal precision loss, and for a key that means colliding keys drop entries (see note)** | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
 | `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
 | `null` (any type) | present as JSON `null` (the field is kept, its value is `null`) | `None` → `null` |
 | `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
@@ -564,6 +564,18 @@ holds the nearest float32, whose true value is `0.10000000149011612`. The connec
 exact value (widened to a 64-bit double) rather than reformatting it back to `0.1`, so the stored
 number is faithful to what Spark actually held, not to the source literal. Use `DOUBLE` if you need
 `0.1` to store as `0.1`.
+
+**`decimal` map keys lose entries, not just digits:** a `map<decimal(p,s), V>` key goes through the
+same `decimal` → float conversion as a decimal *value*, so it inherits the same ~15-17 significant
+figure limit. For a **key** that limit is destructive rather than merely lossy: two distinct keys that
+differ only beyond it render to the same string, and the later entry **overwrites** the earlier one,
+so the map comes back with fewer entries than it went in with. The row still produces exactly one
+document, so the write reports success and reconciliation stays clean, there is no error and no
+count. For example, `decimal(38,0)` keys `10000000000000000000000000000000000001` and
+`...002` both render `"1e+37"`, and `Decimal("1.000000000000000001")` and `Decimal("1.000000000000000002")`
+both render `"1.0"`. Only `decimal` keys are affected: an `int`/`bigint` key never passes through a
+float (Python integers are arbitrary precision), and `date`/`binary`/`string` keys render losslessly.
+**Use a `string` or integer key type if your keys need more than ~15-17 significant figures.**
 
 **Timestamp precision:** epoch-millis is floored to the containing millisecond, consistently for
 pre- and post-epoch instants (matches Spark/Java `unix_millis`). Elasticsearch `date` is

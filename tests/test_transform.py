@@ -339,8 +339,13 @@ def test_decimal_precision_lost_beyond_double():
 # --- non-string map keys (Spark map<K,V> where K is not a string) ---
 # json.dumps stringifies int/bool/float/None keys but RAISES on date/decimal/bytes/tuple keys,
 # which would crash helpers.bulk on the executor (uncounted). coerce_value must render every key
-# to a JSON-safe string so any map<K,V> exports without a crash. Spark maps are homogeneously
-# typed, so distinct keys always render distinctly (no collision to detect).
+# to a JSON-safe string so any map<K,V> exports without a crash.
+#
+# Spark maps are homogeneously typed, so an int key and a string key can never share one column.
+# But homogeneity is NOT sufficient to keep distinct keys distinct: a `decimal` key inherits the
+# documented decimal->float precision loss, and two decimal keys differing only beyond float's
+# ~15-17 significant figures render to the SAME string, silently dropping a map entry. The tests
+# below pin that behavior as the README documents it, so the docs cannot drift from the code.
 
 def test_map_int_keys_become_strings():
     # map<int,V> keys must be JSON strings, deterministically.
@@ -357,6 +362,61 @@ def test_map_decimal_and_bytes_keys_do_not_crash():
     from decimal import Decimal
     assert _json_roundtrip({Decimal("1.5"): "a"}) == {"1.5": "a"}
     assert _json_roundtrip({b"\x01\x02": "a"}) == {"AQI=": "a"}
+
+
+def test_high_precision_decimal_keys_collide_and_drop_an_entry():
+    """A DOCUMENTED limitation, pinned so the README and the code cannot drift apart.
+
+    A `decimal` map key goes through the same decimal->float conversion as a decimal value, so it
+    inherits the ~15-17 significant figure limit. For a KEY that is destructive rather than merely
+    lossy: the second entry overwrites the first, the map comes back smaller than it went in, and
+    because the row still yields exactly one document the write reports success with no error and no
+    count. If this test starts FAILING because both entries survive, the limitation was fixed and the
+    README note must be removed.
+    """
+    from decimal import Decimal
+
+    # decimal(38,0): distinct integers, identical once passed through float.
+    big_a = Decimal("10000000000000000000000000000000000001")
+    big_b = Decimal("10000000000000000000000000000000000002")
+    assert big_a != big_b
+    collapsed = _json_roundtrip({big_a: "first", big_b: "second"})
+    assert collapsed == {"1e+37": "second"}, "README documents both keys rendering '1e+37'"
+    assert len(collapsed) == 1, "two input entries must be observed collapsing to one"
+
+    # decimal(38,18): distinct fractions, identical once passed through float.
+    frac = _json_roundtrip({Decimal("1.000000000000000001"): "first",
+                            Decimal("1.000000000000000002"): "second"})
+    assert frac == {"1.0": "second"}
+    assert len(frac) == 1
+
+
+def test_the_collapse_is_silent_no_stat_is_recorded():
+    # Pins the SILENCE, which is the part that makes this worth documenting: nothing in `stats`
+    # marks the dropped entry, so a caller cannot detect it from the write result. If a counter is
+    # ever added, this test must change and the README note should say the loss is counted.
+    from decimal import Decimal
+
+    stats = {}
+    out = coerce_value({Decimal("1" + "0" * 37 + "1"): "a",
+                        Decimal("1" + "0" * 37 + "2"): "b"}, stats)
+    assert len(out) == 1
+    assert stats == {}, f"expected no counter for the dropped entry, got {stats}"
+
+
+def test_integer_and_temporal_keys_are_not_affected_by_the_decimal_caveat():
+    # The README scopes the caveat to `decimal` keys specifically. These are the types it claims are
+    # safe, so they are pinned too: a regression that routed them through float would break the
+    # documented scope, not just an edge case.
+    import datetime as _dt
+
+    # Python ints are arbitrary precision and never go through float, even past 2**53.
+    for n in (2 ** 53 + 1, 2 ** 63 - 1, 10 ** 37 + 1):
+        assert _json_roundtrip({n: "x"}) == {str(n): "x"}
+    # Two bigints beyond float's exact-integer range stay distinct.
+    assert len(_json_roundtrip({2 ** 53 + 1: "a", 2 ** 53 + 2: "b"})) == 2
+    # Adjacent dates stay distinct (epoch-millis, no float involved).
+    assert len(_json_roundtrip({_dt.date(2024, 1, 1): "a", _dt.date(2024, 1, 2): "b"})) == 2
 
 
 def test_map_none_key_becomes_json_null_key():
