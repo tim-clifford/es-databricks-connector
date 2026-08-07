@@ -217,9 +217,17 @@ def read_coerce(value: Any, target: Any) -> Any:
             # bool() on a string is truthiness, so a stored "false"/"0"/"no" would read back as
             # True: the value inverts, silently, and a boolean column is exactly where nobody
             # re-checks. Parse an explicit allow-list in BOTH directions and refuse anything else,
-            # mirroring transform._is_delete_flagged on the write side (same reasoning: both
-            # possible defaults are wrong). Strings arise when reading an index the connector did
+            # for the same reason `transform._is_delete_flagged` does on the write side: both
+            # possible defaults are wrong. Strings arise when reading an index the connector did
             # not write; a connector round-trip stores real JSON booleans and skips this branch.
+            #
+            # It is NOT a mirror of that function on one input: an empty/whitespace string. There it
+            # means "no flag present", and absent must mean "not a delete", so it returns False.
+            # Here the caller has DECLARED this column boolean and ES stored a string, so "" is a
+            # value that does not parse, not an absence -- a genuine null reads as None several
+            # branches above and never reaches here. Returning False would invent a datum the source
+            # does not contain, in the one column type where nobody re-checks. The asymmetry is
+            # deliberate: the two functions answer different questions about the same characters.
             s = value.strip().lower()
             if s in _BOOL_TRUE_STRINGS:
                 return True

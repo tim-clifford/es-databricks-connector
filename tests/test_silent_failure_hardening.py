@@ -844,6 +844,45 @@ def test_read_coerce_boolean_rejects_ambiguous_strings():
             read_coerce(s, "boolean")
 
 
+def test_read_coerce_boolean_rejects_empty_and_whitespace_strings():
+    """The one input where the read side deliberately does NOT match the write side.
+
+    `transform._is_delete_flagged("")` returns False, because there an empty string means "no flag
+    present" and an absent flag must never be read as a delete. Here the caller has DECLARED the
+    column boolean and Elasticsearch stored a string, so "" is a value that does not parse rather
+    than an absence: a real null reads as None long before this branch. Returning False would invent
+    a datum the source does not contain, in the column type where nobody re-checks.
+
+    Pinned because nothing covered it: an "obvious" symmetry fix would silently turn unparseable
+    data into False, and this is the test that would stop it.
+    """
+    for s in ("", " ", "   ", "\t", "\n"):
+        with pytest.raises(ReadSchemaMismatch):
+            read_coerce(s, "boolean")
+
+
+def test_write_side_still_treats_an_empty_delete_flag_as_absent():
+    # The other half of the asymmetry, pinned so a later "make these consistent" change has to
+    # break a test rather than silently start deleting (or refusing) rows. An empty flag means the
+    # row is not a delete, matching the null rule.
+    from databricks_es_connector.transform import _is_delete_flagged
+
+    for s in ("", " ", "   ", "\t"):
+        assert _is_delete_flagged(s) is False, f"{s!r} must mean 'not a delete', not raise"
+
+
+def test_read_and_write_boolean_parsing_agree_on_every_recognized_string():
+    # Whatever the empty-string difference, the two allow-lists must not drift apart on the values
+    # they DO recognize: a string that deletes a row on write must read back as True, and vice
+    # versa. Divergence there would be a genuine round-trip inversion.
+    from databricks_es_connector.transform import _is_delete_flagged
+
+    for s in ("true", "True", "TRUE", "t", "1", "yes", "y", " t "):
+        assert _is_delete_flagged(s) is True and read_coerce(s.strip(), "boolean") is True, s
+    for s in ("false", "False", "FALSE", "f", "0", "no", "n"):
+        assert _is_delete_flagged(s) is False and read_coerce(s, "boolean") is False, s
+
+
 def test_read_coerce_boolean_keeps_real_booleans_and_numbers():
     assert read_coerce(True, "boolean") is True
     assert read_coerce(False, "boolean") is False
