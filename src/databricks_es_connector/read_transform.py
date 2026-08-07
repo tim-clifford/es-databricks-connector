@@ -97,6 +97,39 @@ def _reject_unsupported_token(t: str, target: Any) -> None:
         raise ReadSchemaMismatch(f"declared type {target!r} cannot be read: {fix}.")
 
 
+# Inclusive value range of each signed integer width Spark carries. A stored value outside the
+# declared width's range cannot be represented in that Spark type: mapInPandas casts the returned
+# value to the declared Arrow type, and that cast either raises an opaque `ArrowInvalid` (Spark 4.1+,
+# where spark.sql.execution.pandas.convertToArrowArraySafely defaults True) or SILENTLY WRAPS on the
+# runtimes where it defaults False (all of DBR <=15.x / Spark 3.5): 10_000_000_000 declared `int`
+# comes back 1410065408. Both are checked here so the read fails closed with a message that names the
+# field and the fix, rather than corrupting data or surfacing a cause-less Arrow error downstream.
+# `bigint` is bounded too: a JSON number larger than int64 (ES stores such values as a double or
+# unsigned long) would overflow Spark's LongType the same way.
+#
+# KEYED ON THE TOKENS read.py ACTUALLY PRODUCES. read._spark_type_token renders a scalar via
+# pyspark `DataType.simpleString()`, which emits `tinyint`/`smallint`/`int`/`bigint` for
+# ByteType/ShortType/IntegerType/LongType -- NOT `byte`/`short`/`integer`/`long`. Keying on the
+# latter left the two NARROWEST widths (tinyint/smallint), where overflow is most likely, matching
+# no branch at all: a ByteType column fell through to the unknown-token passthrough with the value
+# untouched, defeating this guard AND the truncation guard AND the int() coercion itself. The
+# `byte`/`short`/`integer`/`long` spellings are kept as aliases so a hand-built token (tests, a
+# caller invoking read_coerce directly) still works, but tinyint/smallint/int/bigint are the ones
+# that occur in production. tests/test_silent_failure_hardening.py
+# ::test_int_width_bounds_cover_every_production_token asserts these keys cover every real
+# simpleString(), so a future width added with the wrong spelling fails a test instead of leaking.
+_INT_WIDTH_BOUNDS = {
+    "tinyint": (-(2 ** 7), 2 ** 7 - 1),
+    "byte": (-(2 ** 7), 2 ** 7 - 1),           # alias: not emitted by simpleString(), hand-built only
+    "smallint": (-(2 ** 15), 2 ** 15 - 1),
+    "short": (-(2 ** 15), 2 ** 15 - 1),        # alias
+    "int": (-(2 ** 31), 2 ** 31 - 1),
+    "integer": (-(2 ** 31), 2 ** 31 - 1),      # alias
+    "long": (-(2 ** 63), 2 ** 63 - 1),         # alias
+    "bigint": (-(2 ** 63), 2 ** 63 - 1),
+}
+
+
 _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 
 
@@ -194,8 +227,11 @@ def read_coerce(value: Any, target: Any) -> Any:
         return _Decimal(str(value))
 
     # --- numeric scalars: JSON number -> the declared width. ES/JSON has one number type, so the
-    # declared type decides int vs float; we coerce rather than trust the incoming Python type. ---
-    if t in ("byte", "short", "int", "integer", "long", "bigint"):
+    # declared type decides int vs float; we coerce rather than trust the incoming Python type.
+    # Membership is the keys of _INT_WIDTH_BOUNDS (not a re-typed tuple) so the branch and the bounds
+    # table cannot drift apart: adding/renaming a width in one place changes both at once. This is
+    # what makes the token set the SINGLE source of truth after the tinyint/smallint miss. ---
+    if t in _INT_WIDTH_BOUNDS:
         _reject_non_scalar(value, target)
         # A non-integral float declared as an integer type would silently truncate (3.7 -> 3),
         # losing data with no signal. int(3.0) is exact and allowed; int(3.7) is not.
@@ -205,8 +241,25 @@ def read_coerce(value: Any, target: Any) -> Any:
                     f"stored value {value!r} is not an integer but the declared type is {target!r}; "
                     "int() would silently truncate it. Declare a float/double/decimal type, or "
                     "round upstream if truncation is genuinely intended.")
-            return int(value)
-        return int(value)
+            value = int(value)
+        else:
+            value = int(value)
+        # Value-magnitude check: the SIBLING of the truncation guard above and the second half of the
+        # width failure the class docstring promises. A value that exceeds the declared width's range
+        # cannot survive the mapInPandas cast to that Arrow type: it either raises a cause-less
+        # ArrowInvalid (safe cast) or silently wraps (unsafe cast, the pre-Spark-4.1 default). Fail
+        # closed here with a message naming the wider type to declare, so neither outcome reaches the
+        # caller. Only integer widths have a bound; float/double/decimal branches handle range their
+        # own way (float -> inf, decimal -> exact).
+        lo, hi = _INT_WIDTH_BOUNDS[t]
+        if not (lo <= value <= hi):
+            raise ReadSchemaMismatch(
+                f"stored value {value!r} is outside the range of the declared type {target!r} "
+                f"([{lo}, {hi}]). Reading it into that Spark type would overflow the mapInPandas "
+                "Arrow cast, which either raises an opaque error or silently wraps the value "
+                "(e.g. 10000000000 -> 1410065408) depending on the runtime. Declare a wider integer "
+                "type (short/int/long) or a decimal/string type wide enough to hold it.")
+        return value
     if t in ("float", "double"):
         _reject_non_scalar(value, target)
         return float(value)
