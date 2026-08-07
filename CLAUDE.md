@@ -1,8 +1,9 @@
 # databricks-es-connector
 
-**Using the connector?** Read `README.md`. Install the wheel and call `bulk_write` / `read_index`;
-the README covers the API, configuration, datatype fidelity, and the gotchas a caller hits. Nothing
-below this line is needed to *use* the library. (The wheel ships only the `databricks_es_connector`
+**Using the connector?** Read `README.md`. Install the wheel and call `bulk_write` (batch) or
+`make_foreach_batch` (Structured Streaming) to write, `read_index` to read; the README covers the
+API, configuration, datatype fidelity, and the gotchas a caller hits. Nothing below this line is
+needed to *use* the library. (The wheel ships only the `databricks_es_connector`
 package: this file and the skill are repo-maintenance material, not part of what a consumer installs.)
 
 **Changing or releasing the connector?** The rest of this file is for you. Before changing anything
