@@ -1,16 +1,19 @@
 ---
 name: es-connector
 description: >
-  Maintain, review, refactor, and release the databricks-es-connector, a serverless-safe,
-  bidirectional Spark<->Elasticsearch library (bulk_write / read_index). Use when changing any file
-  under src/databricks_es_connector/, adding or altering a Spark datatype's write transform or read
-  inverse, touching the write path (sanitize_for_arrow / timestamp normalization / coerce_value /
-  bulk), the read path (read_index / read_coerce), debugging a data-fidelity or round-trip question,
-  reasoning about Elasticsearch behavior (dynamic mapping, term/keyword, timezone, coercion), running
-  the integration tier on FEVM serverless, reviewing repo documentation for drift (README, HANDOFF,
-  RELEASING, the skill itself), or cutting a release. Also use when the user mentions the
-  connector, bulk_write, read_index, EsConfig/EsWriteConfig/EsReadConfig, datatype fidelity, the
-  round-trip, doc review, or es-databricks-connector.
+  Maintain, review, refactor, and release the databricks-es-connector library (this repo), a
+  serverless-safe, bidirectional Spark<->Elasticsearch connector. This is a MAINTAINER skill for
+  working ON the connector's own source, not a how-to-call-it guide (a consumer installs the wheel
+  and follows README.md; do not load this merely to invoke bulk_write / read_index in an
+  application). Use when modifying any file under src/databricks_es_connector/, adding or altering a
+  Spark datatype's write transform or read inverse, touching the write path (sanitize_for_arrow /
+  timestamp normalization / coerce_value / bulk) or the read path (read_index / read_coerce) as
+  CODE, debugging a data-fidelity or round-trip regression in the transforms, reasoning about the
+  Elasticsearch behavior the connector depends on (dynamic mapping, term/keyword, timezone,
+  coercion, _source-vs-indexed), running the integration tier on FEVM serverless, reviewing this
+  repo's documentation for drift (README, HANDOFF, RELEASING, the skill itself), or cutting a
+  release. In short: load it to CHANGE the connector or reason about its internals, not just to
+  call it.
 ---
 
 # databricks-es-connector maintenance

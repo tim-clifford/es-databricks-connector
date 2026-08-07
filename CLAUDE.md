@@ -1,6 +1,13 @@
 # databricks-es-connector
 
-**Before changing anything in this repo, read `.agents/skills/es-connector/SKILL.md`.**
+**Using the connector?** Read `README.md`. Install the wheel and call `bulk_write` (batch) or
+`make_foreach_batch` (Structured Streaming) to write, `read_index` to read; the README covers the
+API, configuration, datatype fidelity, and the gotchas a caller hits. Nothing below this line is
+needed to *use* the library. (The wheel ships only the `databricks_es_connector`
+package: this file and the skill are repo-maintenance material, not part of what a consumer installs.)
+
+**Changing or releasing the connector?** The rest of this file is for you. Before changing anything
+in this repo, read `.agents/skills/es-connector/SKILL.md`.
 
 It is the maintenance skill for this library and it is NOT auto-discovered (it lives under
 `.agents/`, not `.claude/skills/`), so nothing loads it for you. It carries the rules that this
