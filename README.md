@@ -351,6 +351,7 @@ detect:
 | `{"k": 1}` | `string` | raises: declare a matching `struct` |
 | `3.7` | `int` | raises: lossy |
 | `3.0` | `int` | `3` (exact, allowed) |
+| `10000000000` | `int` | raises: exceeds the declared width's range (see below) |
 | `"maybe"` | `boolean` | raises: no defined meaning (see below) |
 | any | `char` / `varchar` / `void` | raises: unsupported declared type (see below) |
 
@@ -364,6 +365,17 @@ whitespace-trimmed. Anything else raises. Real JSON booleans and `0`/`1` are una
 `NullType` through the `mapInPandas` the reader uses, so they raise `ReadSchemaMismatch` naming the
 fix (`StringType`, or the column's real type). They fail fast at coercion rather than surfacing later
 as Spark's `Invalid return type in mapInPandas`, which names neither the field nor the cause.
+
+**An integer value that exceeds the declared width raises, it is not wrapped.** A stored value that
+fits an integer type but overflows the declared width (e.g. `10000000000` read as `int`, or `128`
+read as `byte`) raises `ReadSchemaMismatch` naming a wider type. Without this, the returned value
+must still be cast to the declared type by `mapInPandas`, and that cast either raises a cause-less
+`ArrowInvalid` or, on runtimes where `spark.sql.execution.pandas.convertToArrowArraySafely` defaults
+`false` (Spark 3.5 / DBR 15.x and earlier), **silently wraps** it (`10000000000` → `1410065408`). A
+pure `read_index(cfg, df.schema)` round-trip never hits this (the declared width equals the width
+written), so it only arises reading an index the connector did not write, or one whose values
+outgrew an under-sized declared type. Declare `short`/`int`/`long`, or a `decimal`/`string` wide
+enough to hold the value.
 
 Watch the multi-value case: **ES has no array type**, so any field can hold multiple values under the
 same mapping and `GET /_mapping` will not tell you which do. Declare `array<T>` wherever

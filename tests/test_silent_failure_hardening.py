@@ -25,7 +25,8 @@ from databricks_es_connector.bulk import (
     EsWriteError, _merge_partition_results, make_partition_writer, reconcile_or_raise,
 )
 from databricks_es_connector.config import EsConfig, EsReadConfig, EsWriteConfig
-from databricks_es_connector.read_transform import ReadSchemaMismatch, read_coerce
+from databricks_es_connector.read_transform import (
+    ReadSchemaMismatch, read_coerce, _INT_WIDTH_BOUNDS)
 from databricks_es_connector.stream import IGNORE, LOG, RAISE, make_foreach_batch
 from databricks_es_connector.transform import AmbiguousDeleteFlag, build_action, coerce_value
 
@@ -687,6 +688,83 @@ def test_integral_float_declared_int_is_allowed():
     # float. Only a LOSSY conversion is rejected.
     assert read_coerce(3.0, "int") == 3
     assert read_coerce(-7.0, "long") == -7
+
+
+# Tokens are the ones read.py's _spark_type_token actually produces via DataType.simpleString():
+# `tinyint`/`smallint`/`int`/`bigint`, NOT `byte`/`short`/`integer`/`long`. Testing the latter (as
+# an earlier revision did) exercises tokens that never occur in production, so the byte/short guard
+# looked covered while a real ByteType column fell through unguarded. These use the production
+# tokens; test_int_width_bounds_cover_every_production_token below pins the mapping itself.
+@pytest.mark.parametrize("value,token", [
+    (128, "tinyint"),                     # int8 max is 127
+    (-129, "tinyint"),                    # int8 min is -128
+    (40000, "smallint"),                  # int16 max is 32767
+    (3_000_000_000, "int"),               # int32 max is ~2.147e9
+    (10_000_000_000, "int"),              # comfortably over int32
+    (2 ** 63, "bigint"),                  # int64 max+1
+    (-(2 ** 63) - 1, "bigint"),           # int64 min-1
+])
+def test_integer_value_out_of_declared_width_raises(value, token):
+    # The SIBLING of the truncation guard: a value that FITS an integer type but exceeds the declared
+    # WIDTH used to pass straight through unchecked, then the mapInPandas Arrow cast either wrapped it
+    # silently (pre-Spark-4.1 default, e.g. 10000000000 declared int -> 1410065408) or raised a
+    # cause-less ArrowInvalid. Fail closed here instead, naming the fix.
+    with pytest.raises(ReadSchemaMismatch, match="outside the range"):
+        read_coerce(value, token)
+
+
+@pytest.mark.parametrize("value,token", [
+    (127, "tinyint"), (-128, "tinyint"),  # int8 boundaries, inclusive
+    (32767, "smallint"), (-32768, "smallint"),
+    (2 ** 31 - 1, "int"), (-(2 ** 31), "int"),
+    (2 ** 63 - 1, "bigint"), (-(2 ** 63), "bigint"),
+])
+def test_integer_value_at_declared_width_boundary_is_allowed(value, token):
+    # The bound is INCLUSIVE: the exact min/max of each width must still read back, unchanged. Guards
+    # against an off-by-one that would reject a legitimate extreme value.
+    assert read_coerce(value, token) == value
+
+
+def test_tinyint_smallint_are_guarded_not_passed_through():
+    # REGRESSION for the production-token miss: ByteType/ShortType render as tinyint/smallint via
+    # simpleString(), which the integer branch originally did not list, so read_coerce(128,'tinyint')
+    # returned 128 untouched (defeating the width guard, the truncation guard, and int() coercion).
+    # All three must now hold under the production tokens.
+    assert read_coerce(3.0, "tinyint") == 3 and isinstance(read_coerce(3.0, "tinyint"), int)
+    with pytest.raises(ReadSchemaMismatch, match="not an integer"):
+        read_coerce(3.7, "tinyint")            # truncation guard reaches tinyint
+    with pytest.raises(ReadSchemaMismatch, match="outside the range"):
+        read_coerce(128, "tinyint")            # width guard reaches tinyint
+    with pytest.raises(ReadSchemaMismatch, match="outside the range"):
+        read_coerce(40000, "smallint")
+
+
+def test_int_width_bounds_cover_every_production_token():
+    # The class-level gate: every integer Spark type, rendered the way read.py renders it
+    # (simpleString()), MUST be a key in _INT_WIDTH_BOUNDS. This is what would have caught the
+    # tinyint/smallint miss at the source: keying on byte/short instead of tinyint/smallint fails
+    # here immediately. Uses the real pyspark types so it tracks Spark's spelling, not a hand-copy.
+    pyspark_types = pytest.importorskip("pyspark.sql.types")
+    for cls in (pyspark_types.ByteType, pyspark_types.ShortType,
+                pyspark_types.IntegerType, pyspark_types.LongType):
+        token = cls().simpleString()
+        assert token in _INT_WIDTH_BOUNDS, (
+            f"{cls.__name__}.simpleString() == {token!r} is not a key in _INT_WIDTH_BOUNDS; "
+            "a real column of this type would fall through the integer branch unguarded.")
+
+
+def test_integral_float_within_width_still_allowed():
+    # The width check runs AFTER the float->int normalization, so an integral float that fits the
+    # declared width is unaffected (regression guard for the two guards interacting).
+    assert read_coerce(100.0, "tinyint") == 100
+    assert read_coerce(3_000_000_000.0, "bigint") == 3_000_000_000
+
+
+def test_integral_float_out_of_width_raises_on_magnitude():
+    # An integral float whose VALUE exceeds the declared width: passes the truncation guard (it IS
+    # integral) but must still fail the magnitude guard.
+    with pytest.raises(ReadSchemaMismatch, match="outside the range"):
+        read_coerce(3_000_000_000.0, "int")
 
 
 def test_declared_array_still_reads_a_list():
