@@ -9,9 +9,6 @@ description = "Serverless-safe bulk export from Databricks/Spark to Elasticsearc
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Databricks Field Engineering" }]
-classifiers = [
-    "License :: Other/Proprietary License",
-]
 dependencies = [
     "elasticsearch>=8,<9",
 ]
