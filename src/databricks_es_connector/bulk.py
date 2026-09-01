@@ -83,6 +83,86 @@ def classify_bulk_result(ok: bool, op_type: str, status: int) -> str:
     return ERROR
 
 
+def _streaming_bulk(es, actions, cfg: EsConfig):
+    """One streaming_bulk stream with the connector's fixed error/retry settings.
+
+    Factored out so the serial path and every concurrent worker in `_iter_bulk_results` issue
+    IDENTICAL requests. The choices here are load-bearing:
+
+      - raise_on_error=False + raise_on_exception=False + yield_ok=True: we get one (ok, item) tuple
+        per document and classify each ourselves (`classify_bulk_result`). We deliberately do NOT use
+        helpers.bulk's `ignore_status`, which would suppress a status across ALL op types (e.g. a 404
+        on an index would also be swallowed); the connector's suppression is scoped to *delete* 404s
+        only, and lives in the classifier.
+      - max_retries + retry_on_status: streaming_bulk retries the individual documents ES rejected
+        with a retryable status (429 = write queue full) with exponential backoff, re-sending only
+        the failed subset. Without this the library default (max_retries=0) makes a transient 429 a
+        permanent per-doc error on its first attempt; the transport-level EsConnection.max_retries
+        does NOT cover it, because _bulk returns HTTP 200 even when individual items fail.
+    """
+    from elasticsearch import helpers
+    return helpers.streaming_bulk(
+        es, actions, chunk_size=cfg.chunk_size,
+        raise_on_error=False, raise_on_exception=False, yield_ok=True,
+        max_retries=cfg.max_retries_per_doc,
+        retry_on_status=tuple(cfg.retry_on_doc_status),
+    )
+
+
+def _iter_bulk_results(es, actions, cfg: EsConfig):
+    """Yield (ok, result) tuples, one per document, for the writer loop to classify.
+
+    `cfg.write_concurrency == 1` (default) is a single serial `streaming_bulk`: EXACTLY the original
+    path, no threads. `> 1` fans `actions` across that many worker threads, each running its own
+    `streaming_bulk` (the elasticsearch-py client is thread-safe; it holds a connection pool), and
+    merges their per-document results through a bounded queue as they complete. This keeps
+    `write_concurrency` bulk requests in flight per partition to fill the ES round-trip wait, WITHOUT
+    losing streaming_bulk's per-document 429 retry (which parallel_bulk drops entirely).
+
+    A worker exception (e.g. a transport error surviving transport_max_retries) is re-raised on the
+    consumer thread once the queue has drained, so a partial write FAILS the partition instead of
+    silently reporting the documents a dead worker never sent as a clean success -- the exact silent
+    loss this module is built to prevent.
+    """
+    n = cfg.write_concurrency
+    if n <= 1:
+        yield from _streaming_bulk(es, actions, cfg)
+        return
+
+    import queue as _queue
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Strided slices spread any positional ordering in the partition evenly across workers instead of
+    # front-loading one. Order does not matter: each action is independent.
+    slices = [actions[i::n] for i in range(n)]
+    results = _queue.Queue(maxsize=n * 2)   # bounded => producers block when full => flat memory
+    _DONE = object()
+
+    def _worker(slice_actions):
+        try:
+            for tup in _streaming_bulk(es, slice_actions, cfg):
+                results.put(tup)
+        finally:
+            # Always signal completion, even on exception, so the consumer's drain loop terminates
+            # and can then re-raise via the future below.
+            results.put(_DONE)
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = [pool.submit(_worker, s) for s in slices]
+        finished = 0
+        while finished < n:
+            item = results.get()
+            if item is _DONE:
+                finished += 1
+                continue
+            yield item
+        # Every worker has now put its _DONE (the loop above drained them), so result() re-raises the
+        # first worker exception rather than blocking. Skipping this would let a thread that died
+        # mid-stream drop its remaining docs while the partition reported a clean partial count.
+        for f in futures:
+            f.result()
+
+
 def make_partition_writer(cfg: EsConfig):
     """Return a mapInPandas-compatible function that bulk-writes each pandas chunk.
 
@@ -91,7 +171,7 @@ def make_partition_writer(cfg: EsConfig):
     """
     def _write(iterator: "Iterator") -> "Iterator":
         import pandas as pd
-        from elasticsearch import Elasticsearch, helpers
+        from elasticsearch import Elasticsearch
 
         es = Elasticsearch(**cfg.client_kwargs())
         written = 0
@@ -121,23 +201,12 @@ def make_partition_writer(cfg: EsConfig):
             coerced_nonfinite += _stats.get("coerced_nonfinite", 0)
             if not actions:
                 continue
-            # streaming_bulk with raise_on_error=False + yield_ok=True yields one
-            # (ok, {op_type: item}) tuple per document, so we can classify each result
-            # individually. We deliberately do NOT use helpers.bulk's ignore_status: that
-            # would suppress a status across ALL op types (e.g. a 404 on an index would
-            # also be swallowed). We need the suppression scoped to *delete* 404s only.
-            # max_retries + retry_on_status make streaming_bulk retry the individual documents ES
-            # rejected with a retryable status (429 = write queue full) with exponential backoff,
-            # re-sending only the failed subset. Without this the library default (max_retries=0)
-            # makes a transient 429 a permanent per-doc error on its first attempt; the
-            # transport-level EsConnection.max_retries does NOT cover it, because _bulk returns
-            # HTTP 200 even when individual items fail.
-            for ok, result in helpers.streaming_bulk(
-                es, actions, chunk_size=cfg.chunk_size,
-                raise_on_error=False, raise_on_exception=False, yield_ok=True,
-                max_retries=cfg.max_retries_per_doc,
-                retry_on_status=tuple(cfg.retry_on_doc_status),
-            ):
+            # _iter_bulk_results yields one (ok, {op_type: item}) tuple per document (see
+            # _streaming_bulk for the raise_on_error / yield_ok / retry rationale), so each result is
+            # classified individually below. With cfg.write_concurrency > 1 the tuples arrive from
+            # several concurrent streaming_bulk streams over this partition, merged in completion
+            # order; the classification and counting are identical either way.
+            for ok, result in _iter_bulk_results(es, actions, cfg):
                 op_type, item = next(iter(result.items()))
                 outcome = classify_bulk_result(ok, op_type, item.get("status", 500))
                 if outcome == WRITTEN:

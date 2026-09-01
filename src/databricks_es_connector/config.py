@@ -125,6 +125,22 @@ class EsWriteConfig(EsConnection):
     id_field: Optional[str] = None          # column used as deterministic _id (idempotency)
     chunk_size: int = 500                   # docs per bulk request
 
+    # How many bulk request streams run IN PARALLEL within a single DataFrame partition. 1 (default)
+    # is one serial streaming_bulk per partition, exactly the historical behavior, so write
+    # concurrency across the cluster is just the partition count. Raise it when the write is
+    # LATENCY-bound: executors sit idle waiting on each bulk's ES round-trip (CPU and network both
+    # under-utilized) rather than CPU- or bandwidth-bound. Each partition then keeps
+    # `write_concurrency` bulk requests in flight at once, filling that wait. Every stream is a full
+    # streaming_bulk with the SAME chunk_size and per-document retry behavior (max_retries_per_doc /
+    # retry_on_doc_status), so the error accounting is byte-for-byte unchanged; only the number of
+    # concurrent in-flight requests grows. Costs one executor thread and up to one chunk of in-flight
+    # docs per unit. Total requests hitting ES at once = (running partitions) * write_concurrency, so
+    # raise it gradually and watch for 429s (ES write queue full) -- if they climb, the ES cluster,
+    # not the client, is the ceiling. This does NOT use elasticsearch-py's parallel_bulk, which has no
+    # per-document retry loop and would drop the 429 handling exactly when concurrency makes 429s more
+    # likely.
+    write_concurrency: int = 1
+
     # Per-DOCUMENT retries for rows Elasticsearch rejects with a retryable status (429
     # es_rejected_execution_exception: the ES write queue is full). This is NOT the same as
     # EsConnection.max_retries, which is transport-level and only fires on the HTTP status of the
@@ -160,6 +176,8 @@ class EsWriteConfig(EsConnection):
         super().__post_init__()
         if self.max_retries_per_doc < 0:
             raise ValueError("EsWriteConfig.max_retries_per_doc must be >= 0")
+        if self.write_concurrency < 1:
+            raise ValueError("EsWriteConfig.write_concurrency must be >= 1")
         # The `max_retries` umbrella cannot produce this combination (it sets both layers to the same
         # value), so reaching here means the layers were configured GRANULARLY: the transport layer
         # was hardened while per-document retries were switched off. That is almost certainly not
