@@ -122,7 +122,10 @@ def _iter_bulk_results(es, actions, cfg: EsConfig):
     A worker exception (e.g. a transport error surviving transport_max_retries) is re-raised on the
     consumer thread once the queue has drained, so a partial write FAILS the partition instead of
     silently reporting the documents a dead worker never sent as a clean success -- the exact silent
-    loss this module is built to prevent.
+    loss this module is built to prevent. If instead the CONSUMER abandons this generator early (the
+    classify loop raises, or the generator is closed/GC'd mid-stream), the `stop` flag releases any
+    producer parked on a full queue so `ThreadPoolExecutor.__exit__`'s shutdown(wait=True) can never
+    deadlock the partition on a `put()` that will never be drained.
     """
     n = cfg.write_concurrency
     if n <= 1:
@@ -130,37 +133,64 @@ def _iter_bulk_results(es, actions, cfg: EsConfig):
         return
 
     import queue as _queue
+    import threading
     from concurrent.futures import ThreadPoolExecutor
 
     # Strided slices spread any positional ordering in the partition evenly across workers instead of
     # front-loading one. Order does not matter: each action is independent.
     slices = [actions[i::n] for i in range(n)]
     results = _queue.Queue(maxsize=n * 2)   # bounded => producers block when full => flat memory
+    stop = threading.Event()                # set when the consumer abandons us early (see docstring)
     _DONE = object()
+
+    def _put(item):
+        # Block for room on a full queue, but poll `stop` so a producer can't hang forever once the
+        # consumer has stopped draining. Returns immediately when there is room (the normal path), so
+        # this adds no latency unless the queue is actually full.
+        while not stop.is_set():
+            try:
+                results.put(item, timeout=0.2)
+                return
+            except _queue.Full:
+                continue
 
     def _worker(slice_actions):
         try:
             for tup in _streaming_bulk(es, slice_actions, cfg):
-                results.put(tup)
+                if stop.is_set():
+                    return
+                _put(tup)
         finally:
-            # Always signal completion, even on exception, so the consumer's drain loop terminates
-            # and can then re-raise via the future below.
-            results.put(_DONE)
+            # Always signal completion, even on exception, so the consumer's drain loop terminates and
+            # can re-raise via the future below. `_put` honors `stop`, so this can't wedge on abort.
+            _put(_DONE)
 
     with ThreadPoolExecutor(max_workers=n) as pool:
         futures = [pool.submit(_worker, s) for s in slices]
-        finished = 0
-        while finished < n:
-            item = results.get()
-            if item is _DONE:
-                finished += 1
-                continue
-            yield item
-        # Every worker has now put its _DONE (the loop above drained them), so result() re-raises the
-        # first worker exception rather than blocking. Skipping this would let a thread that died
-        # mid-stream drop its remaining docs while the partition reported a clean partial count.
-        for f in futures:
-            f.result()
+        try:
+            finished = 0
+            while finished < n:
+                item = results.get()
+                if item is _DONE:
+                    finished += 1
+                    continue
+                yield item
+            # Every worker has now put its _DONE (the loop above drained them), so result() re-raises
+            # the first worker exception rather than blocking. Skipping this would let a thread that
+            # died mid-stream drop its remaining docs while the partition reported a clean partial count.
+            for f in futures:
+                f.result()
+        finally:
+            # On ANY early exit (consumer raised, or the generator was closed/GC'd), release producers
+            # that may be blocked in _put before ThreadPoolExecutor.__exit__ runs shutdown(wait=True):
+            # set the flag, then drain so a parked producer wakes at once rather than after its poll
+            # timeout. Harmless on the normal path (workers have already finished; the queue is empty).
+            stop.set()
+            try:
+                while True:
+                    results.get_nowait()
+            except _queue.Empty:
+                pass
 
 
 def make_partition_writer(cfg: EsConfig):

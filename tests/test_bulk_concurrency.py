@@ -34,6 +34,13 @@ def test_write_concurrency_must_be_positive():
         _cfg(write_concurrency=0)
 
 
+def test_client_kwargs_sizes_connection_pool_to_concurrency():
+    # Serial path unchanged: no pool override, so the client keeps elastic_transport's default.
+    assert "connections_per_node" not in _cfg().client_kwargs()
+    # Concurrent path: pool is sized to the concurrency so the fanned workers aren't capped below it.
+    assert _cfg(write_concurrency=8).client_kwargs()["connections_per_node"] == 8
+
+
 # --- a recording stub for helpers.streaming_bulk -----------------------------------------
 # Yields one (ok, result) tuple per action so a test can recover exactly which actions each
 # stream processed, and records every call's kwargs (thread-safely) so the fan-out and the
@@ -113,6 +120,27 @@ def test_worker_exception_propagates_fail_closed(monkeypatch):
     cfg = _cfg(write_concurrency=4)
     with pytest.raises(RuntimeError, match="transport died"):
         list(_iter_bulk_results(object(), _actions(40), cfg))
+
+
+def test_early_consumer_abort_does_not_deadlock(monkeypatch):
+    # RED-BEFORE-GREEN guard for the abort deadlock: fill the bounded queue, then abandon the
+    # generator. Without the stop-flag release + drain, the workers stay blocked on put() and
+    # ThreadPoolExecutor.__exit__'s shutdown(wait=True) hangs the partition forever. The workers must
+    # be released so close() returns promptly. 400 actions >> the maxsize-8 queue, so producers are
+    # blocked by the time we abort.
+    _install_stub(monkeypatch)
+    cfg = _cfg(write_concurrency=4)
+    gen = _iter_bulk_results(object(), _actions(400), cfg)
+    next(gen)                              # start the workers, then stop draining
+
+    done = threading.Event()
+
+    def _close():
+        gen.close()                        # GeneratorExit at the paused yield -> must not hang
+        done.set()
+
+    threading.Thread(target=_close, daemon=True).start()
+    assert done.wait(timeout=15), "generator.close() hung: early-abort deadlock"
 
 
 # --- end-to-end through the writer, concurrent -------------------------------------------
