@@ -42,6 +42,11 @@ Each fixture owns one concern:
   deliberately-rejected doc (so the error path + `error_samples` are exercised, not just the clean
   path), idempotent re-write via a deterministic `_id`, and a duplicate-id-within-one-input case
   proving the collapse (counts succeed, ES doc count is lower). Does not re-assert per-type transforms.
+- **`test_concurrency_roundtrip.py`**: live ES. Owns the **per-partition write-concurrency contract**:
+  with `write_concurrency > 1`, the threaded fan-out inside each partition writes every doc exactly
+  once (ES `_count` == input), counts reconcile with `unaccounted == 0` and `overcounted == 0`,
+  deterministic-`_id` re-write stays idempotent, and a rejected doc is still counted + sampled. The
+  unit tier proves the merge/retry/fail-closed logic; this proves it over the live `mapInPandas` write.
 - **`test_deletes_roundtrip.py`**: live ES. Owns the **delete-propagation contract** end-to-end:
   with `has_deletes=True`, flagged rows delete-by-`_id` while unflagged rows index; `deleted` is
   counted exactly; the delete-flag column is never indexed; and a delete of an absent `_id` is a
