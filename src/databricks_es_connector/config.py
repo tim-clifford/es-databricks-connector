@@ -125,6 +125,23 @@ class EsWriteConfig(EsConnection):
     id_field: Optional[str] = None          # column used as deterministic _id (idempotency)
     chunk_size: int = 500                   # docs per bulk request
 
+    # How many bulk request streams run IN PARALLEL within a single DataFrame partition. 1 (default)
+    # is one serial streaming_bulk per partition, exactly the historical behavior, so write
+    # concurrency across the cluster is just the partition count. Raise it when the write is
+    # LATENCY-bound: executors sit idle waiting on each bulk's ES round-trip (CPU and network both
+    # under-utilized) rather than CPU- or bandwidth-bound. Each partition then keeps
+    # `write_concurrency` bulk requests in flight at once, filling that wait. Every stream is a full
+    # streaming_bulk with the SAME chunk_size and per-document retry behavior (max_retries_per_doc /
+    # retry_on_doc_status), so the error accounting is byte-for-byte unchanged; only the number of
+    # concurrent in-flight requests grows. Costs one executor thread and up to one chunk of in-flight
+    # docs per unit. Total requests hitting ES at once = (running partitions) * write_concurrency, so
+    # raise it gradually and watch for 429s (ES write queue full) -- if they climb, the ES cluster,
+    # not the client, is the ceiling. This does NOT use elasticsearch-py's parallel_bulk, which has no
+    # per-document retry loop and would drop the 429 handling exactly when concurrency makes 429s more
+    # likely. The per-node HTTP connection pool is sized to write_concurrency automatically (see
+    # client_kwargs), so callers do not also have to raise it.
+    write_concurrency: int = 1
+
     # Per-DOCUMENT retries for rows Elasticsearch rejects with a retryable status (429
     # es_rejected_execution_exception: the ES write queue is full). This is NOT the same as
     # EsConnection.max_retries, which is transport-level and only fires on the HTTP status of the
@@ -160,6 +177,8 @@ class EsWriteConfig(EsConnection):
         super().__post_init__()
         if self.max_retries_per_doc < 0:
             raise ValueError("EsWriteConfig.max_retries_per_doc must be >= 0")
+        if self.write_concurrency < 1:
+            raise ValueError("EsWriteConfig.write_concurrency must be >= 1")
         # The `max_retries` umbrella cannot produce this combination (it sets both layers to the same
         # value), so reaching here means the layers were configured GRANULARLY: the transport layer
         # was hardened while per-document retries were switched off. That is almost certainly not
@@ -194,6 +213,20 @@ class EsWriteConfig(EsConnection):
             # A flag column set with deletes off would silently do nothing, reject the misconfig
             # rather than let a caller believe deletes are happening.
             raise ValueError("delete_flag_column is set but has_deletes is False, enable has_deletes or drop it")
+
+    def client_kwargs(self) -> dict:
+        """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.
+
+        Each partition's ES client is shared by `write_concurrency` worker threads (see
+        bulk._iter_bulk_results). elastic_transport's per-node pool defaults to ~10 connections, so a
+        higher write_concurrency would silently cap the in-flight requests below the configured value;
+        sizing the pool to the concurrency gives every worker its own connection. Left at the client
+        default for write_concurrency == 1 (the serial path), so nothing changes there.
+        """
+        kw = super().client_kwargs()
+        if self.write_concurrency > 1:
+            kw["connections_per_node"] = self.write_concurrency
+        return kw
 
 
 @dataclass(frozen=True)
