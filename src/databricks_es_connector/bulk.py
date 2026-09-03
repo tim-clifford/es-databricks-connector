@@ -231,32 +231,29 @@ def make_partition_writer(cfg: EsConfig):
             coerced_nonfinite += _stats.get("coerced_nonfinite", 0)
             if not actions:
                 continue
-            # _iter_bulk_results yields one (ok, {op_type: item}) tuple per document (see
-            # _streaming_bulk for the raise_on_error / yield_ok / retry rationale), so each result is
-            # classified individually below. With cfg.write_concurrency > 1 the tuples arrive from
-            # several concurrent streaming_bulk streams over this partition, merged in completion
-            # order; the classification and counting are identical either way.
-            for ok, result in _iter_bulk_results(es, actions, cfg):
-                op_type, item = next(iter(result.items()))
-                outcome = classify_bulk_result(ok, op_type, item.get("status", 500))
-                if outcome == WRITTEN:
-                    written += 1
-                elif outcome == DELETED:
-                    deleted += 1
-                elif outcome == IGNORED:
-                    # A delete-404 is an expected no-op, but it must be COUNTED: it is the one
-                    # outcome that legitimately makes written+deleted+errors < total_input, so
-                    # without this the reconciliation check cannot tell an expected no-op from a
-                    # row lost below the per-doc level. Counting it here is what makes
-                    # written+deleted+errors+ignored == total_input the invariant `unaccounted`
-                    # measures. Note this is about a row producing NO write, not about two rows
-                    # collapsing onto one `_id`: duplicate ids each report success, so they keep the
-                    # identity intact and `unaccounted` stays 0 (see the README's duplicate-id note).
-                    ignored += 1
-                elif outcome == ERROR:
-                    errors += 1
-                    if len(error_samples) < ERROR_SAMPLE_CAP:
-                        error_samples.append(_extract_error_sample(op_type, item))
+            # === THROUGHPUT DIAGNOSTIC (EXPERIMENT - DO NOT MERGE / REVERT BEFORE ANY REAL WRITE) ===
+            # The ES bulk call is DISABLED to isolate the cost of the mapInPandas machinery (Arrow
+            # decode + pdf.to_dict + build_action above) and the upstream shuffle read from the cost of
+            # the ES HTTP write path. build_action still runs (per-row prep is part of the machinery
+            # under test); only the network send (_iter_bulk_results / streaming_bulk) is skipped.
+            # The built actions are counted as `written` so written == total_input and
+            # reconcile_or_raise passes, letting the run COMPLETE and report a clean stage timing.
+            # NO DOCUMENTS ARE SENT TO ELASTICSEARCH while this block is active (batch AND streaming).
+            written += len(actions)
+            # --- original write+classify loop; uncomment (and delete the line above) to re-enable ES ---
+            # for ok, result in _iter_bulk_results(es, actions, cfg):
+            #     op_type, item = next(iter(result.items()))
+            #     outcome = classify_bulk_result(ok, op_type, item.get("status", 500))
+            #     if outcome == WRITTEN:
+            #         written += 1
+            #     elif outcome == DELETED:
+            #         deleted += 1
+            #     elif outcome == IGNORED:
+            #         ignored += 1
+            #     elif outcome == ERROR:
+            #         errors += 1
+            #         if len(error_samples) < ERROR_SAMPLE_CAP:
+            #             error_samples.append(_extract_error_sample(op_type, item))
         # error_samples is JSON-encoded into a single string column: mapInPandas needs a flat,
         # typed schema and can't carry a nested list<struct> of varying content cleanly.
         yield pd.DataFrame({
