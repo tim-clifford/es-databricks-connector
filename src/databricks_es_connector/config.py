@@ -166,6 +166,17 @@ class EsWriteConfig(EsConnection):
     # not. Set False for a pipeline that intentionally relies on auto-creation or an index template.
     require_existing_index: bool = True
 
+    # Optional per-write LOG TABLE (a table identifier). None (default) => nothing is logged and no
+    # table is touched, so there is zero overhead and full backward compatibility. When set, every
+    # bulk_write call APPENDS rows to this table recording the write: one aggregate row per call
+    # (scope="batch", = one micro-batch on the streaming path) plus one row per Spark partition
+    # (scope="partition"), each carrying a start time, a duration, and the row counts. Best-effort:
+    # a failure to write the log NEVER fails the ES write (it warns). Note it is one Delta commit per
+    # bulk_write call, so on a high-frequency stream that is many small commits -- enable it for
+    # diagnosis (throughput, keeping-up, per-partition skew) rather than steady-state, or point it at
+    # a table you compact. See bulk.build_log_rows for the exact columns.
+    log_table: Optional[str] = None
+
     # --- deletes ---
     # has_deletes=False (default): every row is an index/upsert.
     # Set has_deletes=True *and* delete_flag_column to route rows whose flag is truthy to an
@@ -213,6 +224,10 @@ class EsWriteConfig(EsConnection):
             # A flag column set with deletes off would silently do nothing, reject the misconfig
             # rather than let a caller believe deletes are happening.
             raise ValueError("delete_flag_column is set but has_deletes is False, enable has_deletes or drop it")
+        # log_table is optional; if given it must be a real identifier. An empty/whitespace string
+        # is a misconfiguration (it would fail the append at write time), so reject it up front.
+        if self.log_table is not None and not str(self.log_table).strip():
+            raise ValueError("log_table is set but empty; give a table identifier or leave it None")
 
     def client_kwargs(self) -> dict:
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.

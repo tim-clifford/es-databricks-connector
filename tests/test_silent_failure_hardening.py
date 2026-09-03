@@ -63,7 +63,7 @@ def test_streaming_raises_when_every_doc_is_rejected(monkeypatch):
     # where ES rejected all 1000 docs used to be recorded as a success and the rows were never
     # retried. It must now raise.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(errors=1000, total_input=1000))
+                        lambda df, cfg, batch_id=None: _result(errors=1000, total_input=1000))
     fb = make_foreach_batch(_cfg())
     with pytest.raises(EsWriteError, match="1000 document"):
         fb(_FakeDF(), 42)
@@ -72,7 +72,7 @@ def test_streaming_raises_when_every_doc_is_rejected(monkeypatch):
 def test_streaming_raises_on_partial_rejection(monkeypatch):
     # Not just the all-or-nothing case: one rejected doc is still silent loss of that row.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(written=999, errors=1, total_input=1000))
+                        lambda df, cfg, batch_id=None: _result(written=999, errors=1, total_input=1000))
     fb = make_foreach_batch(_cfg())
     with pytest.raises(EsWriteError):
         fb(_FakeDF(), 7)
@@ -82,7 +82,7 @@ def test_streaming_raises_on_unaccounted_rows(monkeypatch):
     # Loss BELOW the per-doc level (a chunk-level transport failure): errors==0 but rows vanished.
     # The per-doc error count structurally cannot see this, which is why unaccounted exists.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(written=7, total_input=10, unaccounted=3))
+                        lambda df, cfg, batch_id=None: _result(written=7, total_input=10, unaccounted=3))
     fb = make_foreach_batch(_cfg())
     with pytest.raises(EsWriteError, match="unaccounted"):
         fb(_FakeDF(), 1)
@@ -92,7 +92,7 @@ def test_streaming_error_carries_the_result_for_a_dead_letter_path(monkeypatch):
     # A caller catching the error still needs the counts and samples (e.g. to write a DLQ row).
     res = _result(written=1, errors=2, total_input=3,
                   error_samples=[{"_id": "x", "op_type": "index", "status": 400, "reason": "boom"}])
-    monkeypatch.setattr(stream_mod, "bulk_write", lambda df, cfg: res)
+    monkeypatch.setattr(stream_mod, "bulk_write", lambda df, cfg, batch_id=None: res)
     fb = make_foreach_batch(_cfg())
     with pytest.raises(EsWriteError) as exc:
         fb(_FakeDF(), 3)
@@ -103,21 +103,21 @@ def test_streaming_error_carries_the_result_for_a_dead_letter_path(monkeypatch):
 def test_streaming_does_not_raise_on_a_clean_batch(monkeypatch):
     # The guard must not fire on success, or every healthy stream breaks.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(written=500, total_input=500))
+                        lambda df, cfg, batch_id=None: _result(written=500, total_input=500))
     make_foreach_batch(_cfg())(_FakeDF(), 0)   # returns cleanly
 
 
 def test_streaming_does_not_raise_on_expected_delete_404s(monkeypatch):
     # A CDF replay deleting already-absent docs is the COMMON case; it must not fail the stream.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(written=1, deleted=2, ignored=5, total_input=8))
+                        lambda df, cfg, batch_id=None: _result(written=1, deleted=2, ignored=5, total_input=8))
     make_foreach_batch(_cfg())(_FakeDF(), 0)   # returns cleanly
 
 
 def test_streaming_on_batch_still_sees_a_failing_batch(monkeypatch):
     # The metrics hook may BE the dead-letter path, so it must run before the raise.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(errors=3, total_input=3))
+                        lambda df, cfg, batch_id=None: _result(errors=3, total_input=3))
     seen = []
     fb = make_foreach_batch(_cfg(), on_batch=lambda bid, r: seen.append((bid, r["errors"])))
     with pytest.raises(EsWriteError):
@@ -129,7 +129,7 @@ def test_streaming_on_error_log_advances_and_warns(monkeypatch, caplog):
     # The documented opt-out. It must be loud about the consequence: rows are NOT retried.
     import logging
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(errors=4, total_input=4))
+                        lambda df, cfg, batch_id=None: _result(errors=4, total_input=4))
     fb = make_foreach_batch(_cfg(), on_error=LOG)
     with caplog.at_level(logging.WARNING, logger="databricks_es_connector.stream"):
         fb(_FakeDF(), 5)     # does NOT raise
@@ -141,7 +141,7 @@ def test_streaming_on_error_ignore_is_silent(monkeypatch, caplog):
     # Restores pre-0.6.0 behavior for a deliberately loss-tolerant pipeline. No raise, no log.
     import logging
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(errors=4, total_input=4))
+                        lambda df, cfg, batch_id=None: _result(errors=4, total_input=4))
     fb = make_foreach_batch(_cfg(), on_error=IGNORE)
     with caplog.at_level(logging.WARNING, logger="databricks_es_connector.stream"):
         fb(_FakeDF(), 5)
@@ -158,7 +158,7 @@ def test_streaming_empty_batch_result_has_the_new_keys(monkeypatch):
     # The empty-batch stand-in must carry the same keys a real result does, including the new ones,
     # so a callback reading result["unaccounted"] never KeyErrors on an empty micro-batch.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: pytest.fail("must not write an empty batch"))
+                        lambda df, cfg, batch_id=None: pytest.fail("must not write an empty batch"))
     seen = []
     make_foreach_batch(_cfg(), on_batch=lambda b, r: seen.append(r))(_FakeDF(empty=True), 0)
     for key in ("written", "deleted", "errors", "ignored", "coerced_nonfinite", "total_input",
@@ -1113,7 +1113,7 @@ def test_overcount_is_surfaced_under_both_raise_and_log(monkeypatch, caplog):
     import logging
 
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+                        lambda df, cfg, batch_id=None: _result(written=105, total_input=100, overcounted=5))
 
     for policy in (RAISE, LOG):
         caplog.clear()
@@ -1129,7 +1129,7 @@ def test_overcount_stays_silent_under_ignore(monkeypatch, caplog):
     import logging
 
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+                        lambda df, cfg, batch_id=None: _result(written=105, total_input=100, overcounted=5))
     caplog.clear()
     with caplog.at_level(logging.DEBUG):
         make_foreach_batch(_cfg(), on_error=IGNORE)(_FakeDF(), 1)
@@ -1140,7 +1140,7 @@ def test_an_overcount_alone_never_fails_a_batch(monkeypatch):
     # Guard-rail on the fix: surfacing the over-count must not start FAILING batches over a library
     # bug, which on the streaming path is an unescapable retry loop.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: _result(written=105, total_input=100, overcounted=5))
+                        lambda df, cfg, batch_id=None: _result(written=105, total_input=100, overcounted=5))
     make_foreach_batch(_cfg(), on_error=RAISE)(_FakeDF(), 1)   # returns cleanly
 
 

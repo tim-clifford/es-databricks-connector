@@ -119,7 +119,8 @@ def test_partition_writer_counts_and_schema(monkeypatch):
     row = out[0].iloc[0]
     # mapInPandas schema: counts + reconciliation total + bounded error samples (JSON string)
     assert list(out[0].columns) == ["written", "deleted", "errors", "ignored", "coerced_nonfinite",
-                                    "total_input", "error_samples"]
+                                    "total_input", "error_samples",
+                                    "partition_id", "partition_start_ms", "partition_duration_ms"]
     assert (int(row["written"]), int(row["deleted"]), int(row["errors"])) == (2, 1, 2)
     # The delete-404 is still not an error, but it is now COUNTED so reconciliation can tell an
     # expected no-op apart from a row lost below the per-document level.
@@ -373,7 +374,8 @@ def test_bulk_write_wires_sanitize_mapinpandas_and_merge(monkeypatch):
     assert isinstance(captured["preflight"], _FakeDF)      # preflight ran, on the prepared df
     assert captured["schema"] == \
         ("written long, deleted long, errors long, ignored long, coerced_nonfinite long, "
-         "total_input long, error_samples string")
+         "total_input long, error_samples string, "
+         "partition_id int, partition_start_ms long, partition_duration_ms long")
     # The collected partition rows are merged into the final result dict.
     assert out["written"] == 4 and out["errors"] == 1 and out["total_input"] == 5
     assert out["error_samples"][0]["_id"] == "b"

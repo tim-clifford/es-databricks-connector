@@ -462,6 +462,48 @@ per-document level, and `max_retries=N` sets both at once, see
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
 | `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses to retry. `429` is ES's write queue being full, the one reliably transient case. Adding `503` (a shard briefly unavailable, e.g. during relocation) is the main sensible extension: `retry_on_doc_status=(429, 503)`. Do **not** add deterministic statuses like `400` (malformed doc) or `409` (version conflict): the retry fails identically and only delays the real error. Empty with a non-zero `max_retries_per_doc` raises. |
 | `require_existing_index` | `bool` | `True` | No | Verify the index exists before writing. ES auto-creates a missing index, so a **typo'd index name** otherwise produces a brand-new dynamically-mapped index and a perfect-looking `written` count. One `indices.exists` call on the driver. Set `False` to allow auto-creation (e.g. with an index template). |
+| `log_table` | `str \| None` | `None` | No | Optional table to **append a per-write log** to. `None` (default) logs nothing and touches no table (zero overhead). When set, each `bulk_write` call — one **micro-batch** on the streaming path — appends one aggregate row plus one row per Spark partition. See [Write logging](#write-logging-log_table). Best-effort: a log-write failure never fails the ES write. |
+
+#### Write logging (`log_table`)
+
+Set `log_table` to make each write record itself to a Delta table you can query — useful for
+throughput analysis, confirming a **streaming** job is keeping up, and spotting **per-partition
+skew**. Every `bulk_write` call (one micro-batch on the streaming path) appends:
+
+- one **`scope="batch"`** row: the whole call's `event_time` (start), `duration_ms`, and the merged
+  counts (`total_input`, `written`, `deleted`, `errors`, `ignored`, `unaccounted`); and
+- one **`scope="partition"`** row per Spark partition: that partition's `partition_id`,
+  `duration_ms`, and its own counts (`unaccounted` is null here — it is a cross-partition figure).
+
+Columns: `event_time`, `batch_id` (the micro-batch id on the streaming path, null otherwise),
+`index`, `scope`, `partition_id`, `duration_ms`, `total_input`, `written`, `deleted`, `errors`,
+`ignored`, `unaccounted`.
+
+```python
+cfg = EsWriteConfig(hosts=..., api_key=..., index="my-index", log_table="cat.sch.es_write_log")
+# rows/sec per batch over time, and whether a streaming job is keeping up (dedupe retried
+# batch_ids to the latest attempt first, see the retries note below):
+#   WITH latest AS (
+#     SELECT *, ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY event_time DESC) rn
+#     FROM cat.sch.es_write_log WHERE scope='batch')
+#   SELECT batch_id, event_time, total_input, duration_ms,
+#          total_input / (duration_ms/1000.0) AS rows_per_sec
+#   -- keep the latest attempt of each streaming batch_id, and ALL non-streaming rows
+#   -- (batch_id NULL, which never retries — they'd otherwise collapse into one window group):
+#   FROM latest WHERE rn = 1 OR batch_id IS NULL ORDER BY event_time
+# slowest partitions (skew) for a batch:
+#   SELECT partition_id, duration_ms, total_input FROM cat.sch.es_write_log
+#   WHERE scope='partition' AND batch_id = :b ORDER BY duration_ms DESC
+```
+
+It is an **append-only event log**: on the streaming default (`on_error="raise"`) a failed
+micro-batch raises *after* its log rows are written, so Spark retries the **same `batch_id`** and
+each retry appends another set of rows (with a fresh `event_time`) — intentional, so failed attempts
+stay visible. **Dedupe per `batch_id` to the latest `event_time`** in any per-batch query (as above);
+`batch_id` is null for non-streaming writes, which append once. It is **best-effort** (a failure to
+write the log is warned, never fails the ES write) and costs **one Delta commit per call**
+(`coalesce(1)`, so one small file each), so enable it for diagnosis rather than steady-state, or
+point it at a table you compact. The table is created on first write and appended thereafter.
 
 #### Retries on a write: two layers
 

@@ -80,7 +80,9 @@ def make_foreach_batch(cfg: EsConfig, on_batch: Optional[Callable] = None,
                                     "coerced_nonfinite": 0, "total_input": 0, "unaccounted": 0,
                                     "overcounted": 0, "error_samples": [], "empty": True})
             return
-        result = bulk_write(batch_df, cfg)
+        # Pass the micro-batch id so an optional cfg.log_table row is tagged with it (correlates a
+        # log row to this exact micro-batch); it is otherwise inert.
+        result = bulk_write(batch_df, cfg, batch_id=batch_id)
         # The metrics hook runs first so it sees a failing batch too (it may be the dead-letter path).
         if on_batch:
             on_batch(batch_id, result)
