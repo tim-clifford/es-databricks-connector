@@ -488,7 +488,9 @@ cfg = EsWriteConfig(hosts=..., api_key=..., index="my-index", log_table="cat.sch
 #     FROM cat.sch.es_write_log WHERE scope='batch')
 #   SELECT batch_id, event_time, total_input, duration_ms,
 #          total_input / (duration_ms/1000.0) AS rows_per_sec
-#   FROM latest WHERE rn = 1 ORDER BY event_time
+#   -- keep the latest attempt of each streaming batch_id, and ALL non-streaming rows
+#   -- (batch_id NULL, which never retries — they'd otherwise collapse into one window group):
+#   FROM latest WHERE rn = 1 OR batch_id IS NULL ORDER BY event_time
 # slowest partitions (skew) for a batch:
 #   SELECT partition_id, duration_ms, total_input FROM cat.sch.es_write_log
 #   WHERE scope='partition' AND batch_id = :b ORDER BY duration_ms DESC
