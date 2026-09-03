@@ -39,7 +39,7 @@ def test_empty_batch_skips_bulk_write_and_reports_full_shape(monkeypatch):
     # keys a real result does (this is the regression: total_input/error_samples were missing).
     called = {"bulk": 0}
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: called.__setitem__("bulk", called["bulk"] + 1) or {})
+                        lambda df, cfg, batch_id=None: called.__setitem__("bulk", called["bulk"] + 1) or {})
 
     seen = []
     fb = make_foreach_batch(_cfg(), on_batch=lambda bid, r: seen.append((bid, r)))
@@ -57,18 +57,19 @@ def test_empty_batch_skips_bulk_write_and_reports_full_shape(monkeypatch):
 def test_empty_batch_without_callback_is_a_noop(monkeypatch):
     # No on_batch => nothing to call; must not touch bulk_write or raise.
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: (_ for _ in ()).throw(AssertionError("should not run")))
+                        lambda df, cfg, batch_id=None: (_ for _ in ()).throw(AssertionError("should not run")))
     fb = make_foreach_batch(_cfg())
     fb(_FakeDF(empty=True), 0)   # returns cleanly
 
 
 def test_non_empty_batch_delegates_to_bulk_write(monkeypatch):
-    # A non-empty batch calls bulk_write(df, cfg) and forwards its exact result to on_batch.
+    # A non-empty batch calls bulk_write(df, cfg, batch_id=...) and forwards its result to on_batch.
     result = {"written": 3, "deleted": 1, "errors": 0, "total_input": 4, "error_samples": []}
     captured = {}
-    def _fake_bulk(df, cfg):
+    def _fake_bulk(df, cfg, batch_id=None):
         captured["df"] = df
         captured["cfg"] = cfg
+        captured["batch_id"] = batch_id
         return result
     monkeypatch.setattr(stream_mod, "bulk_write", _fake_bulk)
 
@@ -79,6 +80,7 @@ def test_non_empty_batch_delegates_to_bulk_write(monkeypatch):
     fb(df, 42)
 
     assert captured["df"] is df and captured["cfg"] is cfg   # passed through unchanged
+    assert captured["batch_id"] == 42                        # micro-batch id forwarded for the log table
     assert seen == [(42, result)]                            # result forwarded verbatim
 
 
@@ -87,7 +89,7 @@ def test_non_empty_batch_without_callback_still_writes(monkeypatch):
     # not the write trigger).
     called = {"bulk": 0}
     monkeypatch.setattr(stream_mod, "bulk_write",
-                        lambda df, cfg: called.__setitem__("bulk", called["bulk"] + 1) or {})
+                        lambda df, cfg, batch_id=None: called.__setitem__("bulk", called["bulk"] + 1) or {})
     fb = make_foreach_batch(_cfg())
     fb(_FakeDF(empty=False), 1)
     assert called["bulk"] == 1
@@ -98,7 +100,7 @@ def test_empty_and_nonempty_callback_dicts_share_the_contract_keys(monkeypatch):
     # empty-batch dict and a real bulk_write result. Assert the empty-batch keys are a superset of
     # the required contract keys (it also adds `empty`, which non-empty results don't have).
     real_result = {"written": 5, "deleted": 0, "errors": 0, "total_input": 5, "error_samples": []}
-    monkeypatch.setattr(stream_mod, "bulk_write", lambda df, cfg: real_result)
+    monkeypatch.setattr(stream_mod, "bulk_write", lambda df, cfg, batch_id=None: real_result)
 
     seen = []
     fb = make_foreach_batch(_cfg(), on_batch=lambda bid, r: seen.append(r))

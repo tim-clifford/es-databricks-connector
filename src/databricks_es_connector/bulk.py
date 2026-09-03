@@ -11,9 +11,11 @@ so nothing non-serializable is captured on the driver.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
-from typing import Iterator
+import time as _time
+from typing import Iterator, Optional
 
 from .config import EsConfig
 from .spark_prep import sanitize_for_arrow, normalize_timestamps_for_utc
@@ -203,6 +205,18 @@ def make_partition_writer(cfg: EsConfig):
         import pandas as pd
         from elasticsearch import Elasticsearch
 
+        # Per-partition timing + id, always captured (two clock reads; negligible) and returned in
+        # the summary row. _merge_partition_results ignores these columns; they are only consumed
+        # when cfg.log_table is set (see build_log_rows). partition_id is the mapInPandas partition
+        # index, so a log row is traceable to a specific task.
+        _p_start = _time.time()
+        try:
+            from pyspark import TaskContext
+            _tc = TaskContext.get()
+            _pid = _tc.partitionId() if _tc is not None else -1
+        except Exception:  # pragma: no cover - TaskContext always present under mapInPandas
+            _pid = -1
+
         es = Elasticsearch(**cfg.client_kwargs())
         written = 0
         deleted = 0
@@ -263,9 +277,78 @@ def make_partition_writer(cfg: EsConfig):
             "written": [written], "deleted": [deleted], "errors": [errors],
             "ignored": [ignored], "coerced_nonfinite": [coerced_nonfinite],
             "total_input": [total_input], "error_samples": [json.dumps(error_samples)],
+            "partition_id": [int(_pid)], "partition_start_ms": [int(_p_start * 1000)],
+            "partition_duration_ms": [int((_time.time() - _p_start) * 1000)],
         })
 
     return _write
+
+
+# Columns of the optional write-log table (EsWriteConfig.log_table). One aggregate row per
+# bulk_write call (scope="batch") plus one row per Spark partition (scope="partition"). Kept as a
+# module constant so build_log_rows and _write_log agree on the exact shape.
+LOG_COLUMNS = ("event_time", "batch_id", "index", "scope", "partition_id", "duration_ms",
+               "total_input", "written", "deleted", "errors", "ignored", "unaccounted")
+
+
+def build_log_rows(result: dict, partition_rows, event_time, batch_duration_ms: int,
+                   batch_id, index: str) -> list:
+    """Build the write-log rows for one bulk_write call. Pure (no Spark) so it is unit-testable.
+
+    Returns a list of dicts keyed by LOG_COLUMNS: first the scope='batch' aggregate row (the merged
+    result plus the whole-call event_time / duration_ms), then one scope='partition' row per entry
+    in `partition_rows`. Each partition_row is a dict (call `.asDict()` on the collected mapInPandas
+    Rows) carrying partition_id / partition_duration_ms and that partition's counts.
+
+    `unaccounted` is populated only on the batch row: it is a cross-partition reconciliation derived
+    at merge time, so it is not meaningful per partition (left None there). `batch_id` is None for a
+    non-streaming write (bulk_write called without one) and the micro-batch id on the streaming path.
+    """
+    def _i(v):
+        return int(v or 0)
+
+    bid = int(batch_id) if batch_id is not None else None
+    rows = [{
+        "event_time": event_time, "batch_id": bid, "index": index, "scope": "batch",
+        "partition_id": None, "duration_ms": int(batch_duration_ms),
+        "total_input": _i(result.get("total_input")), "written": _i(result.get("written")),
+        "deleted": _i(result.get("deleted")), "errors": _i(result.get("errors")),
+        "ignored": _i(result.get("ignored")), "unaccounted": _i(result.get("unaccounted")),
+    }]
+    for pr in partition_rows:
+        pid = pr.get("partition_id")
+        rows.append({
+            "event_time": event_time, "batch_id": bid, "index": index, "scope": "partition",
+            "partition_id": (int(pid) if pid is not None else None),
+            "duration_ms": _i(pr.get("partition_duration_ms")),
+            "total_input": _i(pr.get("total_input")), "written": _i(pr.get("written")),
+            "deleted": _i(pr.get("deleted")), "errors": _i(pr.get("errors")),
+            "ignored": _i(pr.get("ignored")), "unaccounted": None,
+        })
+    return rows
+
+
+def _write_log(spark, log_table: str, log_rows: list) -> None:
+    """Append `log_rows` (from build_log_rows) to `log_table` as a Delta table (append, auto-created
+    on first write). An explicit schema is used because a partition_id/unaccounted of None in every
+    row of a batch would otherwise give Spark no type to infer. Spark-side; proven in the live tier."""
+    from pyspark.sql.types import (StructType, StructField, TimestampType, LongType,
+                                   IntegerType, StringType)
+    schema = StructType([
+        StructField("event_time", TimestampType(), True),
+        StructField("batch_id", LongType(), True),
+        StructField("index", StringType(), True),
+        StructField("scope", StringType(), True),
+        StructField("partition_id", IntegerType(), True),
+        StructField("duration_ms", LongType(), True),
+        StructField("total_input", LongType(), True),
+        StructField("written", LongType(), True),
+        StructField("deleted", LongType(), True),
+        StructField("errors", LongType(), True),
+        StructField("ignored", LongType(), True),
+        StructField("unaccounted", LongType(), True),
+    ])
+    spark.createDataFrame(log_rows, schema).write.mode("append").saveAsTable(log_table)
 
 
 def _merge_partition_results(rows) -> dict:
@@ -477,7 +560,8 @@ def _preflight(df, cfg: EsConfig) -> None:
                 "mapping) first, or set require_existing_index=False to allow auto-creation.")
 
 
-def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
+def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False,
+               batch_id: Optional[int] = None) -> dict:
     """Write a Spark DataFrame to Elasticsearch.
 
     Returns {'written', 'deleted', 'errors', 'ignored', 'coerced_nonfinite', 'total_input',
@@ -524,12 +608,29 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     # Preflight AFTER sanitize (so df.columns is safe to read) but BEFORE any row is written.
     _preflight(df, cfg)
     writer = make_partition_writer(cfg)
+    # event_time is the write's START (driver clock); duration_ms times the whole distributed write.
+    # Both feed the optional log_table (build_log_rows) and are captured whether or not it is set.
+    event_time = _dt.datetime.now(_dt.timezone.utc)
+    _t0 = _time.perf_counter()
     rows = df.mapInPandas(
         writer,
         "written long, deleted long, errors long, ignored long, coerced_nonfinite long, "
-        "total_input long, error_samples string",
+        "total_input long, error_samples string, "
+        "partition_id int, partition_start_ms long, partition_duration_ms long",
     ).collect()
+    duration_ms = int((_time.perf_counter() - _t0) * 1000)
     result = _merge_partition_results(rows)
+    # Optional write log. BEST-EFFORT and BEFORE reconcile_or_raise, so a batch that ES rejected rows
+    # in is still recorded (with its error counts) before the raise. A logging failure must never
+    # fail the ES write itself, which has already happened by here, so it is caught and warned.
+    if cfg.log_table:
+        try:
+            log_rows = build_log_rows(result, [r.asDict() for r in rows], event_time,
+                                      duration_ms, batch_id, cfg.index)
+            _write_log(df.sparkSession, cfg.log_table, log_rows)
+        except Exception as _e:  # noqa: BLE001 - logging must not fail a successful write
+            _log.warning("write-log append to %r failed (%s: %s); the ES write itself succeeded",
+                         cfg.log_table, type(_e).__name__, _e)
     if raise_on_error:
         reconcile_or_raise(result, index=cfg.index)
     return result
