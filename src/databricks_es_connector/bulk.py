@@ -331,7 +331,13 @@ def build_log_rows(result: dict, partition_rows, event_time, batch_duration_ms: 
 def _write_log(spark, log_table: str, log_rows: list) -> None:
     """Append `log_rows` (from build_log_rows) to `log_table` as a Delta table (append, auto-created
     on first write). An explicit schema is used because a partition_id/unaccounted of None in every
-    row of a batch would otherwise give Spark no type to infer. Spark-side; proven in the live tier."""
+    row of a batch would otherwise give Spark no type to infer. Spark-side; proven in the live tier.
+
+    APPEND-ONLY event log: on the streaming RAISE path a failed micro-batch raises AFTER this log is
+    written, Spark retries the SAME batch_id, and each retry appends another full set of rows (with a
+    fresh event_time) -- intentional, so the failed attempts stay visible. Consumers therefore DEDUPE
+    per batch_id, keeping the latest event_time (see the README's example queries). coalesce(1) keeps
+    each commit to a single small file, since the source is a tiny driver-side list."""
     from pyspark.sql.types import (StructType, StructField, TimestampType, LongType,
                                    IntegerType, StringType)
     schema = StructType([
@@ -348,7 +354,7 @@ def _write_log(spark, log_table: str, log_rows: list) -> None:
         StructField("ignored", LongType(), True),
         StructField("unaccounted", LongType(), True),
     ])
-    spark.createDataFrame(log_rows, schema).write.mode("append").saveAsTable(log_table)
+    spark.createDataFrame(log_rows, schema).coalesce(1).write.mode("append").saveAsTable(log_table)
 
 
 def _merge_partition_results(rows) -> dict:

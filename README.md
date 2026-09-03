@@ -481,18 +481,27 @@ Columns: `event_time`, `batch_id` (the micro-batch id on the streaming path, nul
 
 ```python
 cfg = EsWriteConfig(hosts=..., api_key=..., index="my-index", log_table="cat.sch.es_write_log")
-# rows/sec per batch over time, and whether a streaming job is keeping up:
+# rows/sec per batch over time, and whether a streaming job is keeping up (dedupe retried
+# batch_ids to the latest attempt first, see the retries note below):
+#   WITH latest AS (
+#     SELECT *, ROW_NUMBER() OVER (PARTITION BY batch_id ORDER BY event_time DESC) rn
+#     FROM cat.sch.es_write_log WHERE scope='batch')
 #   SELECT batch_id, event_time, total_input, duration_ms,
 #          total_input / (duration_ms/1000.0) AS rows_per_sec
-#   FROM cat.sch.es_write_log WHERE scope='batch' ORDER BY event_time
+#   FROM latest WHERE rn = 1 ORDER BY event_time
 # slowest partitions (skew) for a batch:
 #   SELECT partition_id, duration_ms, total_input FROM cat.sch.es_write_log
-#   WHERE scope='partition' ORDER BY duration_ms DESC
+#   WHERE scope='partition' AND batch_id = :b ORDER BY duration_ms DESC
 ```
 
-It is **best-effort** (a failure to write the log is warned, never fails the ES write) and costs
-**one Delta commit per call**, so enable it for diagnosis rather than steady-state, or point it at a
-table you compact. The table is created on first write and appended thereafter.
+It is an **append-only event log**: on the streaming default (`on_error="raise"`) a failed
+micro-batch raises *after* its log rows are written, so Spark retries the **same `batch_id`** and
+each retry appends another set of rows (with a fresh `event_time`) — intentional, so failed attempts
+stay visible. **Dedupe per `batch_id` to the latest `event_time`** in any per-batch query (as above);
+`batch_id` is null for non-streaming writes, which append once. It is **best-effort** (a failure to
+write the log is warned, never fails the ES write) and costs **one Delta commit per call**
+(`coalesce(1)`, so one small file each), so enable it for diagnosis rather than steady-state, or
+point it at a table you compact. The table is created on first write and appended thereafter.
 
 #### Retries on a write: two layers
 
