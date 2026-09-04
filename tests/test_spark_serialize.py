@@ -242,3 +242,52 @@ def test_type_has_float_detects_nested():
     assert _type_has_float(StructType([StructField("a", IntegerType()),
                                        StructField("s", StringType())])) is False
     assert _type_has_float(ArrayType(IntegerType())) is False
+
+
+# --- _type_has_date_or_ntz / _epoch_type (pure): drive the date/ntz -> epoch-millis rewrite --------
+
+def test_type_has_date_or_ntz_detects_nested():
+    pytest.importorskip("pyspark")
+    from pyspark.sql.types import (ArrayType, DateType, IntegerType, MapType, StringType,
+                                   StructField, StructType, TimestampNTZType, TimestampType)
+    from databricks_es_connector.spark_serialize import _type_has_date_or_ntz
+
+    assert _type_has_date_or_ntz(DateType()) is True
+    assert _type_has_date_or_ntz(TimestampNTZType()) is True
+    # A plain TimestampType is NOT matched here: it is already an epoch-millis Long by the time
+    # build_ndjson runs (normalize_timestamps_for_utc converted it upstream), so this rewrite must
+    # leave it alone. Guards against double-converting the (now integer) timestamp column.
+    assert _type_has_date_or_ntz(TimestampType()) is False
+    assert _type_has_date_or_ntz(IntegerType()) is False
+    # nested: a date/ntz inside struct/array/map must be detected (else the rewrite skips it and a
+    # nested date/ntz reaches to_json as an ISO string, breaking the round-trip).
+    assert _type_has_date_or_ntz(StructType([StructField("a", IntegerType()),
+                                             StructField("d", DateType())])) is True
+    assert _type_has_date_or_ntz(ArrayType(TimestampNTZType())) is True
+    assert _type_has_date_or_ntz(MapType(StringType(), DateType())) is True
+    assert _type_has_date_or_ntz(ArrayType(StructType([StructField("n", TimestampNTZType())]))) is True
+    # no date/ntz anywhere -> not walked
+    assert _type_has_date_or_ntz(StructType([StructField("a", IntegerType()),
+                                             StructField("t", TimestampType())])) is False
+    assert _type_has_date_or_ntz(ArrayType(StringType())) is False
+
+
+def test_epoch_type_maps_date_ntz_to_long_recursively():
+    pytest.importorskip("pyspark")
+    from pyspark.sql.types import (ArrayType, DateType, IntegerType, LongType, MapType, StringType,
+                                   StructField, StructType, TimestampNTZType)
+    from databricks_es_connector.spark_serialize import _epoch_type
+
+    # A null struct literal is typed with this so `when(null)` keeps the rewritten schema: every
+    # DateType/TimestampNTZType leaf becomes LongType, everything else is unchanged.
+    assert isinstance(_epoch_type(DateType()), LongType)
+    assert isinstance(_epoch_type(TimestampNTZType()), LongType)
+    assert isinstance(_epoch_type(StringType()), StringType)
+    nested = StructType([StructField("a", IntegerType()), StructField("d", DateType()),
+                         StructField("n", TimestampNTZType()), StructField("s", StringType())])
+    out = _epoch_type(nested)
+    got = {f.name: type(f.dataType).__name__ for f in out.fields}
+    assert got == {"a": "IntegerType", "d": "LongType", "n": "LongType", "s": "StringType"}
+    # array/map element/value types recurse too
+    assert isinstance(_epoch_type(ArrayType(DateType())).elementType, LongType)
+    assert isinstance(_epoch_type(MapType(StringType(), TimestampNTZType())).valueType, LongType)
