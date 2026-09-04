@@ -288,7 +288,15 @@ def iter_bulk_response_outcomes(items):
     streaming_bulk path.
     """
     for item in items:
-        op_type, body = next(iter(item.items()))
+        # A well-formed item is {op_type: body}. Guard an empty/malformed item explicitly: ES never
+        # returns {}, but `next(iter({}.items()))` would raise StopIteration, which PEP-479 turns into
+        # a RuntimeError inside this generator and aborts the ENTIRE mapInPandas partition. Fail that
+        # one document closed (ERROR) instead, so a single bad item can't take the partition down.
+        pair = next(iter(item.items()), None)
+        if pair is None:
+            yield "unknown", {}, False, ERROR
+            continue
+        op_type, body = pair
         status = int(body.get("status", 500) or 500)
         ok = 200 <= status < 300
         yield op_type, body, ok, classify_bulk_result(ok, op_type, status)

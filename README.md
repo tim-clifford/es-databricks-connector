@@ -560,7 +560,7 @@ differ from the default path's documented round-trip contract:
 
 | Case | Default path (`coerce_value`) | `serialize_in_spark` (`to_json`) |
 |---|---|---|
-| `NaN` / `±inf` | JSON `null`, **counted** in `coerced_nonfinite` | JSON `null` (nulled in Spark at **any nesting depth**), but **not counted** (`coerced_nonfinite` is always `0`) |
+| `NaN` / `±inf` | JSON `null`, **counted** in `coerced_nonfinite` | JSON `null` (nulled in Spark at **any nesting depth** — struct/array/map **values**), but **not counted** (`coerced_nonfinite` is always `0`). Exception: a non-finite float used as a **map key** is left as-is (renders as `"NaN"`; a map key can't be nulled) — use string/int map keys |
 | `decimal` | → `double` (precision lost past ~15–17 sig figs) | rendered at **full precision** (more faithful) |
 | `float` (32-bit) | exact widened double (`0.10000000149…`) | short decimal repr (`0.1`) |
 | null `id_field` value | whole partition **raises** | **fails closed**: the row's action line is emitted as null, so it surfaces as `unaccounted` and `reconcile_or_raise` fails the write (rather than shipping `"_id": null`, which could auto-assign an id and duplicate on replay) |

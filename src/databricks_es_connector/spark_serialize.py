@@ -96,6 +96,10 @@ def _null_nonfinite(col, dt):
     if isinstance(dt, ArrayType):
         return F.transform(col, lambda e: _null_nonfinite(e, dt.elementType))
     if isinstance(dt, MapType):
+        # Values only: a map KEY cannot be nulled (a null map key is invalid / collapses the entry),
+        # so a non-finite float KEY is left as-is and to_json renders it as the string "NaN"/"Infinity".
+        # This is a documented limitation (README): a map keyed by a raw float is pathological anyway;
+        # use string/int keys. Finite float keys are unaffected.
         return F.transform_values(col, lambda k, v: _null_nonfinite(v, dt.valueType))
     return col
 
@@ -111,6 +115,7 @@ def build_ndjson(df, cfg: EsConfig):
     `df.schema` is safe and types are Arrow-friendly / normalized.
     """
     from pyspark.sql import functions as F
+    from pyspark.sql.types import DoubleType, FloatType
 
     payload = _payload_columns(df.columns, cfg.drop_fields)
     field_types = {f.name: f.dataType for f in df.schema.fields}
@@ -130,15 +135,26 @@ def build_ndjson(df, cfg: EsConfig):
 
     # Bulk action header. index/upsert only; _id from id_field when set (else ES assigns one).
     index_meta = [F.lit(cfg.index).alias("_index")]
+    id_col = None
     if cfg.id_field:
-        index_meta.append(F.col(cfg.id_field).cast("string").alias("_id"))
+        # Guard the id column for non-finite SEPARATELY from `payload`: id_field may be in
+        # drop_fields (excluded from payload, so the loop above never guards it), and a NaN/±inf id
+        # would otherwise cast to the string "NaN" -- not null -- evading the fail-closed check below
+        # and colliding every non-finite id onto one _id. Turning it to null here routes it into that
+        # check. Only float/double ids can be non-finite; other id types pass through unchanged.
+        id_dt = field_types.get(cfg.id_field)
+        id_col = F.col(cfg.id_field)
+        if isinstance(id_dt, (DoubleType, FloatType)):
+            id_col = _null_nonfinite(id_col, id_dt)
+        index_meta.append(id_col.cast("string").alias("_id"))
     header = F.to_json(F.struct(F.struct(*index_meta).alias("index")), {"ignoreNullFields": "false"})
 
     ndjson = F.concat(header, F.lit("\n"), source)
-    # Fail CLOSED on a null id value: emit a null action line. The shipper counts it in total_input
-    # but cannot ship it, so it surfaces as `unaccounted` and reconcile_or_raise fails the write --
-    # rather than shipping `"_id": null` and trusting ES not to auto-assign a random id (which would
-    # silently duplicate the row on replay). Mirrors the default path's _require_id fail-loud.
+    # Fail CLOSED on a null (or non-finite, now nulled above) id value: emit a null action line. The
+    # shipper counts it in total_input but cannot ship it, so it surfaces as `unaccounted` and
+    # reconcile_or_raise fails the write -- rather than shipping `"_id": null` and trusting ES not to
+    # auto-assign a random id (which would silently duplicate the row on replay). Mirrors the default
+    # path's _require_id fail-loud.
     if cfg.id_field:
-        ndjson = F.when(F.col(cfg.id_field).isNull(), F.lit(None).cast("string")).otherwise(ndjson)
+        ndjson = F.when(id_col.isNull(), F.lit(None).cast("string")).otherwise(ndjson)
     return out.select(ndjson.alias("_ndjson"))

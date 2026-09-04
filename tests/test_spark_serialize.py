@@ -57,6 +57,20 @@ def test_iter_bulk_response_outcomes_missing_status_is_error():
     assert ok is False and outcome == ERROR
 
 
+def test_iter_bulk_response_outcomes_empty_item_is_error_not_crash():
+    # An empty item {} must fail that doc closed (ERROR), NOT raise: next(iter({}.items())) would
+    # StopIteration -> RuntimeError (PEP-479) and abort the whole mapInPandas partition.
+    (op, body, ok, outcome), = list(iter_bulk_response_outcomes([{}]))
+    assert outcome == ERROR and ok is False and op == "unknown"
+
+
+def test_ship_chunk_empty_item_counts_error_not_crash():
+    es = _FakeES([{"items": [{"index": {"status": 201}}, {}]}])   # one good, one empty
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
+    assert counts["written"] == 1 and counts["errors"] == 1        # no crash, empty -> error
+
+
 # --- _ship_ndjson_chunk: tally + retry ------------------------------------------------------
 
 def test_ship_chunk_tallies_mixed_outcomes():
