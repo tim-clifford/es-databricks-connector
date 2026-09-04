@@ -195,6 +195,19 @@ def test_config_serialize_in_spark_defaults_off():
     assert cfg.serialize_in_spark is False
 
 
+def test_config_warns_write_concurrency_with_serialize_in_spark():
+    import warnings
+    # write_concurrency>1 has no effect on the serialize_in_spark path; must WARN (not silently ignore).
+    with pytest.warns(UserWarning, match="effect with serialize_in_spark"):
+        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i",
+                 serialize_in_spark=True, write_concurrency=4)
+    # No warning when the two are not combined.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", serialize_in_spark=True)
+        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=4)
+
+
 # --- _payload_columns (pure) ----------------------------------------------------------------
 
 def test_payload_columns_keeps_id_drops_only_drop_fields():

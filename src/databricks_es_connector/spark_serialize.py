@@ -26,10 +26,10 @@ differ (rendering verified live via a to_json probe):
     path's decimal -> double.
   - float (32-bit): rendered as its short decimal repr (0.1), not the default path's exact widened
     double (0.10000000149...).
-  - A null `id_field` value FAILS CLOSED: the row's action line is emitted as null, so the shipper
-    cannot ship it and it surfaces as `unaccounted` (reconcile_or_raise then fails the write). This
-    mirrors the default path's _require_id, rather than shipping `"_id": null` and trusting ES not to
-    auto-assign a random id (which would silently duplicate the row on replay).
+  - A null or non-finite `id_field` value FAILS CLOSED: the row's action line is emitted as null and
+    make_ndjson_partition_writer RAISES on it, failing the write UNCONDITIONALLY (like the default
+    path's _require_id, which raises regardless of raise_on_error) -- rather than shipping
+    `"_id": null` and trusting ES not to auto-assign a random id (which would duplicate on replay).
 Everything else (nested structs/arrays/maps, binary as base64, timestamps-as-epoch, kept null fields)
 matches.
 

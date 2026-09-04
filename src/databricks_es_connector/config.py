@@ -241,6 +241,16 @@ class EsWriteConfig(EsConnection):
                 "serialize_in_spark=True does not yet support has_deletes (v1 builds index/upsert "
                 "actions only). Use the default per-row path for delete-bearing writes, or split "
                 "deletes into a separate write.")
+        # serialize_in_spark ships each partition's chunks SERIALLY (its bottleneck was the GIL-bound
+        # per-row work, now moved to the JVM, not the ES round-trip). write_concurrency only tunes the
+        # default path's per-partition thread-fan, so warn rather than silently ignore it here.
+        if self.serialize_in_spark and self.write_concurrency > 1:
+            warnings.warn(
+                f"write_concurrency={self.write_concurrency} has NO effect with serialize_in_spark=True: "
+                "that path ships each partition's bulk chunks serially (parallelism comes from the "
+                "Spark partition count). Raise the partition count / spark.sql.shuffle.partitions "
+                "instead, or leave write_concurrency=1.",
+                UserWarning, stacklevel=4)
 
     def client_kwargs(self) -> dict:
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.

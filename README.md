@@ -569,7 +569,10 @@ differ from the default path's documented round-trip contract:
 
 Everything else is unchanged: `chunk_size`, per-document `429` retry (`max_retries_per_doc` /
 `retry_on_doc_status`), the `written`/`deleted`/`errors`/`ignored`/`unaccounted` accounting, and
-`reconcile_or_raise` all behave exactly as on the default path. Use the default path when you need the
+`reconcile_or_raise` all behave exactly as on the default path. One exception: **`write_concurrency`
+has no effect** with `serialize_in_spark=True` (each partition's chunks ship serially — its bottleneck
+was the GIL-bound per-row work, now in the JVM, not the ES round-trip; parallelism comes from the
+Spark partition count). Setting `write_concurrency > 1` with this mode warns. Use the default path when you need the
 full round-trip fidelity guarantee or delete routing; use `serialize_in_spark=True` for throughput on
 large index/upsert exports where the differences above are acceptable.
 
