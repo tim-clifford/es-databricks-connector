@@ -175,3 +175,28 @@ def test_payload_columns_keeps_id_drops_only_drop_fields():
     assert _payload_columns(cols, ("secret",)) == ["id", "a", "b", "c"]
     assert _payload_columns(cols, ()) == cols
     assert _payload_columns(cols, None) == cols
+
+
+# --- _type_has_float (pure): drives the recursive non-finite guard --------------------------
+
+def test_type_has_float_detects_nested():
+    pytest.importorskip("pyspark")
+    from pyspark.sql.types import (ArrayType, DoubleType, FloatType, IntegerType, MapType,
+                                   StringType, StructField, StructType)
+    from databricks_es_connector.spark_serialize import _type_has_float
+
+    assert _type_has_float(DoubleType()) is True
+    assert _type_has_float(FloatType()) is True
+    assert _type_has_float(IntegerType()) is False
+    assert _type_has_float(StringType()) is False
+    # nested: struct/array/map that CONTAIN a float must be detected (else the guard skips them and a
+    # nested NaN reaches to_json).
+    assert _type_has_float(StructType([StructField("a", IntegerType()),
+                                       StructField("b", DoubleType())])) is True
+    assert _type_has_float(ArrayType(FloatType())) is True
+    assert _type_has_float(MapType(StringType(), DoubleType())) is True
+    assert _type_has_float(ArrayType(StructType([StructField("x", DoubleType())]))) is True
+    # no float anywhere -> not walked
+    assert _type_has_float(StructType([StructField("a", IntegerType()),
+                                       StructField("s", StringType())])) is False
+    assert _type_has_float(ArrayType(IntegerType())) is False

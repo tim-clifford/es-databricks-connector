@@ -16,17 +16,20 @@ path): sanitize has already turned VARIANT/INTERVAL into JSON strings and normal
 
 Fidelity vs `coerce_value` (documented in the README "Spark-native serialization" section, and why
 this path is opt-in): `to_json` is Spark's serializer, not the Python transform, so a few edge cases
-differ (all verified live via a to_json rendering probe):
+differ (rendering verified live via a to_json probe):
   - Non-finite floats: `to_json` renders NaN/inf as the quoted STRINGS "NaN"/"Infinity"/"-Infinity",
-    which a numeric ES field rejects (mapper_parsing_exception). So this builder replaces them with
-    null (top level) to match the default path's NaN/inf -> null; unlike that path it is NOT counted
-    (`coerced_nonfinite` is always 0 in this mode). Nested non-finite floats are not reached here.
+    which a numeric ES field rejects. So this builder replaces them with null at ANY nesting depth
+    (recursive walk over struct/array/map, mirroring spark_prep._rewrite_timestamps) to match the
+    default path's NaN/inf -> null; unlike that path it is NOT counted (`coerced_nonfinite` is always
+    0 in this mode).
   - decimal: rendered at FULL precision (e.g. 1.000000000000000001), more faithful than the default
     path's decimal -> double.
   - float (32-bit): rendered as its short decimal repr (0.1), not the default path's exact widened
     double (0.10000000149...).
-  - A null `id_field` value renders `"_id": null` (header also uses ignoreNullFields=false), which
-    ES surfaces per-doc rather than the default path's whole-partition raise on a null id.
+  - A null `id_field` value FAILS CLOSED: the row's action line is emitted as null, so the shipper
+    cannot ship it and it surfaces as `unaccounted` (reconcile_or_raise then fails the write). This
+    mirrors the default path's _require_id, rather than shipping `"_id": null` and trusting ES not to
+    auto-assign a random id (which would silently duplicate the row on replay).
 Everything else (nested structs/arrays/maps, binary as base64, timestamps-as-epoch, kept null fields)
 matches.
 
@@ -50,6 +53,53 @@ def _payload_columns(columns, drop_fields) -> List[str]:
     return [c for c in columns if c not in drop]
 
 
+def _type_has_float(dt) -> bool:
+    """True if `dt` is a Float/Double or contains one at any nesting depth (struct/array/map).
+
+    Pure logic (only touches pyspark type objects), so build_ndjson only walks columns that can
+    actually carry a non-finite float. Mirrors spark_prep._type_has_timestamp.
+    """
+    from pyspark.sql.types import ArrayType, DoubleType, FloatType, MapType, StructType
+
+    if isinstance(dt, (FloatType, DoubleType)):
+        return True
+    if isinstance(dt, StructType):
+        return any(_type_has_float(f.dataType) for f in dt.fields)
+    if isinstance(dt, ArrayType):
+        return _type_has_float(dt.elementType)
+    if isinstance(dt, MapType):
+        return _type_has_float(dt.keyType) or _type_has_float(dt.valueType)
+    return False
+
+
+def _null_nonfinite(col, dt):
+    """Return a Column that rebuilds `col` with every non-finite float (NaN/±inf) replaced by null,
+    at any nesting depth, preserving struct/array/map structure. `to_json` renders a non-finite float
+    as the string "NaN"/"Infinity" (a numeric ES field rejects it), so nulling it here matches the
+    default path's NaN/inf -> null for nested values too. Mirrors spark_prep._rewrite_timestamps.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import ArrayType, DoubleType, FloatType, MapType, StructType
+
+    if isinstance(dt, (FloatType, DoubleType)):
+        # A null float has isnan()/==inf evaluate to null, so `when` falls through to otherwise(col)
+        # and a genuine null stays null; only actual NaN/±inf become null.
+        return F.when(F.isnan(col) | (col == float("inf")) | (col == float("-inf")),
+                      F.lit(None).cast(dt)).otherwise(col)
+    if isinstance(dt, StructType):
+        rebuilt = F.struct(*[
+            (_null_nonfinite(col[f.name], f.dataType) if _type_has_float(f.dataType)
+             else col[f.name]).alias(f.name)
+            for f in dt.fields
+        ])
+        return F.when(col.isNull(), col).otherwise(rebuilt)   # keep a null struct null
+    if isinstance(dt, ArrayType):
+        return F.transform(col, lambda e: _null_nonfinite(e, dt.elementType))
+    if isinstance(dt, MapType):
+        return F.transform_values(col, lambda k, v: _null_nonfinite(v, dt.valueType))
+    return col
+
+
 def build_ndjson(df, cfg: EsConfig):
     """Return a one-column DataFrame (`_ndjson`) of complete `_bulk` action lines, built in Spark.
 
@@ -61,34 +111,34 @@ def build_ndjson(df, cfg: EsConfig):
     `df.schema` is safe and types are Arrow-friendly / normalized.
     """
     from pyspark.sql import functions as F
-    from pyspark.sql.types import DoubleType, FloatType
 
     payload = _payload_columns(df.columns, cfg.drop_fields)
     field_types = {f.name: f.dataType for f in df.schema.fields}
 
-    # Non-finite guard: turn NaN / +inf / -inf in top-level float/double columns into null, so
-    # to_json cannot emit the bare NaN/Infinity tokens ES rejects (which would fail the WHOLE bulk
-    # request, not just one doc). Nested non-finite floats are not reached here (documented limit).
+    # Non-finite guard at ANY depth: NaN/±inf floats -> null so to_json never emits a "NaN"/
+    # "Infinity" value that a numeric ES field would reject. Only walk columns that can carry a float
+    # (top-level or nested); everything else is left untouched.
     out = df
     for name in payload:
         dt = field_types.get(name)
-        if isinstance(dt, (DoubleType, FloatType)):
-            col = F.col(name)
-            out = out.withColumn(name, F.when(
-                col.isNull() | F.isnan(col) | (col == float("inf")) | (col == float("-inf")),
-                F.lit(None).cast(dt)).otherwise(col))
+        if _type_has_float(dt):
+            out = out.withColumn(name, _null_nonfinite(F.col(name), dt))
 
     # ignoreNullFields=false keeps explicit null fields, matching the default path (coerce_value
     # keeps a null as JSON null rather than dropping the key).
     source = F.to_json(F.struct(*[F.col(c) for c in payload]), {"ignoreNullFields": "false"})
 
     # Bulk action header. index/upsert only; _id from id_field when set (else ES assigns one).
-    # ignoreNullFields=false so a null id renders `"_id": null` (surfaced by ES) instead of being
-    # dropped, which would silently fall back to an ES-assigned id (a replay-duplicate risk).
     index_meta = [F.lit(cfg.index).alias("_index")]
     if cfg.id_field:
         index_meta.append(F.col(cfg.id_field).cast("string").alias("_id"))
     header = F.to_json(F.struct(F.struct(*index_meta).alias("index")), {"ignoreNullFields": "false"})
 
     ndjson = F.concat(header, F.lit("\n"), source)
+    # Fail CLOSED on a null id value: emit a null action line. The shipper counts it in total_input
+    # but cannot ship it, so it surfaces as `unaccounted` and reconcile_or_raise fails the write --
+    # rather than shipping `"_id": null` and trusting ES not to auto-assign a random id (which would
+    # silently duplicate the row on replay). Mirrors the default path's _require_id fail-loud.
+    if cfg.id_field:
+        ndjson = F.when(F.col(cfg.id_field).isNull(), F.lit(None).cast("string")).otherwise(ndjson)
     return out.select(ndjson.alias("_ndjson"))
