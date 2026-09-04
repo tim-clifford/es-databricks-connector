@@ -173,6 +173,26 @@ class EsWriteConfig(EsConnection):
     has_deletes: bool = False
     delete_flag_column: Optional[str] = None  # boolean-ish column: truthy => delete this _id
 
+    # --- serialization mode ---
+    # Where each document's JSON is built. False (default) is the original per-row Python path:
+    # mapInPandas hands each row to coerce_value / build_action, which shape and JSON-serialize it on
+    # the executor. That work is GIL-bound Python and is the throughput ceiling on wide/large writes
+    # (the transform+serialize step, not the ES send, dominates wall time; proven by a no-op run whose
+    # time is unchanged with the ES connection never opened).
+    #
+    # True moves the _source construction AND JSON serialization into Spark: the whole `_bulk` action
+    # line (header + source) is built once per row with `to_json` in Catalyst (JVM, multi-core, no
+    # GIL), and the executor only ships the pre-built NDJSON with es.bulk(operations=...), which
+    # forwards str/bytes lines verbatim (no Python re-serialization). Measured ~5x on the
+    # transform+serialize segment at 30M rows / 32 cores.
+    #
+    # This path has its OWN, slightly different fidelity contract from coerce_value (Spark to_json vs
+    # the Python transform); the differences are documented in the README "Spark-native serialization"
+    # section. It is opt-in precisely so the default path's round-trip guarantee is untouched. v1
+    # supports index/upsert only: has_deletes with serialize_in_spark is rejected below (the per-row
+    # delete-flag RAISE semantics do not yet have a Catalyst equivalent).
+    serialize_in_spark: bool = False
+
     def __post_init__(self):
         super().__post_init__()
         if self.max_retries_per_doc < 0:
@@ -213,6 +233,24 @@ class EsWriteConfig(EsConnection):
             # A flag column set with deletes off would silently do nothing, reject the misconfig
             # rather than let a caller believe deletes are happening.
             raise ValueError("delete_flag_column is set but has_deletes is False, enable has_deletes or drop it")
+        # serialize_in_spark v1 does not build delete actions (see the field comment). Fail CLOSED
+        # rather than silently ignore has_deletes and upsert every flagged row -- the exact silent
+        # loss the delete_flag_column preflight exists to prevent.
+        if self.serialize_in_spark and self.has_deletes:
+            raise ValueError(
+                "serialize_in_spark=True does not yet support has_deletes (v1 builds index/upsert "
+                "actions only). Use the default per-row path for delete-bearing writes, or split "
+                "deletes into a separate write.")
+        # serialize_in_spark ships each partition's chunks SERIALLY (its bottleneck was the GIL-bound
+        # per-row work, now moved to the JVM, not the ES round-trip). write_concurrency only tunes the
+        # default path's per-partition thread-fan, so warn rather than silently ignore it here.
+        if self.serialize_in_spark and self.write_concurrency > 1:
+            warnings.warn(
+                f"write_concurrency={self.write_concurrency} has NO effect with serialize_in_spark=True: "
+                "that path ships each partition's bulk chunks serially (parallelism comes from the "
+                "Spark partition count). Raise the partition count / spark.sql.shuffle.partitions "
+                "instead, or leave write_concurrency=1.",
+                UserWarning, stacklevel=4)
 
     def client_kwargs(self) -> dict:
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.

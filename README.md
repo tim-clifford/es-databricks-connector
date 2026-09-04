@@ -539,6 +539,43 @@ other status on a delete, is still counted in `errors`.
 See [Deletes](#deletes) above for the recommended Change-Data-Feed pattern and the
 cross-batch ordering caveat.
 
+**Serialization mode**
+
+| Field | Type | Default | Required | Notes |
+|-------|------|---------|----------|-------|
+| `serialize_in_spark` | `bool` | `False` | No | Where each document's JSON is built. `False` (default) is the per-row Python path (`coerce_value` → `build_action` → `streaming_bulk` serializes on the executor). `True` builds the whole `_bulk` action line in **Spark** (`to_json`, in the JVM) and ships the pre-built NDJSON without re-serializing in Python — much faster on wide/large writes, with a slightly different fidelity contract (below). Opt-in so the default path's round-trip guarantee is untouched. Index/upsert only: combining it with `has_deletes` raises. |
+
+#### Spark-native serialization (`serialize_in_spark=True`)
+
+The default write path shapes and JSON-serializes every row **in Python** on the executor. That
+per-row work is GIL-bound and is the throughput ceiling on wide or very large writes: the
+transform-and-serialize step, not the Elasticsearch send, dominates wall time. `serialize_in_spark=True`
+moves it into Spark — the entire `_bulk` action line (`{"index":{…}}\n{…_source…}`) is built once per
+row with `to_json` in Catalyst (multi-core JVM, no GIL), and the executor only forwards the pre-built
+NDJSON to `es.bulk(operations=…)`, which sends `str`/`bytes` lines verbatim (no Python re-encode).
+Measured ≈5× faster on the transform+serialize segment (30M rows, 32 cores).
+
+It is **opt-in** because `to_json` is a different serializer from `coerce_value`, so a few edge cases
+differ from the default path's documented round-trip contract:
+
+| Case | Default path (`coerce_value`) | `serialize_in_spark` (`to_json`) |
+|---|---|---|
+| `NaN` / `±inf` | JSON `null`, **counted** in `coerced_nonfinite` | JSON `null` (nulled in Spark at **any nesting depth** — struct/array/map **values**), but **not counted** (`coerced_nonfinite` is always `0`). Exception: a non-finite float used as a **map key** is left as-is (renders as `"NaN"`; a map key can't be nulled) — use string/int map keys |
+| `decimal` | → `double` (precision lost past ~15–17 sig figs) | rendered at **full precision** (more faithful) |
+| `float` (32-bit) | exact widened double (`0.10000000149…`) | short decimal repr (`0.1`) |
+| null / non-finite `id_field` value | whole write **raises** (`_require_id`) | **fails closed the same way**: the writer **raises**, failing the write unconditionally (not merely `unaccounted`), rather than shipping `"_id": null` which could auto-assign an id and duplicate on replay |
+| numeric `id_field` → `_id` string | Python `str(value)` | Spark `cast(string)` — can differ for `float`/`decimal` (e.g. scientific notation); use a **string** id if you mix both write paths and rely on `_id` equality |
+| everything else (nested struct/array/map, `binary`→base64, `timestamp`→epoch-millis, kept null fields) | — | **matches** |
+
+Everything else is unchanged: `chunk_size`, per-document `429` retry (`max_retries_per_doc` /
+`retry_on_doc_status`), the `written`/`deleted`/`errors`/`ignored`/`unaccounted` accounting, and
+`reconcile_or_raise` all behave exactly as on the default path. One exception: **`write_concurrency`
+has no effect** with `serialize_in_spark=True` (each partition's chunks ship serially — its bottleneck
+was the GIL-bound per-row work, now in the JVM, not the ES round-trip; parallelism comes from the
+Spark partition count). Setting `write_concurrency > 1` with this mode warns. Use the default path when you need the
+full round-trip fidelity guarantee or delete routing; use `serialize_in_spark=True` for throughput on
+large index/upsert exports where the differences above are acceptable.
+
 ### Read behavior (`EsReadConfig`)
 
 `EsReadConfig` = the connection fields above **plus** these read-specific fields.
@@ -728,6 +765,7 @@ src/databricks_es_connector/   # the library (this is what ships in the .whl)
   bulk.py                      #   executor-side mapInPandas bulk write (batch entry point)
   stream.py                    #   foreachBatch helper for Structured Streaming
   spark_prep.py                #   sanitize_for_arrow: Arrow-hostile types (VARIANT/INTERVAL) -> JSON string
+  spark_serialize.py           #   serialize_in_spark: build the _bulk NDJSON in Spark (to_json), not per-row Python
   read_transform.py            #   pure-Python inverse coercion on READ (ES value + type -> Spark value)
   read.py                      #   read_index (distributed sliced-scroll PIT reader)
 tests/                         # unit tests for the pure-Python layer (no Spark/ES needed)
