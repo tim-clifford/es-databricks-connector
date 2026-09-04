@@ -317,7 +317,19 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     pending = list(lines)
     attempt = 0
     while pending:
-        resp = es.bulk(operations=pending)
+        try:
+            resp = es.bulk(operations=pending)
+        except Exception as _e:  # noqa: BLE001
+            # A whole-request transport failure (persistent 429/503, dropped connection) survived the
+            # client's transport_max_retries. The default path uses streaming_bulk(raise_on_exception
+            # =False), which records such a failure rather than letting it abort the partition. Mirror
+            # that: count every still-pending line as an ERROR (fail closed, surfaced via reconcile),
+            # instead of propagating and failing the whole mapInPandas partition on one chunk.
+            counts["errors"] += len(pending)
+            if len(error_samples) < ERROR_SAMPLE_CAP:
+                error_samples.append({"_id": None, "op_type": "bulk",
+                                      "status": None, "reason": f"{type(_e).__name__}: {_e}"[:300]})
+            return
         items = resp.get("items", []) if isinstance(resp, dict) else resp["items"]
         retry_lines = []
         for idx, (op_type, body, ok, outcome) in enumerate(iter_bulk_response_outcomes(items)):
@@ -339,8 +351,8 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         if not retry_lines:
             return
         attempt += 1
-        # elasticsearch-py's streaming_bulk uses initial_backoff * 2**(attempt-1); mirror it, capped.
-        _t.sleep(min(2 ** (attempt - 1), 30))
+        # Mirror streaming_bulk's backoff: initial_backoff (2s) * 2**(attempt-1) => 2s, 4s, 8s, capped.
+        _t.sleep(min(2 ** attempt, 30))
         pending = retry_lines
 
 
@@ -349,7 +361,10 @@ def make_ndjson_partition_writer(cfg: EsConfig):
     pre-built action line per row (see spark_serialize.build_ndjson). Yields the SAME per-partition
     summary schema as make_partition_writer, so _merge_partition_results / reconcile_or_raise are
     unchanged. `coerced_nonfinite` is always 0 here: non-finite floats are turned to null in Spark
-    (build_ndjson), not counted per row -- documented as a delta of this mode.
+    (build_ndjson), not counted per row -- documented as a delta of this mode. A null action line
+    (build_ndjson's signal for a null/non-finite id) RAISES here, failing the write unconditionally
+    like the default path's _require_id, rather than being counted as `unaccounted` (which would only
+    surface under raise_on_error=True).
     """
     def _write(iterator: "Iterator") -> "Iterator":
         import pandas as pd
@@ -363,12 +378,19 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         for pdf in iterator:
             for line in pdf["_ndjson"].values:
                 total_input += 1
-                # A null action line is a builder defect; do not ship it. Counting it in total_input
-                # but producing no outcome makes it surface as `unaccounted` (loud) rather than
-                # vanish. pandas renders a null object cell as None OR float NaN depending on dtype,
-                # so guard both (`line != line` is True only for NaN).
+                # A null action line means build_ndjson hit a null/non-finite id (its only null-line
+                # source). RAISE here, failing the partition (and so the whole write) loudly and
+                # UNCONDITIONALLY -- exactly like the default path's _require_id KeyError, which fires
+                # regardless of raise_on_error. Do NOT merely count it as `unaccounted`: that only
+                # surfaces via reconcile_or_raise, which the batch default (raise_on_error=False)
+                # skips, so a null id would silently drop. pandas renders a null object cell as None
+                # OR float NaN depending on dtype, so guard both (`line != line` is True only for NaN).
                 if line is None or (isinstance(line, float) and line != line):
-                    continue
+                    raise ValueError(
+                        "serialize_in_spark produced a null action line: the id_field value is "
+                        "null or non-finite (NaN/inf) in at least one row. Every row needs a "
+                        "non-null, finite id (same requirement as the default path's _require_id). "
+                        "Fix the id column, or leave id_field unset to let Elasticsearch assign ids.")
                 buf.append(line)
                 if len(buf) >= cfg.chunk_size:
                     _ship_ndjson_chunk(es, buf, cfg, counts, error_samples)

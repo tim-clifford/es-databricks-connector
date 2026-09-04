@@ -150,11 +150,13 @@ def build_ndjson(df, cfg: EsConfig):
     header = F.to_json(F.struct(F.struct(*index_meta).alias("index")), {"ignoreNullFields": "false"})
 
     ndjson = F.concat(header, F.lit("\n"), source)
-    # Fail CLOSED on a null (or non-finite, now nulled above) id value: emit a null action line. The
-    # shipper counts it in total_input but cannot ship it, so it surfaces as `unaccounted` and
-    # reconcile_or_raise fails the write -- rather than shipping `"_id": null` and trusting ES not to
-    # auto-assign a random id (which would silently duplicate the row on replay). Mirrors the default
-    # path's _require_id fail-loud.
+    # Fail CLOSED on a null (or non-finite, nulled above) id value: emit a null action line. The
+    # writer (make_ndjson_partition_writer) RAISES on a null line, failing the write unconditionally
+    # -- mirroring the default path's _require_id, which raises regardless of raise_on_error -- rather
+    # than shipping `"_id": null` (ES might auto-assign a random id and duplicate the row on replay).
+    # Note: a numeric id_field is rendered here by Spark `cast(string)`, which can differ from the
+    # default path's Python `str()` for float/decimal ids (e.g. scientific notation); use a string id
+    # if you mix the two write paths for the same data and rely on _id equality.
     if cfg.id_field:
         ndjson = F.when(id_col.isNull(), F.lit(None).cast("string")).otherwise(ndjson)
     return out.select(ndjson.alias("_ndjson"))

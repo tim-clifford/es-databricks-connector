@@ -152,19 +152,34 @@ def test_ndjson_writer_chunks_by_chunk_size(monkeypatch):
     assert [len(c) for c in es.calls] == [2, 2, 1]
 
 
-def test_ndjson_writer_null_line_is_unaccounted(monkeypatch):
-    # A null action line (builder defect) must be counted in total_input but never shipped, so it
-    # surfaces as unaccounted downstream rather than vanishing.
+def test_ndjson_writer_null_line_raises(monkeypatch):
+    # A null action line means build_ndjson hit a null/non-finite id. The writer must RAISE
+    # (failing the write unconditionally, like _require_id), not silently drop it to `unaccounted`
+    # (which only surfaces under raise_on_error=True). Both None and float-NaN nulls must trip it.
     pd = pytest.importorskip("pandas")
     import elasticsearch
 
     es = _FakeES([{"items": [{"index": {"status": 201}}]}])
     monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
     writer = make_ndjson_partition_writer(_cfg(chunk_size=500))
-    out = list(writer(iter([pd.DataFrame({"_ndjson": ["good", None]})])))
-    row = out[0].iloc[0]
-    assert int(row["total_input"]) == 2 and int(row["written"]) == 1
-    assert es.calls == [["good"]]         # the None was not shipped
+    with pytest.raises(ValueError, match="null action line"):
+        list(writer(iter([pd.DataFrame({"_ndjson": ["good", None]})])))
+    with pytest.raises(ValueError, match="null action line"):
+        list(writer(iter([pd.DataFrame({"_ndjson": ["good", float("nan")]})])))
+
+
+def test_ship_chunk_transport_error_counts_errors_not_crash():
+    # A whole-request transport failure (es.bulk raises) must be recorded as chunk errors and NOT
+    # propagate out (which would abort the mapInPandas partition). Mirrors streaming_bulk's
+    # raise_on_exception=False.
+    class _RaisingES:
+        def bulk(self, operations=None, **kw):
+            raise ConnectionError("es unreachable")
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(_RaisingES(), ["a", "b", "c"], _cfg(), counts, samples)   # must not raise
+    assert counts["errors"] == 3 and counts["written"] == 0
+    assert len(samples) == 1 and "ConnectionError" in samples[0]["reason"]
 
 
 # --- config guard ---------------------------------------------------------------------------
