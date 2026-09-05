@@ -167,7 +167,17 @@ def _rewrite_date_ntz(col, dt):
     if isinstance(dt, ArrayType):
         return F.transform(col, lambda e: _rewrite_date_ntz(e, dt.elementType))
     if isinstance(dt, MapType):
-        return F.transform_values(col, lambda k, v: _rewrite_date_ntz(v, dt.valueType))
+        # Rewrite KEYS as well as values: the default path's `transform._coerce_key` converts a
+        # date/ntz map key to epoch-millis (JSON keys are strings, so it renders "1609459200000"),
+        # and `_epoch_type` already declares such a key as LongType. Converting the key here keeps the
+        # two write paths' _source identical for date/ntz-keyed maps AND keeps the rebuilt map's type
+        # (`map<long,V>`) consistent with the null-branch literal a containing struct casts to.
+        out = col
+        if _type_has_date_or_ntz(dt.keyType):
+            out = F.transform_keys(out, lambda k, v: _rewrite_date_ntz(k, dt.keyType))
+        if _type_has_date_or_ntz(dt.valueType):
+            out = F.transform_values(out, lambda k, v: _rewrite_date_ntz(v, dt.valueType))
+        return out
     return col
 
 
