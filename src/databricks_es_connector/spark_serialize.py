@@ -12,7 +12,11 @@ without any Python re-serialization.
 Must run AFTER `sanitize_for_arrow` and `normalize_timestamps_for_utc` (exactly like the default
 path): sanitize has already turned VARIANT/INTERVAL into JSON strings and normalize has turned every
 `TimestampType` into an epoch-millis long, so by the time we get here `df.schema` is safe to read and
-`to_json` sees only Arrow-friendly, already-normalized types.
+`to_json` sees only Arrow-friendly, already-normalized types. The other two temporal types,
+`DateType` and `TimestampNTZType`, are NOT touched by `normalize_timestamps_for_utc` (on the default
+path they cross Arrow as native date/datetime objects and `coerce_value` converts them); this path
+never runs `coerce_value`, so `build_ndjson` converts them itself to the same epoch-millis long (see
+`_rewrite_date_ntz`), or `to_json` would emit ISO strings and break the read_coerce round-trip.
 
 Fidelity vs `coerce_value` (documented in the README "Spark-native serialization" section, and why
 this path is opt-in): `to_json` is Spark's serializer, not the Python transform, so a few edge cases
@@ -30,8 +34,11 @@ differ (rendering verified live via a to_json probe):
     make_ndjson_partition_writer RAISES on it, failing the write UNCONDITIONALLY (like the default
     path's _require_id, which raises regardless of raise_on_error) -- rather than shipping
     `"_id": null` and trusting ES not to auto-assign a random id (which would duplicate on replay).
-Everything else (nested structs/arrays/maps, binary as base64, timestamps-as-epoch, kept null fields)
-matches.
+Everything else (nested structs/arrays/map VALUES, binary as base64, timestamp/date/timestamp_ntz all
+as epoch-millis, kept null fields) matches. The one carve-out is a map KEY of a non-string type
+(temporal/decimal/binary): to_json stringifies it to its own form (a temporal key -> its ISO string)
+rather than the default path's _coerce_key rendering (epoch-millis) -- see the MapType branch of
+_rewrite_date_ntz. A map keyed by a raw temporal value is pathological; use string/int map keys.
 
 pyspark is imported lazily inside the function so the pure config/transform layers stay importable
 without Spark.
@@ -70,6 +77,113 @@ def _type_has_float(dt) -> bool:
     if isinstance(dt, MapType):
         return _type_has_float(dt.keyType) or _type_has_float(dt.valueType)
     return False
+
+
+def _type_has_date_or_ntz(dt) -> bool:
+    """True if `dt` is a DateType/TimestampNTZType or contains one at any nesting depth.
+
+    These are the two temporal types the shared `spark_prep.normalize_timestamps_for_utc` does NOT
+    convert (it handles only TimestampType). On the default path they cross Arrow as native
+    date/datetime objects and `transform.coerce_value` turns them into epoch-millis; the Spark path
+    never runs coerce_value, so `build_ndjson` must convert them itself (see `_rewrite_date_ntz`).
+    Pure logic (pyspark type objects only); mirrors spark_prep._type_has_timestamp.
+    """
+    from pyspark.sql.types import ArrayType, DateType, MapType, StructType, TimestampNTZType
+
+    if isinstance(dt, (DateType, TimestampNTZType)):
+        return True
+    if isinstance(dt, StructType):
+        return any(_type_has_date_or_ntz(f.dataType) for f in dt.fields)
+    if isinstance(dt, ArrayType):
+        return _type_has_date_or_ntz(dt.elementType)
+    if isinstance(dt, MapType):
+        # Map KEY intentionally NOT walked: keys are not temporally converted on this path (see the
+        # MapType branch of _rewrite_date_ntz); only the VALUE side is rewritten.
+        return _type_has_date_or_ntz(dt.valueType)
+    return False
+
+
+def _epoch_type(dt):
+    """The post-rewrite type of `dt` with DateType/TimestampNTZType -> LongType (recursively), used to
+    type a null struct literal so `when(null)` keeps the rewritten schema. Mirrors
+    spark_prep._epoch_struct_type (TimestampType is already a Long by the time build_ndjson runs, so
+    only date/ntz need mapping here)."""
+    from pyspark.sql.types import (ArrayType, DateType, LongType, MapType, StructField, StructType,
+                                   TimestampNTZType)
+
+    if isinstance(dt, (DateType, TimestampNTZType)):
+        return LongType()
+    if isinstance(dt, StructType):
+        return StructType([StructField(f.name, _epoch_type(f.dataType), f.nullable) for f in dt.fields])
+    if isinstance(dt, ArrayType):
+        return ArrayType(_epoch_type(dt.elementType), dt.containsNull)
+    if isinstance(dt, MapType):
+        # keyType left unchanged (map keys are not temporally rewritten), so this null-branch literal
+        # type matches the rebuilt map, whose keys are untouched and only values converted.
+        return MapType(dt.keyType, _epoch_type(dt.valueType), dt.valueContainsNull)
+    return dt
+
+
+def _date_ntz_leaf_to_epoch_millis(col, dt):
+    """A LongType Column: the epoch-millis for a DateType or TimestampNTZType leaf, reproducing
+    EXACTLY what transform._to_epoch_millis stores on the default path (so read_coerce inverts it):
+
+      - DateType -> midnight-UTC epoch millis. `unix_date` is days-since-1970-01-01 (a calendar count,
+        zone-free), so `* 86400000` is midnight UTC regardless of spark.sql.session.timeZone.
+      - TimestampNTZType -> the zoneless wall-clock interpreted LITERALLY as UTC (no session tz, no
+        DST). Rebuilt from the value's own wall-clock fields anchored explicitly at 'UTC' via
+        make_timestamp, then `unix_millis` (which floors toward -inf, matching _to_epoch_millis'
+        timedelta // for pre-epoch and sub-millisecond values). `date_part('SECOND', ...)` carries the
+        sub-second fraction so it is floored, not truncated. Casting the ntz to a timestamp (or to a
+        string then a timestamp) would localize the wall-clock with the session tz (verified wrong
+        by exactly the session offset under Asia/Kolkata), so this path avoids any tz-bearing cast.
+
+    A null date/ntz yields null (unix_date/make_timestamp propagate null), so nulls stay null.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import DateType, TimestampNTZType
+
+    if isinstance(dt, DateType):
+        return F.unix_date(col).cast("long") * F.lit(86400000).cast("long")
+    if isinstance(dt, TimestampNTZType):
+        return F.unix_millis(F.make_timestamp(
+            F.year(col), F.month(col), F.dayofmonth(col),
+            F.hour(col), F.minute(col), F.date_part(F.lit("SECOND"), col),
+            F.lit("UTC")))
+    return col
+
+
+def _rewrite_date_ntz(col, dt):
+    """Return a Column that rebuilds `col` with every DateType/TimestampNTZType node replaced by its
+    epoch-millis long (see `_date_ntz_leaf_to_epoch_millis`), at any nesting depth, preserving
+    struct/array/map structure. Mirrors spark_prep._rewrite_timestamps; the caller only invokes it for
+    columns that `_type_has_date_or_ntz`, and prunes clean subtrees below.
+    """
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import ArrayType, DateType, MapType, StructType, TimestampNTZType
+
+    if isinstance(dt, (DateType, TimestampNTZType)):
+        return _date_ntz_leaf_to_epoch_millis(col, dt)
+    if isinstance(dt, StructType):
+        rebuilt = F.struct(*[
+            (_rewrite_date_ntz(col[f.name], f.dataType) if _type_has_date_or_ntz(f.dataType)
+             else col[f.name]).alias(f.name)
+            for f in dt.fields
+        ])
+        return F.when(col.isNull(), F.lit(None).cast(_epoch_type(dt))).otherwise(rebuilt)  # keep null null
+    if isinstance(dt, ArrayType):
+        return F.transform(col, lambda e: _rewrite_date_ntz(e, dt.elementType))
+    if isinstance(dt, MapType):
+        # VALUES only. Map KEYS are deliberately NOT temporally converted on the serialize_in_spark
+        # path: `to_json` stringifies a temporal map key to its ISO form, which differs from the
+        # default path's `transform._coerce_key` (epoch-millis) -- a documented divergence (README).
+        # Rewriting keys with F.transform_keys was tried and rejected: it (a) RAISES on two
+        # sub-millisecond-distinct keys that floor to the same epoch (the default path silently keeps
+        # the last), and (b) still would not cover TimestampType keys (spark_prep leaves map keys
+        # untouched), so it cannot make the class consistent anyway. A map keyed by a raw temporal
+        # value is pathological; use string/int map keys with serialize_in_spark for exact key parity.
+        return F.transform_values(col, lambda k, v: _rewrite_date_ntz(v, dt.valueType))
+    return col
 
 
 def _null_nonfinite(col, dt):
@@ -120,18 +234,27 @@ def build_ndjson(df, cfg: EsConfig):
     payload = _payload_columns(df.columns, cfg.drop_fields)
     field_types = {f.name: f.dataType for f in df.schema.fields}
 
-    # Non-finite guard at ANY depth: NaN/±inf floats -> null so to_json never emits a "NaN"/
-    # "Infinity" value that a numeric ES field would reject. Only walk columns that can carry a float
-    # (top-level or nested); everything else is left untouched.
-    out = df
-    for name in payload:
+    # Build each payload column's _source expression from the ORIGINAL column, applying two rewrites
+    # where the type calls for them (both preserve struct/array/map structure and field names, so they
+    # compose on the same expression):
+    #   1. date/ntz -> epoch-millis, matching the default path. The shared normalize_timestamps_for_utc
+    #      only converts TimestampType (already a Long here); DateType/TimestampNTZType would otherwise
+    #      reach to_json as ISO strings and break the read_coerce round-trip (which expects epoch-millis
+    #      for those declared types). Runs FIRST so the float guard below sees the rewritten structure.
+    #   2. non-finite floats -> null at any depth, so to_json never emits a "NaN"/"Infinity" value a
+    #      numeric ES field would reject (matches the default path's NaN/inf -> null).
+    def _source_expr(name):
         dt = field_types.get(name)
+        c = F.col(name)
+        if _type_has_date_or_ntz(dt):
+            c = _rewrite_date_ntz(c, dt)
         if _type_has_float(dt):
-            out = out.withColumn(name, _null_nonfinite(F.col(name), dt))
+            c = _null_nonfinite(c, dt)
+        return c.alias(name)
 
     # ignoreNullFields=false keeps explicit null fields, matching the default path (coerce_value
     # keeps a null as JSON null rather than dropping the key).
-    source = F.to_json(F.struct(*[F.col(c) for c in payload]), {"ignoreNullFields": "false"})
+    source = F.to_json(F.struct(*[_source_expr(c) for c in payload]), {"ignoreNullFields": "false"})
 
     # Bulk action header. index/upsert only; _id from id_field when set (else ES assigns one).
     index_meta = [F.lit(cfg.index).alias("_index")]
@@ -142,6 +265,12 @@ def build_ndjson(df, cfg: EsConfig):
         # would otherwise cast to the string "NaN" -- not null -- evading the fail-closed check below
         # and colliding every non-finite id onto one _id. Turning it to null here routes it into that
         # check. Only float/double ids can be non-finite; other id types pass through unchanged.
+        # id_col reads the ORIGINAL column (the _source rewrites above are built as separate
+        # expressions, not applied to df), so a date/ntz id_field renders its raw calendar/wall-clock
+        # string here (a human-readable value close to the default path's str(value)) rather than the
+        # epoch-millis we store in _source. Only its _source copy is epoch; the _id stays the
+        # human-readable value. The exact string is Spark's cast, which is NOT guaranteed identical to
+        # Python str() for a non-string id -- see the fail-closed note below.
         id_dt = field_types.get(cfg.id_field)
         id_col = F.col(cfg.id_field)
         if isinstance(id_dt, (DoubleType, FloatType)):
@@ -154,9 +283,12 @@ def build_ndjson(df, cfg: EsConfig):
     # writer (make_ndjson_partition_writer) RAISES on a null line, failing the write unconditionally
     # -- mirroring the default path's _require_id, which raises regardless of raise_on_error -- rather
     # than shipping `"_id": null` (ES might auto-assign a random id and duplicate the row on replay).
-    # Note: a numeric id_field is rendered here by Spark `cast(string)`, which can differ from the
-    # default path's Python `str()` for float/decimal ids (e.g. scientific notation); use a string id
-    # if you mix the two write paths for the same data and rely on _id equality.
+    # Note: a NON-STRING id_field is rendered here by Spark `cast(string)`, which is NOT guaranteed to
+    # match the default path's Python `str()`: a float/decimal id can differ (e.g. scientific
+    # notation), and a sub-second timestamp/timestamp_ntz id can differ in trailing-zero/fraction
+    # rendering. Only a STRING id_field is byte-identical across the two paths; use one if you mix the
+    # two write paths for the same data and rely on _id equality. (The _source epoch-millis DO match
+    # across paths -- this caveat is about the human-readable _id only.)
     if cfg.id_field:
         ndjson = F.when(id_col.isNull(), F.lit(None).cast("string")).otherwise(ndjson)
-    return out.select(ndjson.alias("_ndjson"))
+    return df.select(ndjson.alias("_ndjson"))

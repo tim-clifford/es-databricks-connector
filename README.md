@@ -565,7 +565,8 @@ differ from the default path's documented round-trip contract:
 | `float` (32-bit) | exact widened double (`0.10000000149…`) | short decimal repr (`0.1`) |
 | null / non-finite `id_field` value | whole write **raises** (`_require_id`) | **fails closed the same way**: the writer **raises**, failing the write unconditionally (not merely `unaccounted`), rather than shipping `"_id": null` which could auto-assign an id and duplicate on replay |
 | numeric `id_field` → `_id` string | Python `str(value)` | Spark `cast(string)` — can differ for `float`/`decimal` (e.g. scientific notation); use a **string** id if you mix both write paths and rely on `_id` equality |
-| everything else (nested struct/array/map, `binary`→base64, `timestamp`→epoch-millis, kept null fields) | — | **matches** |
+| non-string **map keys** (`timestamp` / `date` / `timestamp_ntz` / `decimal` / `binary`) | `_coerce_key` renders the key the same way as a value (e.g. a temporal key → epoch-millis string) | `to_json` stringifies the key to its own form instead (a temporal key → its ISO string), so a map **keyed by** such a type does **not** match the default path. Map **values** of these types still match. Use **string/int map keys** with `serialize_in_spark` for exact key parity |
+| everything else (nested struct/array/map **values**, `binary`→base64, `timestamp` / `date` / `timestamp_ntz`→epoch-millis at any nesting depth, kept null fields) | — | **matches** |
 
 Everything else is unchanged: `chunk_size`, per-document `429` retry (`max_retries_per_doc` /
 `retry_on_doc_status`), the `written`/`deleted`/`errors`/`ignored`/`unaccounted` accounting, and

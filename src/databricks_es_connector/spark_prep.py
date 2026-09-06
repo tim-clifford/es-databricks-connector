@@ -159,7 +159,11 @@ def sanitize_for_arrow(df: "DataFrame") -> "DataFrame":
 #   - TimestampNTZType: a zoneless wall-clock. The connector's contract is to read it AS UTC, which
 #     is exactly what the current path already produces (verified). `unix_millis` also REJECTS ntz.
 #   - DateType: has no time-of-day, converts to midnight-UTC epoch correctly already (verified).
-# Only `TimestampType` at any nesting depth is rewritten.
+# Only `TimestampType` at any nesting depth is rewritten. On the DEFAULT path the above two are then
+# turned into epoch-millis in Python by `transform.coerce_value` (they cross Arrow as native
+# date/datetime). The `serialize_in_spark` path never runs coerce_value, so it converts DateType and
+# TimestampNTZType to the same epoch-millis itself in `spark_serialize.build_ndjson` (which runs after
+# this), NOT here, so the default path's proven behavior is untouched.
 
 
 def _type_has_timestamp(dt: "DataType") -> bool:
