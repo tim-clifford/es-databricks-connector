@@ -221,9 +221,11 @@ def _null_nonfinite(col, dt):
 def build_ndjson(df, cfg: EsConfig):
     """Return a one-column DataFrame (`_ndjson`) of complete `_bulk` action lines, built in Spark.
 
-    Each row becomes "header\\nsource" with NO trailing newline (elastic_transport's NdjsonSerializer
-    adds exactly one when the shipper forwards the line). Index/upsert only: `cfg.has_deletes` is
-    rejected upstream in EsWriteConfig for this mode.
+    An index/upsert row becomes "header\\nsource"; a delete row (when `cfg.has_deletes` and its
+    `delete_flag_column` is true) becomes just the delete-by-id "header" with NO source line. Neither
+    has a trailing newline (elastic_transport's NdjsonSerializer adds exactly one when the shipper
+    forwards the line). Deletes require `delete_flag_column` to be a real BooleanType column, enforced
+    in bulk._preflight; the flag column itself is dropped from `_source` so it is never indexed.
 
     Preconditions: `df` has been through `sanitize_for_arrow` + `normalize_timestamps_for_utc`, so
     `df.schema` is safe and types are Arrow-friendly / normalized.
@@ -231,7 +233,12 @@ def build_ndjson(df, cfg: EsConfig):
     from pyspark.sql import functions as F
     from pyspark.sql.types import DoubleType, FloatType
 
-    payload = _payload_columns(df.columns, cfg.drop_fields)
+    # Drop the delete flag from _source alongside drop_fields: it is control data, not document data
+    # (mirrors the default path's build_action, which adds delete_flag_column to its drop set).
+    drop = tuple(cfg.drop_fields or ())
+    if cfg.has_deletes and cfg.delete_flag_column:
+        drop = drop + (cfg.delete_flag_column,)
+    payload = _payload_columns(df.columns, drop)
     field_types = {f.name: f.dataType for f in df.schema.fields}
 
     # Build each payload column's _source expression from the ORIGINAL column, applying two rewrites
@@ -256,7 +263,7 @@ def build_ndjson(df, cfg: EsConfig):
     # keeps a null as JSON null rather than dropping the key).
     source = F.to_json(F.struct(*[_source_expr(c) for c in payload]), {"ignoreNullFields": "false"})
 
-    # Bulk action header. index/upsert only; _id from id_field when set (else ES assigns one).
+    # Index/upsert action header; _id from id_field when set (else ES assigns one).
     index_meta = [F.lit(cfg.index).alias("_index")]
     id_col = None
     if cfg.id_field:
@@ -276,19 +283,35 @@ def build_ndjson(df, cfg: EsConfig):
         if isinstance(id_dt, (DoubleType, FloatType)):
             id_col = _null_nonfinite(id_col, id_dt)
         index_meta.append(id_col.cast("string").alias("_id"))
-    header = F.to_json(F.struct(F.struct(*index_meta).alias("index")), {"ignoreNullFields": "false"})
+    index_header = F.to_json(F.struct(F.struct(*index_meta).alias("index")), {"ignoreNullFields": "false"})
+    index_line = F.concat(index_header, F.lit("\n"), source)
 
-    ndjson = F.concat(header, F.lit("\n"), source)
+    if cfg.has_deletes:
+        # Delete-by-id action: id-only, NO source line. has_deletes requires id_field (config guard),
+        # so id_col is always set here. A row whose delete_flag_column is true routes to the delete
+        # line; every other row indexes. `flag === true` is null-safe: a null flag yields null (not
+        # true), so it falls through to the index line -- matching the default path's "a null flag is
+        # not a delete". delete_flag_column is a real BooleanType (bulk._preflight enforces it), so no
+        # string parsing happens here; there is no Catalyst equivalent of the per-row
+        # AmbiguousDeleteFlag raise, which is why the boolean type is required at this seam.
+        delete_meta = [F.lit(cfg.index).alias("_index"), id_col.cast("string").alias("_id")]
+        delete_header = F.to_json(F.struct(F.struct(*delete_meta).alias("delete")),
+                                  {"ignoreNullFields": "false"})
+        ndjson = F.when(F.col(cfg.delete_flag_column) == F.lit(True), delete_header).otherwise(index_line)
+    else:
+        ndjson = index_line
+
     # Fail CLOSED on a null (or non-finite, nulled above) id value: emit a null action line. The
     # writer (make_ndjson_partition_writer) RAISES on a null line, failing the write unconditionally
     # -- mirroring the default path's _require_id, which raises regardless of raise_on_error -- rather
     # than shipping `"_id": null` (ES might auto-assign a random id and duplicate the row on replay).
-    # Note: a NON-STRING id_field is rendered here by Spark `cast(string)`, which is NOT guaranteed to
-    # match the default path's Python `str()`: a float/decimal id can differ (e.g. scientific
-    # notation), and a sub-second timestamp/timestamp_ntz id can differ in trailing-zero/fraction
-    # rendering. Only a STRING id_field is byte-identical across the two paths; use one if you mix the
-    # two write paths for the same data and rely on _id equality. (The _source epoch-millis DO match
-    # across paths -- this caveat is about the human-readable _id only.)
+    # Applies to delete rows too: a delete needs a non-null _id to target, so a null-id delete fails
+    # closed the same way. Note: a NON-STRING id_field is rendered here by Spark `cast(string)`, which
+    # is NOT guaranteed to match the default path's Python `str()`: a float/decimal id can differ (e.g.
+    # scientific notation), and a sub-second timestamp/timestamp_ntz id can differ in trailing-zero/
+    # fraction rendering. Only a STRING id_field is byte-identical across the two paths; use one if you
+    # mix the two write paths for the same data and rely on _id equality. (The _source epoch-millis DO
+    # match across paths -- this caveat is about the human-readable _id only.)
     if cfg.id_field:
         ndjson = F.when(id_col.isNull(), F.lit(None).cast("string")).otherwise(ndjson)
     return df.select(ndjson.alias("_ndjson"))

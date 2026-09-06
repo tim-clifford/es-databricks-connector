@@ -271,8 +271,9 @@ def make_partition_writer(cfg: EsConfig):
 # --- serialize_in_spark path: ship pre-built NDJSON, classify the _bulk response ------------------
 # The default writer above builds each action IN PYTHON (build_action -> coerce_value -> streaming_bulk
 # serializes). When cfg.serialize_in_spark is set, spark_serialize.build_ndjson has ALREADY built the
-# whole `_bulk` action line ("header\nsource", index/upsert only) in Catalyst, so this writer does no
-# per-row Python shaping or JSON encoding: it batches the pre-built lines and hands them to
+# whole `_bulk` action line (index/upsert "header\nsource", or a delete "header" with no source) in
+# Catalyst, so this writer does no per-row Python shaping or JSON encoding: it batches the pre-built
+# lines and hands them to
 # es.bulk(operations=...). elastic_transport's NdjsonSerializer forwards str/bytes list items VERBATIM
 # (utf-8 + a trailing newline, no json re-encode), so the JVM-built JSON is never re-serialized in
 # Python -- that pass-through is the whole point, it is what keeps the work off the GIL.
@@ -597,6 +598,27 @@ def _preflight(df, cfg: EsConfig) -> None:
             "not-flagged, so each intended DELETE would silently be applied as an upsert and the "
             "documents would stay in Elasticsearch (deleted=0, errors=0, reconciliation clean). "
             "Fix the name, or set has_deletes=False if this write has no deletes.")
+
+    if cfg.has_deletes and cfg.serialize_in_spark and cfg.delete_flag_column in present:
+        # The serialize_in_spark delete path routes each row in Catalyst with `flag === true`
+        # (spark_serialize.build_ndjson), which requires a real BooleanType column: Catalyst has no
+        # per-row equivalent of the default path's AmbiguousDeleteFlag raise, so a string/int flag
+        # cannot be parsed at the seam. A non-boolean flag would make `flag === true` evaluate to null
+        # for every row (string==boolean is a null-yielding type mismatch), so NO row would route to a
+        # delete and every intended deletion would silently become an upsert -- the exact silent loss
+        # the column-name check just above exists to prevent. Enforce the type on the driver instead.
+        # df.schema is safe here (sanitize_for_arrow already removed the VARIANT columns that make it
+        # throw on Spark Connect); typeName() avoids importing a pyspark type into this module.
+        flag_dt = next((f.dataType for f in df.schema.fields if f.name == cfg.delete_flag_column), None)
+        if flag_dt is None or flag_dt.typeName() != "boolean":
+            raise ValueError(
+                f"delete_flag_column {cfg.delete_flag_column!r} must be a boolean column when "
+                f"serialize_in_spark=True, but its type is "
+                f"{flag_dt.simpleString() if flag_dt is not None else 'unknown'}. This path routes "
+                "deletes in Spark via `flag === true`, which has no way to parse a string/int flag "
+                "(unlike the per-row path's allow-list); a non-boolean flag would route NO row to a "
+                "delete and silently upsert every intended deletion. Cast the column to boolean in "
+                "Spark (e.g. df.withColumn(col, col.cast('boolean'))) so the intent is unambiguous.")
 
     if cfg.require_existing_index:
         from elasticsearch import Elasticsearch

@@ -188,9 +188,12 @@ class EsWriteConfig(EsConnection):
     #
     # This path has its OWN, slightly different fidelity contract from coerce_value (Spark to_json vs
     # the Python transform); the differences are documented in the README "Spark-native serialization"
-    # section. It is opt-in precisely so the default path's round-trip guarantee is untouched. v1
-    # supports index/upsert only: has_deletes with serialize_in_spark is rejected below (the per-row
-    # delete-flag RAISE semantics do not yet have a Catalyst equivalent).
+    # section. It is opt-in precisely so the default path's round-trip guarantee is untouched. It
+    # supports index/upsert AND deletes: build_ndjson emits a delete-by-id action (no source line) for
+    # a row whose delete_flag_column is true. Deletes on this path require delete_flag_column to be a
+    # real BooleanType column (enforced in bulk._preflight): Catalyst has no per-row equivalent of the
+    # default path's AmbiguousDeleteFlag raise, so the boolean type is required at the seam instead of
+    # parsing flag strings.
     serialize_in_spark: bool = False
 
     def __post_init__(self):
@@ -233,14 +236,10 @@ class EsWriteConfig(EsConnection):
             # A flag column set with deletes off would silently do nothing, reject the misconfig
             # rather than let a caller believe deletes are happening.
             raise ValueError("delete_flag_column is set but has_deletes is False, enable has_deletes or drop it")
-        # serialize_in_spark v1 does not build delete actions (see the field comment). Fail CLOSED
-        # rather than silently ignore has_deletes and upsert every flagged row -- the exact silent
-        # loss the delete_flag_column preflight exists to prevent.
-        if self.serialize_in_spark and self.has_deletes:
-            raise ValueError(
-                "serialize_in_spark=True does not yet support has_deletes (v1 builds index/upsert "
-                "actions only). Use the default per-row path for delete-bearing writes, or split "
-                "deletes into a separate write.")
+        # serialize_in_spark now builds delete actions too (build_ndjson): a row whose
+        # delete_flag_column is true becomes a delete-by-id (no source line). Its one added requirement
+        # -- delete_flag_column must be a real BooleanType column -- needs the DataFrame schema, so it
+        # is enforced in bulk._preflight (driver-side, once), not here where only field values exist.
         # serialize_in_spark ships each partition's chunks SERIALLY (its bottleneck was the GIL-bound
         # per-row work, now moved to the JVM, not the ES round-trip). write_concurrency only tunes the
         # default path's per-partition thread-fan, so warn rather than silently ignore it here.

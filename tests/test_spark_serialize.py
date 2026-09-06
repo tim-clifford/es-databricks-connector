@@ -13,7 +13,7 @@ import pytest
 
 from databricks_es_connector.config import EsConfig
 from databricks_es_connector.bulk import (
-    iter_bulk_response_outcomes, _ship_ndjson_chunk, make_ndjson_partition_writer,
+    iter_bulk_response_outcomes, _ship_ndjson_chunk, make_ndjson_partition_writer, _preflight,
     WRITTEN, DELETED, IGNORED, ERROR, ERROR_SAMPLE_CAP,
 )
 
@@ -184,10 +184,13 @@ def test_ship_chunk_transport_error_counts_errors_not_crash():
 
 # --- config guard ---------------------------------------------------------------------------
 
-def test_config_rejects_serialize_in_spark_with_deletes():
-    with pytest.raises(ValueError, match="does not yet support has_deletes"):
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
-                 serialize_in_spark=True, has_deletes=True, delete_flag_column="d")
+def test_config_accepts_serialize_in_spark_with_deletes():
+    # 0.9.0: the serialize_in_spark path builds delete actions too, so the old fail-closed guard
+    # (which rejected the combination) is gone. The remaining requirement -- the flag column must be
+    # boolean -- needs the DataFrame schema and is enforced in bulk._preflight, not here.
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
+                   serialize_in_spark=True, has_deletes=True, delete_flag_column="d")
+    assert cfg.has_deletes is True and cfg.delete_flag_column == "d"
 
 
 def test_config_serialize_in_spark_defaults_off():
@@ -296,3 +299,44 @@ def test_epoch_type_maps_date_ntz_to_long_recursively():
     # a map is mapped to Long.
     mk = _epoch_type(MapType(DateType(), TimestampNTZType()))
     assert isinstance(mk.keyType, DateType) and isinstance(mk.valueType, LongType)
+
+
+# --- _preflight: serialize_in_spark deletes require a BooleanType flag column ------------------
+# The Catalyst delete routing (`flag === true` in build_ndjson) has no way to parse a string/int flag,
+# so a non-boolean flag must fail closed on the driver rather than silently upsert every intended
+# delete. build_ndjson itself needs live Spark (the end-to-end path is proven in the integration
+# tier); this covers the driver-side TYPE check that gates it. _preflight reads only df.columns and
+# df.schema.fields[*].{name, dataType.typeName()}, so a stand-in exercises the check without pyspark
+# (unavailable on this Python) -- the real schema is proven live in test_deletes_roundtrip.
+
+class _FakeDataType:
+    """Mirrors the pyspark DataType methods _preflight reads: typeName() / simpleString()."""
+    def __init__(self, type_name): self._t = type_name
+    def typeName(self): return self._t
+    def simpleString(self): return self._t
+
+
+class _FakeField:
+    def __init__(self, name, type_name): self.name = name; self.dataType = _FakeDataType(type_name)
+
+
+def _fake_df(fields):
+    """Stand-in DataFrame exposing what _preflight reads: .columns and .schema.fields[*].{name,
+    dataType}. `fields`: [(name, type_name), ...], e.g. ("d", "boolean")."""
+    df = type("_DF", (), {})()
+    df.columns = [n for n, _ in fields]
+    df.schema = type("_Schema", (), {"fields": [_FakeField(n, t) for n, t in fields]})()
+    return df
+
+
+def test_preflight_rejects_non_boolean_delete_flag_with_serialize_in_spark():
+    # flag column "d" is a STRING, not boolean: `flag === true` would be null for every row => no row
+    # routed to a delete => every intended deletion silently upserted. Must fail closed on the driver.
+    cfg = _cfg(has_deletes=True, delete_flag_column="d")   # _cfg sets serialize_in_spark=True, id_field="id"
+    with pytest.raises(ValueError, match="must be a boolean column"):
+        _preflight(_fake_df([("id", "string"), ("d", "string")]), cfg)
+
+
+def test_preflight_accepts_boolean_delete_flag_with_serialize_in_spark():
+    cfg = _cfg(has_deletes=True, delete_flag_column="d")
+    _preflight(_fake_df([("id", "string"), ("d", "boolean")]), cfg)   # must not raise (require_existing_index=False)
