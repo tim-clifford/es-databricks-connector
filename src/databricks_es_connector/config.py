@@ -23,7 +23,7 @@ Elasticsearch can fail a write in two independent places, so there are two retry
                           reads and writes. -> elastic_transport.Transport
   max_retries_per_doc     ONE DOCUMENT inside a successful request was rejected (429, ES write queue
                           full). Re-sends only the failed subset. Writes only.
-                          -> elasticsearch.helpers.streaming_bulk
+                          -> bulk._ship_ndjson_chunk
 
 They exist separately because the `_bulk` API answers **HTTP 200 even when documents inside it
 fail**: the per-item statuses live in the response body, which the transport layer never inspects.
@@ -125,21 +125,19 @@ class EsWriteConfig(EsConnection):
     id_field: Optional[str] = None          # column used as deterministic _id (idempotency)
     chunk_size: int = 500                   # docs per bulk request
 
-    # How many bulk request streams run IN PARALLEL within a single DataFrame partition. 1 (default)
-    # is one serial streaming_bulk per partition, exactly the historical behavior, so write
-    # concurrency across the cluster is just the partition count. Raise it when the write is
-    # LATENCY-bound: executors sit idle waiting on each bulk's ES round-trip (CPU and network both
-    # under-utilized) rather than CPU- or bandwidth-bound. Each partition then keeps
-    # `write_concurrency` bulk requests in flight at once, filling that wait. Every stream is a full
-    # streaming_bulk with the SAME chunk_size and per-document retry behavior (max_retries_per_doc /
-    # retry_on_doc_status), so the error accounting is byte-for-byte unchanged; only the number of
-    # concurrent in-flight requests grows. Costs one executor thread and up to one chunk of in-flight
-    # docs per unit. Total requests hitting ES at once = (running partitions) * write_concurrency, so
-    # raise it gradually and watch for 429s (ES write queue full) -- if they climb, the ES cluster,
-    # not the client, is the ceiling. This does NOT use elasticsearch-py's parallel_bulk, which has no
-    # per-document retry loop and would drop the 429 handling exactly when concurrency makes 429s more
-    # likely. The per-node HTTP connection pool is sized to write_concurrency automatically (see
-    # client_kwargs), so callers do not also have to raise it.
+    # How many `_bulk` requests run IN PARALLEL within a single DataFrame partition. 1 (default) ships
+    # a partition's chunks serially, so write concurrency across the cluster is just the partition
+    # count. Raise it when the write is LATENCY-bound: executors sit idle waiting on each bulk's ES
+    # round-trip (CPU and network both under-utilized) rather than CPU- or bandwidth-bound. Each
+    # partition then keeps `write_concurrency` bulk requests in flight at once, filling that wait: the
+    # pre-built NDJSON lines are fanned across that many worker threads (bulk._ship_ndjson_lines), each
+    # shipping its strided slice with the SAME chunk_size and per-document 429 retry, so the error
+    # accounting is unchanged; only the number of concurrent in-flight requests grows. Costs one
+    # executor thread and up to one chunk of in-flight docs per unit. Total requests hitting ES at once
+    # = (running partitions) * write_concurrency, so raise it gradually and watch for 429s (ES write
+    # queue full) -- if they climb, the ES cluster, not the client, is the ceiling. The per-node HTTP
+    # connection pool is sized to write_concurrency automatically (see client_kwargs), so callers do
+    # not also have to raise it.
     write_concurrency: int = 1
 
     # Per-DOCUMENT retries for rows Elasticsearch rejects with a retryable status (429
@@ -168,33 +166,13 @@ class EsWriteConfig(EsConnection):
 
     # --- deletes ---
     # has_deletes=False (default): every row is an index/upsert.
-    # Set has_deletes=True *and* delete_flag_column to route rows whose flag is truthy to an
-    # ES delete-by-id instead of an index. Requires id_field (you cannot delete without an _id).
+    # Set has_deletes=True *and* delete_flag_column to route rows whose flag is true to an ES
+    # delete-by-id instead of an index. Requires id_field (you cannot delete without an _id). The flag
+    # must be a real BooleanType column (a true row deletes; false or null indexes): deletes are routed
+    # in Catalyst via `flag === true`, which cannot parse a string/int flag, so a non-boolean column is
+    # rejected in bulk._preflight rather than silently upserting every intended delete.
     has_deletes: bool = False
-    delete_flag_column: Optional[str] = None  # boolean-ish column: truthy => delete this _id
-
-    # --- serialization mode ---
-    # Where each document's JSON is built. False (default) is the original per-row Python path:
-    # mapInPandas hands each row to coerce_value / build_action, which shape and JSON-serialize it on
-    # the executor. That work is GIL-bound Python and is the throughput ceiling on wide/large writes
-    # (the transform+serialize step, not the ES send, dominates wall time; proven by a no-op run whose
-    # time is unchanged with the ES connection never opened).
-    #
-    # True moves the _source construction AND JSON serialization into Spark: the whole `_bulk` action
-    # line (header + source) is built once per row with `to_json` in Catalyst (JVM, multi-core, no
-    # GIL), and the executor only ships the pre-built NDJSON with es.bulk(operations=...), which
-    # forwards str/bytes lines verbatim (no Python re-serialization). Measured ~5x on the
-    # transform+serialize segment at 30M rows / 32 cores.
-    #
-    # This path has its OWN, slightly different fidelity contract from coerce_value (Spark to_json vs
-    # the Python transform); the differences are documented in the README "Spark-native serialization"
-    # section. It is opt-in precisely so the default path's round-trip guarantee is untouched. It
-    # supports index/upsert AND deletes: build_ndjson emits a delete-by-id action (no source line) for
-    # a row whose delete_flag_column is true. Deletes on this path require delete_flag_column to be a
-    # real BooleanType column (enforced in bulk._preflight): Catalyst has no per-row equivalent of the
-    # default path's AmbiguousDeleteFlag raise, so the boolean type is required at the seam instead of
-    # parsing flag strings.
-    serialize_in_spark: bool = False
+    delete_flag_column: Optional[str] = None  # boolean column: true => delete this _id
 
     def __post_init__(self):
         super().__post_init__()
@@ -236,17 +214,15 @@ class EsWriteConfig(EsConnection):
             # A flag column set with deletes off would silently do nothing, reject the misconfig
             # rather than let a caller believe deletes are happening.
             raise ValueError("delete_flag_column is set but has_deletes is False, enable has_deletes or drop it")
-        # serialize_in_spark now builds delete actions too (build_ndjson): a row whose
-        # delete_flag_column is true becomes a delete-by-id (no source line). Its one added requirement
-        # -- delete_flag_column must be a real BooleanType column -- needs the DataFrame schema, so it
-        # is enforced in bulk._preflight (driver-side, once), not here where only field values exist.
+        # The remaining delete requirement -- delete_flag_column must be a real BooleanType column, so
+        # build_ndjson can route it in Catalyst via `flag === true` -- needs the DataFrame schema, so
+        # it is enforced in bulk._preflight (driver-side, once), not here where only field values exist.
 
     def client_kwargs(self) -> dict:
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.
 
-        Each partition's ES client is shared by `write_concurrency` worker threads (the default path's
-        bulk._iter_bulk_results, or the serialize_in_spark path's bulk._ship_ndjson_lines).
-        elastic_transport's per-node pool defaults to ~10 connections, so a
+        Each partition's ES client is shared by `write_concurrency` worker threads
+        (bulk._ship_ndjson_lines). elastic_transport's per-node pool defaults to ~10 connections, so a
         higher write_concurrency would silently cap the in-flight requests below the configured value;
         sizing the pool to the concurrency gives every worker its own connection. Left at the client
         default for write_concurrency == 1 (the serial path), so nothing changes there.

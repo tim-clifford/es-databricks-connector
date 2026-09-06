@@ -1,12 +1,12 @@
-"""Unit tests for the serialize_in_spark write path (bulk.py shipper + config validation).
+"""Unit tests for the write path (bulk.py shipper + config validation + the fan-out).
 
 The Spark-side builder (spark_serialize.build_ndjson) needs a live Spark session and is proven in
 the integration tier; here we cover everything that does NOT need Spark:
-  - iter_bulk_response_outcomes: es.bulk response item -> WRITTEN/DELETED/IGNORED/ERROR (reuses the
-    same classify_bulk_result rules as streaming_bulk, so the two paths count identically).
+  - iter_bulk_response_outcomes: es.bulk response item -> WRITTEN/DELETED/IGNORED/ERROR.
   - _ship_ndjson_chunk: tallying + the per-document 429 retry the connector treats as load-bearing.
+  - _ship_ndjson_lines: the write_concurrency fan-out (all lines shipped once, tally == serial).
   - make_ndjson_partition_writer: chunking by chunk_size, the yielded summary schema, total_input.
-  - the config guard that fails closed on serialize_in_spark + has_deletes.
+  - _preflight: deletes require a BooleanType flag column.
   - _payload_columns: which columns land in _source.
 """
 import pytest
@@ -20,7 +20,7 @@ from databricks_es_connector.bulk import (
 
 def _cfg(**kw):
     base = dict(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
-                serialize_in_spark=True, require_existing_index=False)
+                require_existing_index=False)
     base.update(kw)
     return EsConfig(**base)
 
@@ -184,31 +184,24 @@ def test_ship_chunk_transport_error_counts_errors_not_crash():
 
 # --- config guard ---------------------------------------------------------------------------
 
-def test_config_accepts_serialize_in_spark_with_deletes():
-    # 0.9.0: the serialize_in_spark path builds delete actions too, so the old fail-closed guard
-    # (which rejected the combination) is gone. The remaining requirement -- the flag column must be
-    # boolean -- needs the DataFrame schema and is enforced in bulk._preflight, not here.
+def test_config_accepts_deletes():
+    # The write path builds delete actions; the config accepts has_deletes + a flag column. The
+    # remaining requirement -- the flag column must be boolean -- needs the DataFrame schema and is
+    # enforced in bulk._preflight, not here.
     cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
-                   serialize_in_spark=True, has_deletes=True, delete_flag_column="d")
+                   has_deletes=True, delete_flag_column="d")
     assert cfg.has_deletes is True and cfg.delete_flag_column == "d"
 
 
-def test_config_serialize_in_spark_defaults_off():
-    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i")
-    assert cfg.serialize_in_spark is False
-
-
-def test_config_write_concurrency_with_serialize_in_spark_does_not_warn():
+def test_config_write_concurrency_sizes_connection_pool():
     import warnings
-    # 0.9.0: write_concurrency now fans the serialize_in_spark path's chunk shipping
-    # (bulk._ship_ndjson_lines), so the old "has no effect" warning is gone. The combination must be
-    # accepted silently.
+    # write_concurrency fans the chunk shipping across worker threads (bulk._ship_ndjson_lines) and
+    # must not warn on its own; the per-node connection pool is sized to it so the workers are not
+    # capped below the configured value.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i",
-                       serialize_in_spark=True, write_concurrency=4)
+        cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=4)
     assert cfg.write_concurrency == 4
-    # And the connection pool is sized to the concurrency so the workers are not capped.
     assert cfg.client_kwargs().get("connections_per_node") == 4
 
 
@@ -302,7 +295,7 @@ def test_epoch_type_maps_date_ntz_to_long_recursively():
     assert isinstance(mk.keyType, DateType) and isinstance(mk.valueType, LongType)
 
 
-# --- _preflight: serialize_in_spark deletes require a BooleanType flag column ------------------
+# --- _preflight: deletes require a BooleanType flag column ------------------------------------
 # The Catalyst delete routing (`flag === true` in build_ndjson) has no way to parse a string/int flag,
 # so a non-boolean flag must fail closed on the driver rather than silently upsert every intended
 # delete. build_ndjson itself needs live Spark (the end-to-end path is proven in the integration
@@ -330,7 +323,7 @@ def _fake_df(fields):
     return df
 
 
-def test_preflight_rejects_non_boolean_delete_flag_with_serialize_in_spark():
+def test_preflight_rejects_non_boolean_delete_flag():
     # flag column "d" is a STRING, not boolean: `flag === true` would be null for every row => no row
     # routed to a delete => every intended deletion silently upserted. Must fail closed on the driver.
     cfg = _cfg(has_deletes=True, delete_flag_column="d")   # _cfg sets serialize_in_spark=True, id_field="id"
@@ -338,7 +331,7 @@ def test_preflight_rejects_non_boolean_delete_flag_with_serialize_in_spark():
         _preflight(_fake_df([("id", "string"), ("d", "string")]), cfg)
 
 
-def test_preflight_accepts_boolean_delete_flag_with_serialize_in_spark():
+def test_preflight_accepts_boolean_delete_flag():
     cfg = _cfg(has_deletes=True, delete_flag_column="d")
     _preflight(_fake_df([("id", "string"), ("d", "boolean")]), cfg)   # must not raise (require_existing_index=False)
 
@@ -416,3 +409,24 @@ def test_ship_ndjson_lines_merges_errors_and_samples_across_workers():
     _ship_ndjson_lines(_SelectiveFakeES(), lines, _cfg(write_concurrency=3, chunk_size=2), counts, samples)
     assert counts["written"] == 8 and counts["errors"] == 3
     assert len(samples) == 3 and all("boom" in s["reason"] for s in samples)
+
+
+def test_ship_ndjson_lines_worker_exception_fails_closed(monkeypatch):
+    # RED-BEFORE-GREEN guard: a worker exception must propagate (via f.result()), so a partial write
+    # FAILS the partition rather than reporting the docs a dead worker never sent as a clean count.
+    # Deleting the `f.result()` loop makes this pass silently. _ship_ndjson_chunk normally catches
+    # transport errors and counts them, so force a raw raise to exercise the re-raise guard itself.
+    from databricks_es_connector import bulk as bulk_mod
+
+    def _boom(es, chunk, cfg, counts, samples):
+        raise RuntimeError("worker died mid-ship")
+
+    monkeypatch.setattr(bulk_mod, "_ship_ndjson_chunk", _boom)
+    with pytest.raises(RuntimeError, match="worker died"):
+        bulk_mod._ship_ndjson_lines(_ThreadSafeFakeES(), [f"L{i}" for i in range(10)],
+                                    _cfg(write_concurrency=3, chunk_size=2), _zero_counts(), [])
+
+
+def test_config_write_concurrency_must_be_positive():
+    with pytest.raises(ValueError, match="write_concurrency must be >= 1"):
+        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=0)

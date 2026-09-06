@@ -17,7 +17,6 @@ from typing import Iterator
 
 from .config import EsConfig
 from .spark_prep import sanitize_for_arrow, normalize_timestamps_for_utc
-from .transform import build_action
 
 _log = logging.getLogger(__name__)
 
@@ -47,7 +46,7 @@ _COLUMN_NAMING_FIELDS = ("id_field", "drop_fields", "delete_flag_column")
 
 
 def _extract_error_sample(op_type: str, item: dict) -> dict:
-    """Pull a compact, JSON-safe diagnostic from one failed streaming_bulk result item.
+    """Pull a compact, JSON-safe diagnostic from one failed _bulk response item.
 
     Keeps only what identifies and explains the failure: the doc _id, the op, the HTTP status,
     and ES's error reason (truncated). Deliberately small so a batch of failures stays bounded.
@@ -66,7 +65,7 @@ def _extract_error_sample(op_type: str, item: dict) -> dict:
 
 
 def classify_bulk_result(ok: bool, op_type: str, status: int) -> str:
-    """Classify one streaming_bulk result into WRITTEN / DELETED / IGNORED / ERROR.
+    """Classify one _bulk response item into WRITTEN / DELETED / IGNORED / ERROR.
 
     Pure so the suppression rule is unit-testable without Spark or a live ES client.
 
@@ -83,200 +82,13 @@ def classify_bulk_result(ok: bool, op_type: str, status: int) -> str:
     return ERROR
 
 
-def _streaming_bulk(es, actions, cfg: EsConfig):
-    """One streaming_bulk stream with the connector's fixed error/retry settings.
-
-    Factored out so the serial path and every concurrent worker in `_iter_bulk_results` issue
-    IDENTICAL requests. The choices here are load-bearing:
-
-      - raise_on_error=False + raise_on_exception=False + yield_ok=True: we get one (ok, item) tuple
-        per document and classify each ourselves (`classify_bulk_result`). We deliberately do NOT use
-        helpers.bulk's `ignore_status`, which would suppress a status across ALL op types (e.g. a 404
-        on an index would also be swallowed); the connector's suppression is scoped to *delete* 404s
-        only, and lives in the classifier.
-      - max_retries + retry_on_status: streaming_bulk retries the individual documents ES rejected
-        with a retryable status (429 = write queue full) with exponential backoff, re-sending only
-        the failed subset. Without this the library default (max_retries=0) makes a transient 429 a
-        permanent per-doc error on its first attempt; the transport-level EsConnection.max_retries
-        does NOT cover it, because _bulk returns HTTP 200 even when individual items fail.
-    """
-    from elasticsearch import helpers
-    return helpers.streaming_bulk(
-        es, actions, chunk_size=cfg.chunk_size,
-        raise_on_error=False, raise_on_exception=False, yield_ok=True,
-        max_retries=cfg.max_retries_per_doc,
-        retry_on_status=tuple(cfg.retry_on_doc_status),
-    )
-
-
-def _iter_bulk_results(es, actions, cfg: EsConfig):
-    """Yield (ok, result) tuples, one per document, for the writer loop to classify.
-
-    `cfg.write_concurrency == 1` (default) is a single serial `streaming_bulk`: EXACTLY the original
-    path, no threads. `> 1` fans `actions` across that many worker threads, each running its own
-    `streaming_bulk` (the elasticsearch-py client is thread-safe; it holds a connection pool), and
-    merges their per-document results through a bounded queue as they complete. This keeps
-    `write_concurrency` bulk requests in flight per partition to fill the ES round-trip wait, WITHOUT
-    losing streaming_bulk's per-document 429 retry (which parallel_bulk drops entirely).
-
-    A worker exception (e.g. a transport error surviving transport_max_retries) is re-raised on the
-    consumer thread once the queue has drained, so a partial write FAILS the partition instead of
-    silently reporting the documents a dead worker never sent as a clean success -- the exact silent
-    loss this module is built to prevent. If instead the CONSUMER abandons this generator early (the
-    classify loop raises, or the generator is closed/GC'd mid-stream), the `stop` flag releases any
-    producer parked on a full queue so `ThreadPoolExecutor.__exit__`'s shutdown(wait=True) can never
-    deadlock the partition on a `put()` that will never be drained.
-    """
-    n = cfg.write_concurrency
-    if n <= 1:
-        yield from _streaming_bulk(es, actions, cfg)
-        return
-
-    import queue as _queue
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
-    # Strided slices spread any positional ordering in the partition evenly across workers instead of
-    # front-loading one. Order does not matter: each action is independent.
-    slices = [actions[i::n] for i in range(n)]
-    results = _queue.Queue(maxsize=n * 2)   # bounded => producers block when full => flat memory
-    stop = threading.Event()                # set when the consumer abandons us early (see docstring)
-    _DONE = object()
-
-    def _put(item):
-        # Block for room on a full queue, but poll `stop` so a producer can't hang forever once the
-        # consumer has stopped draining. Returns immediately when there is room (the normal path), so
-        # this adds no latency unless the queue is actually full.
-        while not stop.is_set():
-            try:
-                results.put(item, timeout=0.2)
-                return
-            except _queue.Full:
-                continue
-
-    def _worker(slice_actions):
-        try:
-            for tup in _streaming_bulk(es, slice_actions, cfg):
-                if stop.is_set():
-                    return
-                _put(tup)
-        finally:
-            # Always signal completion, even on exception, so the consumer's drain loop terminates and
-            # can re-raise via the future below. `_put` honors `stop`, so this can't wedge on abort.
-            _put(_DONE)
-
-    with ThreadPoolExecutor(max_workers=n) as pool:
-        futures = [pool.submit(_worker, s) for s in slices]
-        try:
-            finished = 0
-            while finished < n:
-                item = results.get()
-                if item is _DONE:
-                    finished += 1
-                    continue
-                yield item
-            # Every worker has now put its _DONE (the loop above drained them), so result() re-raises
-            # the first worker exception rather than blocking. Skipping this would let a thread that
-            # died mid-stream drop its remaining docs while the partition reported a clean partial count.
-            for f in futures:
-                f.result()
-        finally:
-            # On ANY early exit (consumer raised, or the generator was closed/GC'd), release producers
-            # that may be blocked in _put before ThreadPoolExecutor.__exit__ runs shutdown(wait=True):
-            # set the flag, then drain so a parked producer wakes at once rather than after its poll
-            # timeout. Harmless on the normal path (workers have already finished; the queue is empty).
-            stop.set()
-            try:
-                while True:
-                    results.get_nowait()
-            except _queue.Empty:
-                pass
-
-
-def make_partition_writer(cfg: EsConfig):
-    """Return a mapInPandas-compatible function that bulk-writes each pandas chunk.
-
-    The returned fn yields a one-row pandas DataFrame with the counts, so the driver
-    can sum results without collecting the data itself.
-    """
-    def _write(iterator: "Iterator") -> "Iterator":
-        import pandas as pd
-        from elasticsearch import Elasticsearch
-
-        es = Elasticsearch(**cfg.client_kwargs())
-        written = 0
-        deleted = 0
-        errors = 0
-        ignored = 0                # delete-404 no-ops: expected, but must be COUNTED so the caller
-                                   # can tell them apart from rows lost below the per-doc level
-        coerced_nonfinite = 0      # values silently turned to JSON null (inf/-inf/NaN)
-        total_input = 0            # rows fed in, so the caller can reconcile against the outcomes
-        error_samples = []         # bounded diagnostics for failed docs (see ERROR_SAMPLE_CAP)
-        for pdf in iterator:
-            rows = pdf.to_dict("records")
-            total_input += len(rows)
-            _stats = {}
-            actions = [
-                build_action(
-                    row,
-                    index=cfg.index,
-                    id_field=cfg.id_field,
-                    drop_fields=cfg.drop_fields,
-                    has_deletes=cfg.has_deletes,
-                    delete_flag_column=cfg.delete_flag_column,
-                    stats=_stats,
-                )
-                for row in rows
-            ]
-            coerced_nonfinite += _stats.get("coerced_nonfinite", 0)
-            if not actions:
-                continue
-            # _iter_bulk_results yields one (ok, {op_type: item}) tuple per document (see
-            # _streaming_bulk for the raise_on_error / yield_ok / retry rationale), so each result is
-            # classified individually below. With cfg.write_concurrency > 1 the tuples arrive from
-            # several concurrent streaming_bulk streams over this partition, merged in completion
-            # order; the classification and counting are identical either way.
-            for ok, result in _iter_bulk_results(es, actions, cfg):
-                op_type, item = next(iter(result.items()))
-                outcome = classify_bulk_result(ok, op_type, item.get("status", 500))
-                if outcome == WRITTEN:
-                    written += 1
-                elif outcome == DELETED:
-                    deleted += 1
-                elif outcome == IGNORED:
-                    # A delete-404 is an expected no-op, but it must be COUNTED: it is the one
-                    # outcome that legitimately makes written+deleted+errors < total_input, so
-                    # without this the reconciliation check cannot tell an expected no-op from a
-                    # row lost below the per-doc level. Counting it here is what makes
-                    # written+deleted+errors+ignored == total_input the invariant `unaccounted`
-                    # measures. Note this is about a row producing NO write, not about two rows
-                    # collapsing onto one `_id`: duplicate ids each report success, so they keep the
-                    # identity intact and `unaccounted` stays 0 (see the README's duplicate-id note).
-                    ignored += 1
-                elif outcome == ERROR:
-                    errors += 1
-                    if len(error_samples) < ERROR_SAMPLE_CAP:
-                        error_samples.append(_extract_error_sample(op_type, item))
-        # error_samples is JSON-encoded into a single string column: mapInPandas needs a flat,
-        # typed schema and can't carry a nested list<struct> of varying content cleanly.
-        yield pd.DataFrame({
-            "written": [written], "deleted": [deleted], "errors": [errors],
-            "ignored": [ignored], "coerced_nonfinite": [coerced_nonfinite],
-            "total_input": [total_input], "error_samples": [json.dumps(error_samples)],
-        })
-
-    return _write
-
-
-# --- serialize_in_spark path: ship pre-built NDJSON, classify the _bulk response ------------------
-# The default writer above builds each action IN PYTHON (build_action -> coerce_value -> streaming_bulk
-# serializes). When cfg.serialize_in_spark is set, spark_serialize.build_ndjson has ALREADY built the
-# whole `_bulk` action line (index/upsert "header\nsource", or a delete "header" with no source) in
-# Catalyst, so this writer does no per-row Python shaping or JSON encoding: it batches the pre-built
-# lines and hands them to
-# es.bulk(operations=...). elastic_transport's NdjsonSerializer forwards str/bytes list items VERBATIM
-# (utf-8 + a trailing newline, no json re-encode), so the JVM-built JSON is never re-serialized in
-# Python -- that pass-through is the whole point, it is what keeps the work off the GIL.
+# --- ship pre-built NDJSON, classify the _bulk response -------------------------------------------
+# spark_serialize.build_ndjson builds the whole `_bulk` action line in Catalyst (index/upsert
+# "header\nsource", or a delete "header" with no source), so this writer does no per-row Python
+# shaping or JSON encoding: it batches the pre-built lines and hands them to es.bulk(operations=...).
+# elastic_transport's NdjsonSerializer forwards str/bytes list items VERBATIM (utf-8 + a trailing
+# newline, no json re-encode), so the JVM-built JSON is never re-serialized in Python -- that
+# pass-through is the whole point, it is what keeps the work off the GIL.
 
 
 def iter_bulk_response_outcomes(items):
@@ -284,9 +96,8 @@ def iter_bulk_response_outcomes(items):
 
     Pure (no ES, no Spark) so the classification is unit-testable against canned responses. An item
     is `{op_type: body}` with `body["status"]` the per-document HTTP status (and `body["error"]` when
-    it failed); `ok` is a 2xx. Reuses `classify_bulk_result` so the WRITTEN/DELETED/IGNORED/ERROR
-    rules (including the delete-404 -> IGNORED suppression) are byte-for-byte identical to the
-    streaming_bulk path.
+    it failed); `ok` is a 2xx. Reuses `classify_bulk_result` for the WRITTEN/DELETED/IGNORED/ERROR
+    rules (including the delete-404 -> IGNORED suppression).
     """
     for item in items:
         # A well-formed item is {op_type: body}. Guard an empty/malformed item explicitly: ES never
@@ -308,10 +119,10 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
 
     `lines` is a list where each element is ONE row's action ("header\\nsource"), so es.bulk returns
     one response item per element, in order, and a retryable item maps back to its line by index.
-    Re-implements streaming_bulk's per-document retry (the connector treats this as load-bearing: the
-    _bulk API answers HTTP 200 even when items inside it fail, so transport-level retries never cover a
-    429'd document). Only items whose status is in cfg.retry_on_doc_status are retried, up to
-    cfg.max_retries_per_doc, with exponential backoff; everything else is tallied immediately.
+    Implements a per-document retry the connector treats as load-bearing: the _bulk API answers HTTP
+    200 even when items inside it fail, so transport-level retries never cover a 429'd document. Only
+    items whose status is in cfg.retry_on_doc_status are retried, up to cfg.max_retries_per_doc, with
+    exponential backoff; everything else is tallied immediately.
     """
     import time as _t
 
@@ -322,10 +133,9 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
             resp = es.bulk(operations=pending)
         except Exception as _e:  # noqa: BLE001
             # A whole-request transport failure (persistent 429/503, dropped connection) survived the
-            # client's transport_max_retries. The default path uses streaming_bulk(raise_on_exception
-            # =False), which records such a failure rather than letting it abort the partition. Mirror
-            # that: count every still-pending line as an ERROR (fail closed, surfaced via reconcile),
-            # instead of propagating and failing the whole mapInPandas partition on one chunk.
+            # client's transport_max_retries. Record it rather than letting it abort the partition:
+            # count every still-pending line as an ERROR (fail closed, surfaced via reconcile), instead
+            # of propagating and failing the whole mapInPandas partition on one chunk.
             counts["errors"] += len(pending)
             if len(error_samples) < ERROR_SAMPLE_CAP:
                 error_samples.append({"_id": None, "op_type": "bulk",
@@ -352,7 +162,7 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         if not retry_lines:
             return
         attempt += 1
-        # Mirror streaming_bulk's backoff: initial_backoff (2s) * 2**(attempt-1) => 2s, 4s, 8s, capped.
+        # Exponential backoff: initial_backoff (2s) * 2**(attempt-1) => 2s, 4s, 8s, capped at 30s.
         _t.sleep(min(2 ** attempt, 30))
         pending = retry_lines
 
@@ -361,22 +171,20 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     """Ship all of one partition-batch's pre-built NDJSON action `lines`, chunked by cfg.chunk_size,
     tallying into `counts` / `error_samples`.
 
-    `cfg.write_concurrency == 1` (default) chunks and ships serially -- EXACTLY the original path, no
-    threads. `> 1` fans the batch across that many worker threads, each shipping its OWN strided slice
-    with its OWN `_ship_ndjson_chunk` calls, so `write_concurrency` bulk requests are in flight at once
-    to fill the ES round-trip wait (the serialize_in_spark path's remaining serial bottleneck: the
-    per-row work is already off the GIL, but a partition shipped its chunks one blocking es.bulk at a
-    time). Strided slices (`lines[i::n]`) spread any positional ordering evenly across workers; order
-    does not matter, each action is independent. Each worker tallies into a PRIVATE counts dict + sample
-    list (no shared-state lock), merged here after the pool joins. This mirrors the structure of the
-    default path's `_iter_bulk_results` (which cannot be reused directly: it wraps `streaming_bulk`,
-    while this path ships pre-built lines via `es.bulk(operations=...)`).
+    `cfg.write_concurrency == 1` (default) chunks and ships serially, no threads. `> 1` fans the batch
+    across that many worker threads, each shipping its OWN strided slice with its OWN
+    `_ship_ndjson_chunk` calls, so `write_concurrency` bulk requests are in flight at once to fill the
+    ES round-trip wait. Without this a partition shipped its chunks one blocking es.bulk at a time --
+    the last serial bottleneck, since the per-row work is already off the GIL (built in Catalyst).
+    Strided slices (`lines[i::n]`) spread any positional ordering evenly across workers; order does not
+    matter, each action is independent. Each worker tallies into a PRIVATE counts dict + sample list
+    (no shared-state lock), merged here after the pool joins.
 
     A worker exception is re-raised on this thread after join (`f.result()`), so a partial write FAILS
     the partition rather than silently reporting the docs a dead worker never sent as a clean success
     -- the exact silent loss this module exists to prevent. (`_ship_ndjson_chunk` itself catches
     transport errors and counts them rather than raising, so in practice a worker raises only on a
-    programming error, but the guard is kept for the same reason the default path keeps it.)
+    programming error, but the guard is kept as a backstop.)
     """
     n = cfg.write_concurrency
     if n <= 1:
@@ -411,14 +219,13 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
 
 def make_ndjson_partition_writer(cfg: EsConfig):
     """mapInPandas writer for the serialize_in_spark path. Input has a single `_ndjson` column, one
-    pre-built action line per row (see spark_serialize.build_ndjson). Yields the SAME per-partition
-    summary schema as make_partition_writer, so _merge_partition_results / reconcile_or_raise are
-    unchanged. `coerced_nonfinite` is always 0 here: non-finite floats are turned to null in Spark
-    (build_ndjson), not counted per row -- documented as a delta of this mode. A null action line
-    (build_ndjson's signal for a null/non-finite id) RAISES here, failing the write unconditionally
-    like the default path's _require_id, rather than being counted as `unaccounted` (which would only
-    surface under raise_on_error=True). Shipping is delegated to `_ship_ndjson_lines`, which fans each
-    batch across `cfg.write_concurrency` worker threads (1 = serial, the original behavior).
+    pre-built action line per row (see spark_serialize.build_ndjson). Yields the per-partition summary
+    schema _merge_partition_results / reconcile_or_raise consume. `coerced_nonfinite` is always 0:
+    non-finite floats are turned to null in Spark (build_ndjson), not counted per row. A null action
+    line (build_ndjson's signal for a null/non-finite id) RAISES here, failing the write
+    unconditionally, rather than being counted as `unaccounted` (which would only surface under
+    raise_on_error=True). Shipping is delegated to `_ship_ndjson_lines`, which fans each batch across
+    `cfg.write_concurrency` worker threads (1 = serial).
     """
     def _write(iterator: "Iterator") -> "Iterator":
         import pandas as pd
@@ -434,18 +241,16 @@ def make_ndjson_partition_writer(cfg: EsConfig):
                 total_input += 1
                 # A null action line means build_ndjson hit a null/non-finite id (its only null-line
                 # source). RAISE here, failing the partition (and so the whole write) loudly and
-                # UNCONDITIONALLY -- exactly like the default path's _require_id KeyError, which fires
-                # regardless of raise_on_error. Do NOT merely count it as `unaccounted`: that only
-                # surfaces via reconcile_or_raise, which the batch default (raise_on_error=False)
-                # skips, so a null id would silently drop. Checked BEFORE dispatch so a null id fails
-                # the write before any worker ships. pandas renders a null object cell as None OR float
-                # NaN depending on dtype, so guard both (`line != line` is True only for NaN).
+                # UNCONDITIONALLY. Do NOT merely count it as `unaccounted`: that only surfaces via
+                # reconcile_or_raise, which the batch default (raise_on_error=False) skips, so a null
+                # id would silently drop. Checked BEFORE dispatch so a null id fails the write before
+                # any worker ships. pandas renders a null object cell as None OR float NaN depending on
+                # dtype, so guard both (`line != line` is True only for NaN).
                 if line is None or (isinstance(line, float) and line != line):
                     raise ValueError(
-                        "serialize_in_spark produced a null action line: the id_field value is "
-                        "null or non-finite (NaN/inf) in at least one row. Every row needs a "
-                        "non-null, finite id (same requirement as the default path's _require_id). "
-                        "Fix the id column, or leave id_field unset to let Elasticsearch assign ids.")
+                        "build_ndjson produced a null action line: the id_field value is null or "
+                        "non-finite (NaN/inf) in at least one row. Every row needs a non-null, finite "
+                        "id. Fix the id column, or leave id_field unset to let Elasticsearch assign ids.")
                 lines.append(line)
             if lines:
                 _ship_ndjson_lines(es, lines, cfg, counts, error_samples)
@@ -617,9 +422,9 @@ def _preflight(df, cfg: EsConfig) -> None:
     present = set(df.columns)
 
     if cfg.id_field is not None and cfg.id_field not in present:
-        # Without this, _require_id raises per-row on the executor mid-write, after earlier
-        # partitions may already have committed their documents. One driver-side failure before any
-        # write beats a partial write plus an opaque KeyError from inside mapInPandas.
+        # Without this, build_ndjson would reference a missing column and the write would fail deep
+        # inside mapInPandas, after earlier partitions may already have committed their documents. One
+        # driver-side failure before any write beats a partial write plus an opaque error.
         raise ValueError(
             f"id_field {cfg.id_field!r} is not a column in the DataFrame. "
             f"Available columns: {sorted(present)}. Every row needs this column to derive its "
@@ -650,26 +455,25 @@ def _preflight(df, cfg: EsConfig) -> None:
             "documents would stay in Elasticsearch (deleted=0, errors=0, reconciliation clean). "
             "Fix the name, or set has_deletes=False if this write has no deletes.")
 
-    if cfg.has_deletes and cfg.serialize_in_spark and cfg.delete_flag_column in present:
-        # The serialize_in_spark delete path routes each row in Catalyst with `flag === true`
-        # (spark_serialize.build_ndjson), which requires a real BooleanType column: Catalyst has no
-        # per-row equivalent of the default path's AmbiguousDeleteFlag raise, so a string/int flag
-        # cannot be parsed at the seam. A non-boolean flag would make `flag === true` evaluate to null
-        # for every row (string==boolean is a null-yielding type mismatch), so NO row would route to a
-        # delete and every intended deletion would silently become an upsert -- the exact silent loss
-        # the column-name check just above exists to prevent. Enforce the type on the driver instead.
-        # df.schema is safe here (sanitize_for_arrow already removed the VARIANT columns that make it
-        # throw on Spark Connect); typeName() avoids importing a pyspark type into this module.
+    if cfg.has_deletes and cfg.delete_flag_column in present:
+        # Deletes are routed in Catalyst with `flag === true` (spark_serialize.build_ndjson), which
+        # requires a real BooleanType column: Catalyst has no per-row equivalent of a raise on an
+        # ambiguous flag, so a string/int flag cannot be parsed at the seam. A non-boolean flag would
+        # make `flag === true` evaluate to null for every row (string==boolean is a null-yielding type
+        # mismatch), so NO row would route to a delete and every intended deletion would silently
+        # become an upsert -- the exact silent loss the column-name check just above exists to prevent.
+        # Enforce the type on the driver instead. df.schema is safe here (sanitize_for_arrow already
+        # removed the VARIANT columns that make it throw on Spark Connect); typeName() avoids importing
+        # a pyspark type into this module.
         flag_dt = next((f.dataType for f in df.schema.fields if f.name == cfg.delete_flag_column), None)
         if flag_dt is None or flag_dt.typeName() != "boolean":
             raise ValueError(
-                f"delete_flag_column {cfg.delete_flag_column!r} must be a boolean column when "
-                f"serialize_in_spark=True, but its type is "
-                f"{flag_dt.simpleString() if flag_dt is not None else 'unknown'}. This path routes "
-                "deletes in Spark via `flag === true`, which has no way to parse a string/int flag "
-                "(unlike the per-row path's allow-list); a non-boolean flag would route NO row to a "
-                "delete and silently upsert every intended deletion. Cast the column to boolean in "
-                "Spark (e.g. df.withColumn(col, col.cast('boolean'))) so the intent is unambiguous.")
+                f"delete_flag_column {cfg.delete_flag_column!r} must be a boolean column, but its "
+                f"type is {flag_dt.simpleString() if flag_dt is not None else 'unknown'}. Deletes are "
+                "routed in Spark via `flag === true`, which has no way to parse a string/int flag; a "
+                "non-boolean flag would route NO row to a delete and silently upsert every intended "
+                "deletion. Cast the column to boolean in Spark (e.g. "
+                "df.withColumn(col, col.cast('boolean'))) so the intent is unambiguous.")
 
     if cfg.require_existing_index:
         from elasticsearch import Elasticsearch
@@ -698,8 +502,10 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
       - 'deleted': successful delete-by-id ops (only non-zero when cfg.has_deletes).
       - 'errors': docs ES rejected (exact count).
       - 'ignored': delete-404 no-ops (deleting an already-absent doc: expected, not an error).
-      - 'coerced_nonfinite': values (inf/-inf/NaN) that had to become JSON null to be sent at all.
-        Non-zero means real numbers landed in ES as nulls, usually an upstream divide-by-zero.
+      - 'coerced_nonfinite': always 0. Non-finite floats (inf/-inf/NaN) are still turned to JSON null
+        in Spark (build_ndjson) so ES accepts the document, but this path does not count them per row
+        (to_json runs in the JVM, off the per-row Python that the old path counted in). Kept in the
+        result for shape stability; a caller needing that signal can pre-count in Spark.
       - 'total_input': rows handed to the writer.
       - 'unaccounted': input rows that produced none of those outcomes. Every row yields exactly one
         of them, so a positive value means rows were lost BELOW the per-document level (e.g. a
@@ -735,21 +541,15 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     df = normalize_timestamps_for_utc(df)
     # Preflight AFTER sanitize (so df.columns is safe to read) but BEFORE any row is written.
     _preflight(df, cfg)
-    # The per-partition summary schema is identical for both paths, so _merge_partition_results and
-    # reconcile_or_raise below don't care which writer produced it.
     summary_schema = ("written long, deleted long, errors long, ignored long, "
                       "coerced_nonfinite long, total_input long, error_samples string")
-    if cfg.serialize_in_spark:
-        # Build the whole `_bulk` action line in Catalyst (JVM), then ship the pre-built NDJSON with
-        # no per-row Python shaping/serialization. See spark_serialize.build_ndjson and
-        # make_ndjson_partition_writer. Opt-in; its fidelity contract differs from coerce_value.
-        from .spark_serialize import build_ndjson
-        nd = build_ndjson(df, cfg)
-        writer = make_ndjson_partition_writer(cfg)
-        rows = nd.mapInPandas(writer, summary_schema).collect()
-    else:
-        writer = make_partition_writer(cfg)
-        rows = df.mapInPandas(writer, summary_schema).collect()
+    # Build the whole `_bulk` action line in Catalyst (JVM) via build_ndjson, then ship the pre-built
+    # NDJSON with no per-row Python shaping/serialization (make_ndjson_partition_writer, fanned across
+    # write_concurrency worker threads). This is the only write path.
+    from .spark_serialize import build_ndjson
+    nd = build_ndjson(df, cfg)
+    writer = make_ndjson_partition_writer(cfg)
+    rows = nd.mapInPandas(writer, summary_schema).collect()
     result = _merge_partition_results(rows)
     if raise_on_error:
         reconcile_or_raise(result, index=cfg.index)
