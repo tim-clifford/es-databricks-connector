@@ -198,17 +198,18 @@ def test_config_serialize_in_spark_defaults_off():
     assert cfg.serialize_in_spark is False
 
 
-def test_config_warns_write_concurrency_with_serialize_in_spark():
+def test_config_write_concurrency_with_serialize_in_spark_does_not_warn():
     import warnings
-    # write_concurrency>1 has no effect on the serialize_in_spark path; must WARN (not silently ignore).
-    with pytest.warns(UserWarning, match="effect with serialize_in_spark"):
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i",
-                 serialize_in_spark=True, write_concurrency=4)
-    # No warning when the two are not combined.
+    # 0.9.0: write_concurrency now fans the serialize_in_spark path's chunk shipping
+    # (bulk._ship_ndjson_lines), so the old "has no effect" warning is gone. The combination must be
+    # accepted silently.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", serialize_in_spark=True)
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=4)
+        cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i",
+                       serialize_in_spark=True, write_concurrency=4)
+    assert cfg.write_concurrency == 4
+    # And the connection pool is sized to the concurrency so the workers are not capped.
+    assert cfg.client_kwargs().get("connections_per_node") == 4
 
 
 # --- _payload_columns (pure) ----------------------------------------------------------------
@@ -340,3 +341,78 @@ def test_preflight_rejects_non_boolean_delete_flag_with_serialize_in_spark():
 def test_preflight_accepts_boolean_delete_flag_with_serialize_in_spark():
     cfg = _cfg(has_deletes=True, delete_flag_column="d")
     _preflight(_fake_df([("id", "string"), ("d", "boolean")]), cfg)   # must not raise (require_existing_index=False)
+
+
+# --- _ship_ndjson_lines: the write_concurrency fan-out over pre-built lines --------------------
+# No Spark: _ship_ndjson_lines takes an ES client and a list of lines, so a thread-safe fake client
+# exercises the fan-out directly. The live end-to-end proof is integration test_concurrency_roundtrip.
+
+class _ThreadSafeFakeES:
+    """Returns 201 for every operation and records what it shipped. Thread-safe for fan-out tests."""
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self.chunks = []       # each es.bulk() call's operations list
+        self.all_ops = []      # every op line shipped, flattened
+
+    def bulk(self, operations=None, **kw):
+        ops = list(operations)
+        with self._lock:
+            self.chunks.append(ops)
+            self.all_ops.extend(ops)
+        return {"items": [{"index": {"status": 201}} for _ in ops]}
+
+
+def _zero_counts():
+    return {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+
+
+def test_ship_ndjson_lines_fans_all_lines_exactly_once():
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+    es = _ThreadSafeFakeES()
+    lines = [f"L{i}" for i in range(10)]
+    counts, samples = _zero_counts(), []
+    _ship_ndjson_lines(es, lines, _cfg(write_concurrency=3, chunk_size=2), counts, samples)
+    # every line shipped exactly once across the workers -- no drops, no duplicates
+    assert sorted(es.all_ops) == sorted(lines)
+    assert len(es.all_ops) == 10
+    assert counts["written"] == 10 and counts["errors"] == 0
+
+
+def test_ship_ndjson_lines_concurrency_matches_serial_tally():
+    # The whole point of the fan-out: identical accounting regardless of write_concurrency.
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+    lines = [f"L{i}" for i in range(7)]
+
+    def run(wc):
+        es = _ThreadSafeFakeES()
+        counts, samples = _zero_counts(), []
+        _ship_ndjson_lines(es, lines, _cfg(write_concurrency=wc, chunk_size=2), counts, samples)
+        return counts, sorted(es.all_ops)
+
+    serial_counts, serial_ops = run(1)
+    conc_counts, conc_ops = run(4)
+    assert serial_counts == conc_counts == {"written": 7, "deleted": 0, "ignored": 0, "errors": 0}
+    assert serial_ops == conc_ops == sorted(lines)
+
+
+def test_ship_ndjson_lines_merges_errors_and_samples_across_workers():
+    # Per-worker error tallies and (bounded) sample lists must merge correctly on join.
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+
+    class _SelectiveFakeES:
+        """400s any op line containing 'bad', 201s the rest."""
+        def bulk(self, operations=None, **kw):
+            items = []
+            for op in operations:
+                if "bad" in op:
+                    items.append({"index": {"status": 400, "_id": op, "error": {"reason": "boom"}}})
+                else:
+                    items.append({"index": {"status": 201}})
+            return {"items": items}
+
+    lines = [f"ok{i}" for i in range(8)] + [f"bad{i}" for i in range(3)]
+    counts, samples = _zero_counts(), []
+    _ship_ndjson_lines(_SelectiveFakeES(), lines, _cfg(write_concurrency=3, chunk_size=2), counts, samples)
+    assert counts["written"] == 8 and counts["errors"] == 3
+    assert len(samples) == 3 and all("boom" in s["reason"] for s in samples)

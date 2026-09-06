@@ -357,6 +357,58 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         pending = retry_lines
 
 
+def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: list) -> None:
+    """Ship all of one partition-batch's pre-built NDJSON action `lines`, chunked by cfg.chunk_size,
+    tallying into `counts` / `error_samples`.
+
+    `cfg.write_concurrency == 1` (default) chunks and ships serially -- EXACTLY the original path, no
+    threads. `> 1` fans the batch across that many worker threads, each shipping its OWN strided slice
+    with its OWN `_ship_ndjson_chunk` calls, so `write_concurrency` bulk requests are in flight at once
+    to fill the ES round-trip wait (the serialize_in_spark path's remaining serial bottleneck: the
+    per-row work is already off the GIL, but a partition shipped its chunks one blocking es.bulk at a
+    time). Strided slices (`lines[i::n]`) spread any positional ordering evenly across workers; order
+    does not matter, each action is independent. Each worker tallies into a PRIVATE counts dict + sample
+    list (no shared-state lock), merged here after the pool joins. This mirrors the structure of the
+    default path's `_iter_bulk_results` (which cannot be reused directly: it wraps `streaming_bulk`,
+    while this path ships pre-built lines via `es.bulk(operations=...)`).
+
+    A worker exception is re-raised on this thread after join (`f.result()`), so a partial write FAILS
+    the partition rather than silently reporting the docs a dead worker never sent as a clean success
+    -- the exact silent loss this module exists to prevent. (`_ship_ndjson_chunk` itself catches
+    transport errors and counts them rather than raising, so in practice a worker raises only on a
+    programming error, but the guard is kept for the same reason the default path keeps it.)
+    """
+    n = cfg.write_concurrency
+    if n <= 1:
+        for i in range(0, len(lines), cfg.chunk_size):
+            _ship_ndjson_chunk(es, lines[i:i + cfg.chunk_size], cfg, counts, error_samples)
+        return
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    slices = [lines[i::n] for i in range(n)]
+    # One private (counts, samples) pair per worker, so threads never touch shared state; merged below.
+    partials = [({"written": 0, "deleted": 0, "ignored": 0, "errors": 0}, []) for _ in range(n)]
+
+    def _worker(idx):
+        local_counts, local_samples = partials[idx]
+        sl = slices[idx]
+        for i in range(0, len(sl), cfg.chunk_size):
+            _ship_ndjson_chunk(es, sl[i:i + cfg.chunk_size], cfg, local_counts, local_samples)
+
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = [pool.submit(_worker, i) for i in range(n)]
+        for f in futures:
+            f.result()   # re-raise the first worker exception; a partial write must fail the partition
+
+    for local_counts, local_samples in partials:
+        for k in counts:
+            counts[k] += local_counts[k]
+        # Keep the merged sample list bounded exactly as the serial path does (ERROR_SAMPLE_CAP total).
+        if len(error_samples) < ERROR_SAMPLE_CAP and local_samples:
+            error_samples.extend(local_samples[:ERROR_SAMPLE_CAP - len(error_samples)])
+
+
 def make_ndjson_partition_writer(cfg: EsConfig):
     """mapInPandas writer for the serialize_in_spark path. Input has a single `_ndjson` column, one
     pre-built action line per row (see spark_serialize.build_ndjson). Yields the SAME per-partition
@@ -365,7 +417,8 @@ def make_ndjson_partition_writer(cfg: EsConfig):
     (build_ndjson), not counted per row -- documented as a delta of this mode. A null action line
     (build_ndjson's signal for a null/non-finite id) RAISES here, failing the write unconditionally
     like the default path's _require_id, rather than being counted as `unaccounted` (which would only
-    surface under raise_on_error=True).
+    surface under raise_on_error=True). Shipping is delegated to `_ship_ndjson_lines`, which fans each
+    batch across `cfg.write_concurrency` worker threads (1 = serial, the original behavior).
     """
     def _write(iterator: "Iterator") -> "Iterator":
         import pandas as pd
@@ -375,8 +428,8 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
         total_input = 0
         error_samples = []
-        buf = []
         for pdf in iterator:
+            lines = []
             for line in pdf["_ndjson"].values:
                 total_input += 1
                 # A null action line means build_ndjson hit a null/non-finite id (its only null-line
@@ -384,20 +437,18 @@ def make_ndjson_partition_writer(cfg: EsConfig):
                 # UNCONDITIONALLY -- exactly like the default path's _require_id KeyError, which fires
                 # regardless of raise_on_error. Do NOT merely count it as `unaccounted`: that only
                 # surfaces via reconcile_or_raise, which the batch default (raise_on_error=False)
-                # skips, so a null id would silently drop. pandas renders a null object cell as None
-                # OR float NaN depending on dtype, so guard both (`line != line` is True only for NaN).
+                # skips, so a null id would silently drop. Checked BEFORE dispatch so a null id fails
+                # the write before any worker ships. pandas renders a null object cell as None OR float
+                # NaN depending on dtype, so guard both (`line != line` is True only for NaN).
                 if line is None or (isinstance(line, float) and line != line):
                     raise ValueError(
                         "serialize_in_spark produced a null action line: the id_field value is "
                         "null or non-finite (NaN/inf) in at least one row. Every row needs a "
                         "non-null, finite id (same requirement as the default path's _require_id). "
                         "Fix the id column, or leave id_field unset to let Elasticsearch assign ids.")
-                buf.append(line)
-                if len(buf) >= cfg.chunk_size:
-                    _ship_ndjson_chunk(es, buf, cfg, counts, error_samples)
-                    buf = []
-        if buf:
-            _ship_ndjson_chunk(es, buf, cfg, counts, error_samples)
+                lines.append(line)
+            if lines:
+                _ship_ndjson_lines(es, lines, cfg, counts, error_samples)
         yield pd.DataFrame({
             "written": [counts["written"]], "deleted": [counts["deleted"]],
             "errors": [counts["errors"]], "ignored": [counts["ignored"]],

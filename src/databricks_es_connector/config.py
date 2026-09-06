@@ -240,22 +240,13 @@ class EsWriteConfig(EsConnection):
         # delete_flag_column is true becomes a delete-by-id (no source line). Its one added requirement
         # -- delete_flag_column must be a real BooleanType column -- needs the DataFrame schema, so it
         # is enforced in bulk._preflight (driver-side, once), not here where only field values exist.
-        # serialize_in_spark ships each partition's chunks SERIALLY (its bottleneck was the GIL-bound
-        # per-row work, now moved to the JVM, not the ES round-trip). write_concurrency only tunes the
-        # default path's per-partition thread-fan, so warn rather than silently ignore it here.
-        if self.serialize_in_spark and self.write_concurrency > 1:
-            warnings.warn(
-                f"write_concurrency={self.write_concurrency} has NO effect with serialize_in_spark=True: "
-                "that path ships each partition's bulk chunks serially (parallelism comes from the "
-                "Spark partition count). Raise the partition count / spark.sql.shuffle.partitions "
-                "instead, or leave write_concurrency=1.",
-                UserWarning, stacklevel=4)
 
     def client_kwargs(self) -> dict:
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.
 
-        Each partition's ES client is shared by `write_concurrency` worker threads (see
-        bulk._iter_bulk_results). elastic_transport's per-node pool defaults to ~10 connections, so a
+        Each partition's ES client is shared by `write_concurrency` worker threads (the default path's
+        bulk._iter_bulk_results, or the serialize_in_spark path's bulk._ship_ndjson_lines).
+        elastic_transport's per-node pool defaults to ~10 connections, so a
         higher write_concurrency would silently cap the in-flight requests below the configured value;
         sizing the pool to the concurrency gives every worker its own connection. Left at the client
         default for write_concurrency == 1 (the serial path), so nothing changes there.
