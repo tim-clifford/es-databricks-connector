@@ -267,8 +267,10 @@ def build_ndjson(df, cfg: EsConfig):
         # check. Only float/double ids can be non-finite; other id types pass through unchanged.
         # id_col reads the ORIGINAL column (the _source rewrites above are built as separate
         # expressions, not applied to df), so a date/ntz id_field renders its raw calendar/wall-clock
-        # string here (matching the default path's str(value)) rather than the epoch-millis we store
-        # in _source. Only its _source copy is epoch; the _id stays the human-readable value.
+        # string here (a human-readable value close to the default path's str(value)) rather than the
+        # epoch-millis we store in _source. Only its _source copy is epoch; the _id stays the
+        # human-readable value. The exact string is Spark's cast, which is NOT guaranteed identical to
+        # Python str() for a non-string id -- see the fail-closed note below.
         id_dt = field_types.get(cfg.id_field)
         id_col = F.col(cfg.id_field)
         if isinstance(id_dt, (DoubleType, FloatType)):
@@ -281,9 +283,12 @@ def build_ndjson(df, cfg: EsConfig):
     # writer (make_ndjson_partition_writer) RAISES on a null line, failing the write unconditionally
     # -- mirroring the default path's _require_id, which raises regardless of raise_on_error -- rather
     # than shipping `"_id": null` (ES might auto-assign a random id and duplicate the row on replay).
-    # Note: a numeric id_field is rendered here by Spark `cast(string)`, which can differ from the
-    # default path's Python `str()` for float/decimal ids (e.g. scientific notation); use a string id
-    # if you mix the two write paths for the same data and rely on _id equality.
+    # Note: a NON-STRING id_field is rendered here by Spark `cast(string)`, which is NOT guaranteed to
+    # match the default path's Python `str()`: a float/decimal id can differ (e.g. scientific
+    # notation), and a sub-second timestamp/timestamp_ntz id can differ in trailing-zero/fraction
+    # rendering. Only a STRING id_field is byte-identical across the two paths; use one if you mix the
+    # two write paths for the same data and rely on _id equality. (The _source epoch-millis DO match
+    # across paths -- this caveat is about the human-readable _id only.)
     if cfg.id_field:
         ndjson = F.when(id_col.isNull(), F.lit(None).cast("string")).otherwise(ndjson)
     return df.select(ndjson.alias("_ndjson"))
