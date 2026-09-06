@@ -6,26 +6,30 @@ breaks. This checklist is the connector's most important review gate.
 
 ## The places, in dependency order
 
-1. **`src/databricks_es_connector/transform.py` -> `coerce_value`**
-   The write transform: Spark/pandas value -> JSON-serializable ES `_source` value. Add a branch (or
-   adjust one). Remember `coerce_value` runs per row on the executor, after Arrow, so it sees pandas
-   /numpy scalars, `dict` (structs/maps), `list`/`ndarray` (arrays). Keep the total-fallback `str(v)`
-   last so an unforeseen type never crashes `helpers.bulk`.
+1. **`src/databricks_es_connector/spark_serialize.py` -> `build_ndjson`**
+   The write transform: it builds the whole `_bulk` action line in Spark with `to_json` (Catalyst,
+   JVM). Add or adjust a branch here (the recursive `_rewrite_date_ntz` / `_null_nonfinite` walks over
+   struct/array/map, or the header/source expressions). This is column-level Catalyst, NOT per-row
+   Python: you work with pyspark `Column` expressions and `df.schema` types, and `to_json` does the
+   actual serialization. If a type needs Arrow-hostile handling or timestamp normalization first, that
+   is the sixth place (`spark_prep.py`) below.
 
 2. **`src/databricks_es_connector/read_transform.py` -> `read_coerce`**
    The EXACT inverse for the declared type token (`"timestamp"`, `"decimal(10,2)"`, `"struct<...>"`,
    etc.). If the write side is genuinely one-way (e.g. variant->string), the inverse is a documented
    passthrough, say so in a comment and in the README.
 
-3. **`tests/test_read_transform.py`**
-   The round-trip **oracle**: `read_coerce(coerce_value(x), "type") == x`, or `== <documented
-   delta>` if one-way. This is the primary regression guard for the whole contract. Add positive
-   cases AND the edge cases (null, empty container, nesting, the boundary that makes it one-way).
+3. **`tests/test_read_transform.py`** (the read half) **AND an `integration_tests/` fixture** (the
+   write<->read whole). `build_ndjson` only runs in Spark, so the round-trip oracle lives in the
+   integration tier now, not offline. Unit-test `read_coerce` against the stored form directly
+   (`read_coerce(<epoch-millis / base64 / float / JSON string>, "type") == x`, or `== <documented
+   delta>` if one-way) for a fast red-before-green on the read inverse; add positive AND edge cases
+   (null, empty container, nesting, the boundary that makes it one-way).
 
-4. **An `integration_tests/` fixture** (live Spark + ES)
-   Prove it end-to-end, because `tests/` can't run Spark's Arrow conversion or ES itself. Usually
-   `test_datatype_coverage.py` (the wide one-row-per-type matrix) and/or `test_read_roundtrip.py`.
-   For timestamps, also `test_timezone_utc.py` under a non-UTC session.
+4. **An `integration_tests/` fixture** (live Spark + ES) -- the write<->read oracle
+   Prove it end-to-end, because `tests/` can't run `to_json`, Spark's Arrow conversion, or ES itself.
+   Usually `test_datatype_coverage.py` (the wide one-row-per-type matrix) and/or
+   `test_read_roundtrip.py`. For timestamps, also `test_timezone_utc.py` under a non-UTC session.
 
 5. **README "Datatype coverage" + "Read fidelity" tables** (and `.agents/skills/es-connector/references/1-fidelity-model.md`)
    The documented contract customers read. Update the write table, the read-inverse table, and the
@@ -60,14 +64,14 @@ instead of a datetime. The complete fix touched:
 3. `integration_tests/test_read_roundtrip.py`: an `s_ts_ntz` column read back naive against live ES;
    `test_datatype_coverage.py` / `test_timezone_utc.py` assert NTZ is unaffected by the session zone.
 4. README: `timestamp_ntz` rows added to both the write and read-inverse tables.
-(`coerce_value` needed no change here, the write was already correct, which is itself the tell:
-always check whether the gap is on the write side, the read side, or both.)
+(the write side needed no change here, it was already correct, which is itself the tell: always
+check whether the gap is on the write side (`build_ndjson`), the read side (`read_coerce`), or both.)
 
 ## Review checklist for a PR that touches transforms
 
-- [ ] `coerce_value` and `read_coerce` are still exact inverses (or the delta is newly documented).
-- [ ] A `tests/test_read_transform.py` oracle case exists and was shown to FAIL without the change.
-- [ ] An integration fixture covers it live (and under a non-UTC session if it's a timestamp).
+- [ ] `build_ndjson` (`to_json`) and `read_coerce` are still exact inverses (or the delta is newly documented).
+- [ ] A `tests/test_read_transform.py` case covers the read inverse against the stored form, shown to FAIL without the change.
+- [ ] An integration fixture covers the write<->read round-trip live (and under a non-UTC session if it's a timestamp).
 - [ ] README write + read tables and ref 1 updated; one-way-delta list correct.
 - [ ] If Arrow-hostile/timestamp: `spark_prep.py` handles it, with `tests/test_spark_prep.py` cases.
 - [ ] `scripts/check_readme_sync.py` passes (new fixture/module documented).

@@ -218,7 +218,7 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
 
 
 def make_ndjson_partition_writer(cfg: EsConfig):
-    """mapInPandas writer for the serialize_in_spark path. Input has a single `_ndjson` column, one
+    """mapInPandas writer for the write path. Input has a single `_ndjson` column, one
     pre-built action line per row (see spark_serialize.build_ndjson). Yields the per-partition summary
     schema _merge_partition_results / reconcile_or_raise consume. `coerced_nonfinite` is always 0:
     non-finite floats are turned to null in Spark (build_ndjson), not counted per row. A null action
@@ -502,10 +502,10 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
       - 'deleted': successful delete-by-id ops (only non-zero when cfg.has_deletes).
       - 'errors': docs ES rejected (exact count).
       - 'ignored': delete-404 no-ops (deleting an already-absent doc: expected, not an error).
-      - 'coerced_nonfinite': always 0. Non-finite floats (inf/-inf/NaN) are still turned to JSON null
-        in Spark (build_ndjson) so ES accepts the document, but this path does not count them per row
-        (to_json runs in the JVM, off the per-row Python that the old path counted in). Kept in the
-        result for shape stability; a caller needing that signal can pre-count in Spark.
+      - 'coerced_nonfinite': always 0. Non-finite floats (inf/-inf/NaN) are turned to JSON null in
+        Spark (build_ndjson) so ES accepts the document, but they are not counted (to_json runs in the
+        JVM, with no per-row Python step to count them). Kept in the result for shape stability; a
+        caller needing that signal can pre-count in Spark.
       - 'total_input': rows handed to the writer.
       - 'unaccounted': input rows that produced none of those outcomes. Every row yields exactly one
         of them, so a positive value means rows were lost BELOW the per-document level (e.g. a

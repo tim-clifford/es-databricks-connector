@@ -7,7 +7,7 @@ description: >
   and follows README.md; do not load this merely to invoke bulk_write / read_index in an
   application). Use when modifying any file under src/databricks_es_connector/, adding or altering a
   Spark datatype's write transform or read inverse, touching the write path (sanitize_for_arrow /
-  timestamp normalization / coerce_value / bulk) or the read path (read_index / read_coerce) as
+  timestamp normalization / build_ndjson / bulk) or the read path (read_index / read_coerce) as
   CODE, debugging a data-fidelity or round-trip regression in the transforms, reasoning about the
   Elasticsearch behavior the connector depends on (dynamic mapping, term/keyword, timezone,
   coercion, _source-vs-indexed), running the integration tier on FEVM serverless, reviewing this
@@ -28,9 +28,10 @@ the README explicitly documents as one-way.
 
 **Public API** (`src/databricks_es_connector/__init__.py`): `bulk_write`, `read_index`,
 `make_foreach_batch`, `reconcile_or_raise`, configs (`EsWriteConfig`, `EsReadConfig`, `EsConnection`,
-and the `EsConfig` alias = `EsWriteConfig`), the pure transforms `coerce_value` / `read_coerce` /
-`to_es_source` / `sanitize_for_arrow`, and the exceptions `EsWriteError` / `AmbiguousDeleteFlag` /
-`ReadSchemaMismatch`.
+and the `EsConfig` alias = `EsWriteConfig`), `read_coerce` (the read inverse), `sanitize_for_arrow`,
+and the exceptions `EsWriteError` / `ReadSchemaMismatch`. (0.9.0 removed the pure-Python write
+transforms `coerce_value` / `to_es_source` and `AmbiguousDeleteFlag` when the per-row write path was
+deleted.)
 
 **Write path** (`bulk_write` in `bulk.py`) runs, in order:
 1. `sanitize_for_arrow(df)` (`spark_prep.py`, Spark-side): serializes Arrow-hostile columns
@@ -49,12 +50,15 @@ and the `EsConfig` alias = `EsWriteConfig`), the pure transforms `coerce_value` 
    closure, which would put an HTTP round-trip on every executor. This is the ONLY layer that can
    make these checks: below it a row is a dict, and `row.get(name)` cannot distinguish an absent
    column from one that is present-but-null (which must stay legal).
-4. `df.mapInPandas(writer, ...)` (per-partition, executor-side): each row dict goes through
-   `coerce_value` (`transform.py`), the pure-Python value shaper, then `build_action` /
-   `to_es_source` build the ES bulk action; `helpers.streaming_bulk` ships it, yielding one result
-   per document so each outcome is classified individually (`classify_bulk_result`).
-5. `_merge_partition_results(rows)` sums the per-partition counts and derives `unaccounted`.
-   `raise_on_error=True` then applies `reconcile_or_raise`.
+4. `build_ndjson(df, cfg)` (`spark_serialize.py`, Spark-side): builds the whole `_bulk` action line
+   per row in Catalyst with `to_json` (index/upsert "header\nsource", or a delete "header" for a row
+   whose boolean `delete_flag_column` is true) -> a one-column `_ndjson` DataFrame. The JVM does the
+   document serialization; no per-row Python. This is the only write path.
+5. `df.mapInPandas(make_ndjson_partition_writer(cfg), ...)` (per-partition, executor-side): ships the
+   pre-built NDJSON lines via `es.bulk(operations=...)`, fanned across `cfg.write_concurrency` worker
+   threads (`_ship_ndjson_lines`), classifying each response item individually (`classify_bulk_result`
+   / `iter_bulk_response_outcomes`). Then `_merge_partition_results(rows)` sums the per-partition
+   counts and derives `unaccounted`; `raise_on_error=True` applies `reconcile_or_raise`.
 
 **Read path** (`read_index` in `read.py`): opens a Point-in-Time, fans out
 `spark.range(num_slices).mapInPandas(...)` (pass `num_slices=1` for a single unsliced reader on small
@@ -70,9 +74,11 @@ non-serializable crosses the wire).
 
 ## The fidelity contract (read this before touching any transform)
 
-`coerce_value` (write) and `read_coerce` (read) MUST stay exact inverses, except for the documented
-one-way deltas: **decimal** precision beyond ~15-17 sig figs, **sub-millisecond timestamp** floor,
-**float32** widening. Everything else round-trips exactly. See
+`build_ndjson` / `to_json` (write) and `read_coerce` (read) MUST stay exact inverses, except for the
+documented one-way deltas: **decimal** *fractional* precision beyond ~15-17 sig figs (integer decimals
+are exact) and **sub-millisecond timestamp** floor. Everything else round-trips exactly -- including
+`float` (32-bit), which `to_json` renders as its short decimal repr and reads back into a `FLOAT`
+unchanged (0.9.0 dropped the old float32-widening delta, three -> two). See
 [references/1-fidelity-model.md](references/1-fidelity-model.md) for the full per-type table (stored
 form, inverse, and which deltas are expected), and the crucial `_source`-vs-indexed distinction that
 explains why ES dynamic-mapping coercion does NOT break the connector round-trip.
@@ -82,10 +88,13 @@ explains why ES dynamic-mapping coercion does NOT break the connector round-trip
 When you add or change how a Spark datatype is handled, **five things must move together** or fidelity
 silently breaks. This is the connector's single most error-prone surface:
 
-1. `transform.py::coerce_value`: the write transform (Spark value -> ES `_source`).
+1. `spark_serialize.py::build_ndjson`: the write transform (Spark value -> ES `_source`), built in
+   Catalyst with `to_json`.
 2. `read_transform.py::read_coerce`: the exact read inverse for the declared type.
-3. `tests/test_read_transform.py`: the pure round-trip **oracle** (`read_coerce(coerce_value(x)) == x`).
-4. An `integration_tests/` fixture: the same round-trip proven live against real Spark + ES.
+3. `tests/test_read_transform.py`: the read inverse against the stored form (`read_coerce(<stored>,
+   "type") == x`) -- the fast offline half of the oracle.
+4. An `integration_tests/` fixture: the write<->read round-trip proven live against real Spark + ES
+   (the whole oracle, since `to_json` only runs in Spark).
 5. The README "Datatype coverage" + "Read fidelity" tables: the documented contract.
 
 `spark_prep.py` (VARIANT/INTERVAL, timestamp normalization) is a sixth place when the type is
@@ -134,10 +143,11 @@ is the doc most prone to silent drift (it restates the others), so it is explici
 
 ## Critical rules
 
-- **Never let `coerce_value` and `read_coerce` drift apart.** A change to one needs the inverse in
-  the other, or the round-trip oracle in `tests/test_read_transform.py` must be updated with a
-  *deliberate, documented* reason (a new one-way delta added to the README). Red-before-green: a new
-  fidelity test must fail without the change.
+- **Never let `build_ndjson` (`to_json`) and `read_coerce` drift apart.** A change to the write side
+  needs the inverse in `read_coerce`, or a *deliberate, documented* reason (a one-way delta added to
+  the README). The read inverse has a fast offline test (`tests/test_read_transform.py`, red-before-
+  green against the stored form); the write<->read round-trip is proven live in the integration tier,
+  since `to_json` only runs in Spark.
 - **`df.schema` is forbidden on a possibly-VARIANT DataFrame** (Spark Connect throws). Use the
   `DESCRIBE`-over-temp-view path already in `spark_prep.py`.
 - **Timestamp normalization runs after sanitize, never before**: sanitize removes the VARIANT
