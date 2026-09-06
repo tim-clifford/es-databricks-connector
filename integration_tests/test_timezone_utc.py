@@ -54,9 +54,7 @@ _ROW_SQL = """
     map('k', TIMESTAMP'2021-01-01 00:00:00Z')             AS s_map_ts,
     named_struct('a', array(TIMESTAMP'2021-01-01 00:00:00Z')) AS s_struct_array_ts,
     TIMESTAMP_NTZ'2021-06-01 12:00:00'                    AS s_ntz,
-    DATE'2021-01-01'                                      AS s_date,
-    map(DATE'2021-01-01', 1)                              AS s_map_date_key,  -- map<date,int>: key -> epoch
-    named_struct('m', map(TIMESTAMP_NTZ'2021-06-01 12:00:00', 7)) AS s_struct_map_ntz_key  -- ntz map key, nested
+    DATE'2021-01-01'                                      AS s_date
 """
 
 
@@ -163,7 +161,7 @@ class TestTimezoneEpochStability(NotebookTestFixture):
     def test_utc_and_non_utc_sessions_agree(self, path):
         utc, ny = self.by_path[path]["utc"], self.by_path[path]["ny"]
         cols = ["s_ts", "s_ts_preepoch", "s_struct_ts", "s_array_ts", "s_map_ts",
-                "s_struct_array_ts", "s_ntz", "s_date", "s_map_date_key", "s_struct_map_ntz_key"]
+                "s_struct_array_ts", "s_ntz", "s_date"]
         diffs = {c: (utc.get(c), ny.get(c)) for c in cols if utc.get(c) != ny.get(c)}
         assert not diffs, f"[{path}] session-dependent epochs (fix regressed): {diffs}"
 
@@ -173,19 +171,9 @@ class TestTimezoneEpochStability(NotebookTestFixture):
     def test_write_paths_agree(self, session):
         d, s = self.by_path["default"][session], self.by_path["spark"][session]
         cols = ["s_ts", "s_ts_preepoch", "s_struct_ts", "s_array_ts", "s_map_ts",
-                "s_struct_array_ts", "s_ntz", "s_date", "s_map_date_key", "s_struct_map_ntz_key"]
+                "s_struct_array_ts", "s_ntz", "s_date"]
         diffs = {c: (d.get(c), s.get(c)) for c in cols if d.get(c) != s.get(c)}
         assert not diffs, f"[{session}] default vs serialize_in_spark diverge: {diffs}"
-
-    # --- date/ntz MAP KEYS convert to epoch-millis on both paths (Isaac Review finding): a map key
-    #     is rendered by the default path's _coerce_key as epoch-millis; the Spark path must match
-    #     (build_ndjson transform_keys), not leave an ISO-string key. The ntz case is nested in a
-    #     struct, which also exercises the null-branch type staying map<long,int>, not map<ntz,int>. ---
-    @pytest.mark.parametrize("path", PATHS)
-    def test_date_ntz_map_keys_are_epoch_millis(self, path):
-        utc = self.by_path[path]["utc"]
-        assert utc["s_map_date_key"] == {str(DATE_MIDNIGHT): 1}, (path, utc["s_map_date_key"])
-        assert utc["s_struct_map_ntz_key"] == {"m": {str(NTZ_AS_UTC): 7}}, (path, utc["s_struct_map_ntz_key"])
 
 
 # COMMAND ----------

@@ -34,8 +34,11 @@ differ (rendering verified live via a to_json probe):
     make_ndjson_partition_writer RAISES on it, failing the write UNCONDITIONALLY (like the default
     path's _require_id, which raises regardless of raise_on_error) -- rather than shipping
     `"_id": null` and trusting ES not to auto-assign a random id (which would duplicate on replay).
-Everything else (nested structs/arrays/maps, binary as base64, timestamp/date/timestamp_ntz all as
-epoch-millis, kept null fields) matches.
+Everything else (nested structs/arrays/map VALUES, binary as base64, timestamp/date/timestamp_ntz all
+as epoch-millis, kept null fields) matches. The one carve-out is a map KEY of a non-string type
+(temporal/decimal/binary): to_json stringifies it to its own form (a temporal key -> its ISO string)
+rather than the default path's _coerce_key rendering (epoch-millis) -- see the MapType branch of
+_rewrite_date_ntz. A map keyed by a raw temporal value is pathological; use string/int map keys.
 
 pyspark is imported lazily inside the function so the pure config/transform layers stay importable
 without Spark.
@@ -94,7 +97,9 @@ def _type_has_date_or_ntz(dt) -> bool:
     if isinstance(dt, ArrayType):
         return _type_has_date_or_ntz(dt.elementType)
     if isinstance(dt, MapType):
-        return _type_has_date_or_ntz(dt.keyType) or _type_has_date_or_ntz(dt.valueType)
+        # Map KEY intentionally NOT walked: keys are not temporally converted on this path (see the
+        # MapType branch of _rewrite_date_ntz); only the VALUE side is rewritten.
+        return _type_has_date_or_ntz(dt.valueType)
     return False
 
 
@@ -113,7 +118,9 @@ def _epoch_type(dt):
     if isinstance(dt, ArrayType):
         return ArrayType(_epoch_type(dt.elementType), dt.containsNull)
     if isinstance(dt, MapType):
-        return MapType(_epoch_type(dt.keyType), _epoch_type(dt.valueType), dt.valueContainsNull)
+        # keyType left unchanged (map keys are not temporally rewritten), so this null-branch literal
+        # type matches the rebuilt map, whose keys are untouched and only values converted.
+        return MapType(dt.keyType, _epoch_type(dt.valueType), dt.valueContainsNull)
     return dt
 
 
@@ -167,17 +174,15 @@ def _rewrite_date_ntz(col, dt):
     if isinstance(dt, ArrayType):
         return F.transform(col, lambda e: _rewrite_date_ntz(e, dt.elementType))
     if isinstance(dt, MapType):
-        # Rewrite KEYS as well as values: the default path's `transform._coerce_key` converts a
-        # date/ntz map key to epoch-millis (JSON keys are strings, so it renders "1609459200000"),
-        # and `_epoch_type` already declares such a key as LongType. Converting the key here keeps the
-        # two write paths' _source identical for date/ntz-keyed maps AND keeps the rebuilt map's type
-        # (`map<long,V>`) consistent with the null-branch literal a containing struct casts to.
-        out = col
-        if _type_has_date_or_ntz(dt.keyType):
-            out = F.transform_keys(out, lambda k, v: _rewrite_date_ntz(k, dt.keyType))
-        if _type_has_date_or_ntz(dt.valueType):
-            out = F.transform_values(out, lambda k, v: _rewrite_date_ntz(v, dt.valueType))
-        return out
+        # VALUES only. Map KEYS are deliberately NOT temporally converted on the serialize_in_spark
+        # path: `to_json` stringifies a temporal map key to its ISO form, which differs from the
+        # default path's `transform._coerce_key` (epoch-millis) -- a documented divergence (README).
+        # Rewriting keys with F.transform_keys was tried and rejected: it (a) RAISES on two
+        # sub-millisecond-distinct keys that floor to the same epoch (the default path silently keeps
+        # the last), and (b) still would not cover TimestampType keys (spark_prep leaves map keys
+        # untouched), so it cannot make the class consistent anyway. A map keyed by a raw temporal
+        # value is pathological; use string/int map keys with serialize_in_spark for exact key parity.
+        return F.transform_values(col, lambda k, v: _rewrite_date_ntz(v, dt.valueType))
     return col
 
 

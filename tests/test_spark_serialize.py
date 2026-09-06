@@ -291,8 +291,8 @@ def test_epoch_type_maps_date_ntz_to_long_recursively():
     # array/map element/value types recurse too
     assert isinstance(_epoch_type(ArrayType(DateType())).elementType, LongType)
     assert isinstance(_epoch_type(MapType(StringType(), TimestampNTZType())).valueType, LongType)
-    # a date/ntz map KEY also maps to Long: _rewrite_date_ntz converts such keys (transform_keys), so
-    # the rebuilt map<long,V> must match this null-branch type, and it matches the default path's
-    # _coerce_key (epoch-millis) rendering.
-    mk = _epoch_type(MapType(DateType(), IntegerType()))
-    assert isinstance(mk.keyType, LongType) and isinstance(mk.valueType, IntegerType)
+    # a date/ntz map KEY is left UNCHANGED (map keys are not temporally converted on this path), so the
+    # null-branch literal type matches the rebuilt map whose keys are untouched; only the VALUE side of
+    # a map is mapped to Long.
+    mk = _epoch_type(MapType(DateType(), TimestampNTZType()))
+    assert isinstance(mk.keyType, DateType) and isinstance(mk.valueType, LongType)
