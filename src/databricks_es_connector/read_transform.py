@@ -1,17 +1,17 @@
-"""Pure-Python inverse of `transform.coerce_value`: ES `_source` value -> the value Spark expects
-for a declared target type. No Spark, no ES client: unit-testable, and the single coercion oracle
-shared by the distributed reader (read.py).
+"""Pure-Python inverse of the write serializer (`spark_serialize.build_ndjson` / `to_json`): ES
+`_source` value -> the value Spark expects for a declared target type. No Spark, no ES client:
+unit-testable, and the single coercion oracle shared by the distributed reader (read.py).
 
 The read path requires the caller to declare a Spark schema. That is deliberate: several
 write transforms are documented as one-way and are NOT invertible from `_source` alone:
   - a `date`/`timestamp` is stored as an epoch-millis integer (indistinguishable from a plain long),
-  - a `decimal` is stored as a float,
+  - a `decimal` is stored as a JSON number,
   - `binary` is stored as a base64 string,
   - `variant`/`interval` are stored as strings,
 so only the caller's declared type tells us how to turn the stored value back. Each branch here is
-the exact inverse of a `transform.coerce_value` branch; the accepted round-trip deltas are precisely
-those the README datatype table documents (decimal precision, sub-millisecond timestamp, float32
-widening): reads introduce no new lossiness.
+the exact inverse of a write serialization; the accepted round-trip deltas are precisely those the
+README datatype table documents (sub-millisecond timestamp floor, and a `decimal` with fractional
+precision beyond double's ~15-17 sig figs): reads introduce no new lossiness.
 
 Target types are given as type *tokens* rather than pyspark objects, so this module stays importable
 without Spark for local unit testing. read.py maps a pyspark DataType to a token before calling in.
@@ -134,10 +134,10 @@ _EPOCH_UTC = _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)
 
 
 def _epoch_millis_to_datetime(v: Any) -> _dt.datetime:
-    """Inverse of transform._to_epoch_millis for a timestamp: epoch-millis int -> aware UTC datetime.
+    """Inverse of the timestamp write: epoch-millis int -> aware UTC datetime.
 
-    Mirrors the write side's UTC treatment: writes floor to the millisecond in UTC, so we read back
-    in UTC. Sub-millisecond precision was dropped on write (documented), so this is exact to the ms.
+    Mirrors the write's UTC treatment: writes floor to the millisecond in UTC, so we read back in UTC.
+    Sub-millisecond precision was dropped on write (documented), so this is exact to the ms.
 
     Uses integer timedelta arithmetic (epoch + timedelta(milliseconds=ms)) rather than
     `fromtimestamp(ms / 1000)`: the float division loses sub-ms resolution at large magnitudes and
@@ -149,10 +149,10 @@ def _epoch_millis_to_datetime(v: Any) -> _dt.datetime:
 def _epoch_millis_to_naive_datetime(v: Any) -> _dt.datetime:
     """Inverse of the write for a `timestamp_ntz`: epoch-millis int -> NAIVE datetime.
 
-    A Spark `timestamp_ntz` is a zoneless wall-clock; the write side reads that wall-clock as UTC
-    to pick a deterministic epoch (transform._to_epoch_millis). The symmetric read reconstructs the
-    same wall-clock and drops the zone, so the value declared `timestamp_ntz` comes back naive (as
-    Spark expects) rather than tz-aware. Exact to the ms, same as the aware path."""
+    A Spark `timestamp_ntz` is a zoneless wall-clock; the write reads that wall-clock as UTC to pick a
+    deterministic epoch. The symmetric read reconstructs the same wall-clock and drops the zone, so
+    the value declared `timestamp_ntz` comes back naive (as Spark expects) rather than tz-aware.
+    Exact to the ms, same as the aware path."""
     return _epoch_millis_to_datetime(v).replace(tzinfo=None)
 
 
@@ -171,9 +171,9 @@ def read_coerce(value: Any, target: Any) -> Any:
       - a container tuple: ("array", elem), ("map", key, val), ("struct", [(name, sub), ...]).
         read.py builds these from the declared pyspark DataType, so no string parsing happens here.
 
-    null/missing -> None for every type. Each non-null branch is the inverse of a coerce_value
-    transform; anything already JSON-native (string/number/bool) passes through with the target's
-    interpretation applied.
+    null/missing -> None for every type. Each non-null branch is the inverse of a write serialization;
+    anything already JSON-native (string/number/bool) passes through with the target's interpretation
+    applied.
 
     A declared type the reader cannot honor (char/varchar/void) raises ReadSchemaMismatch. That is
     checked BEFORE the null branch: the type is wrong whatever the value happens to be, so a column
@@ -270,17 +270,15 @@ def read_coerce(value: Any, target: Any) -> Any:
             # bool() on a string is truthiness, so a stored "false"/"0"/"no" would read back as
             # True: the value inverts, silently, and a boolean column is exactly where nobody
             # re-checks. Parse an explicit allow-list in BOTH directions and refuse anything else,
-            # for the same reason `transform._is_delete_flagged` does on the write side: both
-            # possible defaults are wrong. Strings arise when reading an index the connector did
-            # not write; a connector round-trip stores real JSON booleans and skips this branch.
+            # because both possible defaults are wrong. Strings arise when reading an index the
+            # connector did not write; a connector round-trip stores real JSON booleans and skips
+            # this branch.
             #
-            # It is NOT a mirror of that function on one input: an empty/whitespace string. There it
-            # means "no flag present", and absent must mean "not a delete", so it returns False.
-            # Here the caller has DECLARED this column boolean and ES stored a string, so "" is a
-            # value that does not parse, not an absence -- a genuine null reads as None several
-            # branches above and never reaches here. Returning False would invent a datum the source
-            # does not contain, in the one column type where nobody re-checks. The asymmetry is
-            # deliberate: the two functions answer different questions about the same characters.
+            # An empty/whitespace string does NOT parse to False here: the caller has DECLARED this
+            # column boolean and ES stored a string, so "" is a value that does not parse, not an
+            # absence -- a genuine null reads as None several branches above and never reaches here.
+            # Returning False would invent a datum the source does not contain, in the one column type
+            # where nobody re-checks.
             s = value.strip().lower()
             if s in _BOOL_TRUE_STRINGS:
                 return True

@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.8.1)
+# Production Readiness / Known Limitations (0.9.0)
 
 `databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
 bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -93,10 +93,11 @@ Hardening still needed before production for SIEM/audit data:
   on the indexed value rather than on a `read_index` round-trip.
 - **Updates & deletes.** Inserts/upserts via deterministic `_id`, and deletes via `has_deletes` +
   `delete_flag_column` (emitting delete-by-`_id` bulk actions with scoped 404 no-op suppression),
-  are supported. A `delete_flag_column` that is not a column in the DataFrame fails the write before
-  any document is touched, because otherwise no row is flagged and every intended delete is applied
-  as an upsert while the counts still reconcile. The connector deletes exactly the rows the caller
-  flags: it does **not** dedup or
+  are supported. The delete flag must be a real **BooleanType** column (routing is done in Catalyst
+  via `flag === true`, which cannot parse a string flag); a missing or non-boolean flag column fails
+  the write before any document is touched, because otherwise no row is flagged and every intended
+  delete is applied as an upsert while the counts still reconcile. The connector deletes exactly the
+  rows the caller flags: it does **not** dedup or
   order Change Data Feed rows itself. That is deliberate: dedup needs the caller's business
   sequencing column and should run distributed in Spark, not in executor memory (see the
   Change-Data-Feed pattern in the README). **Known limitation:** a caller that dedups per
@@ -142,24 +143,27 @@ Hardening still needed before production for SIEM/audit data:
 - **Wheel install path is per-environment.** Notebooks `%pip install` from a specific UC Volume
   path; `%pip` cannot read a widget, so this line is edited per workspace. Documented in the
   README ("Deploying to a workspace").
-- **Datatype coverage is complete, with two fidelity caveats.** Every Spark column is exportable
-  with no caller pre-processing: `coerce_value` handles all Arrow-crossable types (numerics,
-  `decimal`→float, `binary`→base64, `date`/`timestamp`→epoch-millis, array/map/struct, non-finite
-  floats→null, plus a str fallback for anything unforeseen); `sanitize_for_arrow` (called by
-  `bulk_write`) serializes the types that can't cross Arrow at all (`variant`, `interval`, at any
-  nesting depth) to a string: `variant`→JSON string, scalar `interval`→its Spark string form.
-  Field pruning
-  (`drop_fields`) is a client opt-out to shrink payload, never a capability limit. Non-string
-  `map` keys are rendered to strings via the same value transform; Spark maps are
-  homogeneously typed so keys stay distinct. Caveats to raise with a customer: (1) `decimal`→float
-  loses precision beyond ~15-17 sig figs: cast to string in Spark if exact decimals matter
-  (money/IDs); (2) added fields need matching ES mapping entries or ES dynamic-maps and guesses the
-  type; (3) a Spark `FLOAT` (32-bit) stores its exact widened value (`0.1`→`0.10000000149011612`),
-  not the source literal: use `DOUBLE` if that matters; (4) `timestamp`→epoch-millis is floored to
-  the millisecond (sub-ms precision dropped; ES `date` is ms-resolution: use `date_nanos` for finer).
-  **`timestamp` timezone-independence:** a `timestamp`'s stored epoch is its true UTC instant
-  regardless of `spark.sql.session.timeZone` (the connector converts via Spark `unix_millis` before
-  export); `timestamp_ntz` is interpreted as UTC and reads back naive, `date` is unaffected.
+- **Datatype coverage is complete, with a few fidelity caveats.** Every Spark column is exportable
+  with no caller pre-processing. The whole `_bulk` line is built in Spark with `to_json`
+  (`spark_serialize.build_ndjson`): numerics as JSON numbers, `decimal` at full precision,
+  `binary`→base64, `date`/`timestamp`/`timestamp_ntz`→epoch-millis (converted in Catalyst before the
+  Arrow export), array/map/struct recursed, non-finite floats→null at any depth. `sanitize_for_arrow`
+  (called by `bulk_write`) first serializes the types that can't cross Arrow at all (`variant`,
+  `interval`, at any nesting depth) to a string: `variant`→JSON string, scalar `interval`→its Spark
+  string form. Field pruning (`drop_fields`) is a client opt-out to shrink payload, never a capability
+  limit. Non-string `map` keys are stringified by `to_json` to their own form (a temporal key becomes
+  an ISO string, unlike a temporal value → epoch-millis). Caveats to raise with a customer:
+  (1) a `decimal` is written at full precision, so an integer-valued decimal round-trips **exactly**,
+  but a **fractional** decimal beyond double's ~15-17 sig figs loses its low fractional digits when the
+  stored JSON number is parsed to a float on read: cast to string in Spark if exact high-precision
+  fractions matter (money/IDs); (2) added fields need matching ES mapping entries or ES dynamic-maps
+  and guesses the type; (3) `timestamp`→epoch-millis is floored to the millisecond (sub-ms precision
+  dropped; ES `date` is ms-resolution: use `date_nanos` for finer). A Spark `FLOAT` (32-bit) is
+  written as its short decimal repr (`0.1`→`0.1`) and round-trips faithfully into a `FLOAT` column, so
+  it is no longer a fidelity caveat. `coerced_nonfinite` in the result is always 0 (non-finite→null
+  happens in Spark, uncounted). **`timestamp` timezone-independence:** a `timestamp`'s stored epoch is
+  its true UTC instant regardless of `spark.sql.session.timeZone` (converted via Spark `unix_millis`
+  before export); `timestamp_ntz` is interpreted as UTC and reads back naive, `date` is unaffected.
 - **ES version compatibility.** The client is pinned `elasticsearch>=8,<9`; the 8.x client refuses a
   9.x cluster. Confirm the customer's ES major version and adjust.
 

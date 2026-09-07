@@ -1,26 +1,26 @@
-"""Unit tests for the serialize_in_spark write path (bulk.py shipper + config validation).
+"""Unit tests for the write path (bulk.py shipper + config validation + the fan-out).
 
 The Spark-side builder (spark_serialize.build_ndjson) needs a live Spark session and is proven in
 the integration tier; here we cover everything that does NOT need Spark:
-  - iter_bulk_response_outcomes: es.bulk response item -> WRITTEN/DELETED/IGNORED/ERROR (reuses the
-    same classify_bulk_result rules as streaming_bulk, so the two paths count identically).
+  - iter_bulk_response_outcomes: es.bulk response item -> WRITTEN/DELETED/IGNORED/ERROR.
   - _ship_ndjson_chunk: tallying + the per-document 429 retry the connector treats as load-bearing.
+  - _ship_ndjson_lines: the write_concurrency fan-out (all lines shipped once, tally == serial).
   - make_ndjson_partition_writer: chunking by chunk_size, the yielded summary schema, total_input.
-  - the config guard that fails closed on serialize_in_spark + has_deletes.
+  - _preflight: deletes require a BooleanType flag column.
   - _payload_columns: which columns land in _source.
 """
 import pytest
 
 from databricks_es_connector.config import EsConfig
 from databricks_es_connector.bulk import (
-    iter_bulk_response_outcomes, _ship_ndjson_chunk, make_ndjson_partition_writer,
+    iter_bulk_response_outcomes, _ship_ndjson_chunk, make_ndjson_partition_writer, _preflight,
     WRITTEN, DELETED, IGNORED, ERROR, ERROR_SAMPLE_CAP,
 )
 
 
 def _cfg(**kw):
     base = dict(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
-                serialize_in_spark=True, require_existing_index=False)
+                require_existing_index=False)
     base.update(kw)
     return EsConfig(**base)
 
@@ -184,28 +184,25 @@ def test_ship_chunk_transport_error_counts_errors_not_crash():
 
 # --- config guard ---------------------------------------------------------------------------
 
-def test_config_rejects_serialize_in_spark_with_deletes():
-    with pytest.raises(ValueError, match="does not yet support has_deletes"):
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
-                 serialize_in_spark=True, has_deletes=True, delete_flag_column="d")
+def test_config_accepts_deletes():
+    # The write path builds delete actions; the config accepts has_deletes + a flag column. The
+    # remaining requirement -- the flag column must be boolean -- needs the DataFrame schema and is
+    # enforced in bulk._preflight, not here.
+    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
+                   has_deletes=True, delete_flag_column="d")
+    assert cfg.has_deletes is True and cfg.delete_flag_column == "d"
 
 
-def test_config_serialize_in_spark_defaults_off():
-    cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i")
-    assert cfg.serialize_in_spark is False
-
-
-def test_config_warns_write_concurrency_with_serialize_in_spark():
+def test_config_write_concurrency_sizes_connection_pool():
     import warnings
-    # write_concurrency>1 has no effect on the serialize_in_spark path; must WARN (not silently ignore).
-    with pytest.warns(UserWarning, match="effect with serialize_in_spark"):
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i",
-                 serialize_in_spark=True, write_concurrency=4)
-    # No warning when the two are not combined.
+    # write_concurrency fans the chunk shipping across worker threads (bulk._ship_ndjson_lines) and
+    # must not warn on its own; the per-node connection pool is sized to it so the workers are not
+    # capped below the configured value.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", serialize_in_spark=True)
-        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=4)
+        cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=4)
+    assert cfg.write_concurrency == 4
+    assert cfg.client_kwargs().get("connections_per_node") == 4
 
 
 # --- _payload_columns (pure) ----------------------------------------------------------------
@@ -296,3 +293,140 @@ def test_epoch_type_maps_date_ntz_to_long_recursively():
     # a map is mapped to Long.
     mk = _epoch_type(MapType(DateType(), TimestampNTZType()))
     assert isinstance(mk.keyType, DateType) and isinstance(mk.valueType, LongType)
+
+
+# --- _preflight: deletes require a BooleanType flag column ------------------------------------
+# The Catalyst delete routing (`flag === true` in build_ndjson) has no way to parse a string/int flag,
+# so a non-boolean flag must fail closed on the driver rather than silently upsert every intended
+# delete. build_ndjson itself needs live Spark (the end-to-end path is proven in the integration
+# tier); this covers the driver-side TYPE check that gates it. _preflight reads only df.columns and
+# df.schema.fields[*].{name, dataType.typeName()}, so a stand-in exercises the check without pyspark
+# (unavailable on this Python) -- the real schema is proven live in test_deletes_roundtrip.
+
+class _FakeDataType:
+    """Mirrors the pyspark DataType methods _preflight reads: typeName() / simpleString()."""
+    def __init__(self, type_name): self._t = type_name
+    def typeName(self): return self._t
+    def simpleString(self): return self._t
+
+
+class _FakeField:
+    def __init__(self, name, type_name): self.name = name; self.dataType = _FakeDataType(type_name)
+
+
+def _fake_df(fields):
+    """Stand-in DataFrame exposing what _preflight reads: .columns and .schema.fields[*].{name,
+    dataType}. `fields`: [(name, type_name), ...], e.g. ("d", "boolean")."""
+    df = type("_DF", (), {})()
+    df.columns = [n for n, _ in fields]
+    df.schema = type("_Schema", (), {"fields": [_FakeField(n, t) for n, t in fields]})()
+    return df
+
+
+def test_preflight_rejects_non_boolean_delete_flag():
+    # flag column "d" is a STRING, not boolean: `flag === true` would be null for every row => no row
+    # routed to a delete => every intended deletion silently upserted. Must fail closed on the driver.
+    cfg = _cfg(has_deletes=True, delete_flag_column="d")   # _cfg sets serialize_in_spark=True, id_field="id"
+    with pytest.raises(ValueError, match="must be a boolean column"):
+        _preflight(_fake_df([("id", "string"), ("d", "string")]), cfg)
+
+
+def test_preflight_accepts_boolean_delete_flag():
+    cfg = _cfg(has_deletes=True, delete_flag_column="d")
+    _preflight(_fake_df([("id", "string"), ("d", "boolean")]), cfg)   # must not raise (require_existing_index=False)
+
+
+# --- _ship_ndjson_lines: the write_concurrency fan-out over pre-built lines --------------------
+# No Spark: _ship_ndjson_lines takes an ES client and a list of lines, so a thread-safe fake client
+# exercises the fan-out directly. The live end-to-end proof is integration test_concurrency_roundtrip.
+
+class _ThreadSafeFakeES:
+    """Returns 201 for every operation and records what it shipped. Thread-safe for fan-out tests."""
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self.chunks = []       # each es.bulk() call's operations list
+        self.all_ops = []      # every op line shipped, flattened
+
+    def bulk(self, operations=None, **kw):
+        ops = list(operations)
+        with self._lock:
+            self.chunks.append(ops)
+            self.all_ops.extend(ops)
+        return {"items": [{"index": {"status": 201}} for _ in ops]}
+
+
+def _zero_counts():
+    return {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+
+
+def test_ship_ndjson_lines_fans_all_lines_exactly_once():
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+    es = _ThreadSafeFakeES()
+    lines = [f"L{i}" for i in range(10)]
+    counts, samples = _zero_counts(), []
+    _ship_ndjson_lines(es, lines, _cfg(write_concurrency=3, chunk_size=2), counts, samples)
+    # every line shipped exactly once across the workers -- no drops, no duplicates
+    assert sorted(es.all_ops) == sorted(lines)
+    assert len(es.all_ops) == 10
+    assert counts["written"] == 10 and counts["errors"] == 0
+
+
+def test_ship_ndjson_lines_concurrency_matches_serial_tally():
+    # The whole point of the fan-out: identical accounting regardless of write_concurrency.
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+    lines = [f"L{i}" for i in range(7)]
+
+    def run(wc):
+        es = _ThreadSafeFakeES()
+        counts, samples = _zero_counts(), []
+        _ship_ndjson_lines(es, lines, _cfg(write_concurrency=wc, chunk_size=2), counts, samples)
+        return counts, sorted(es.all_ops)
+
+    serial_counts, serial_ops = run(1)
+    conc_counts, conc_ops = run(4)
+    assert serial_counts == conc_counts == {"written": 7, "deleted": 0, "ignored": 0, "errors": 0}
+    assert serial_ops == conc_ops == sorted(lines)
+
+
+def test_ship_ndjson_lines_merges_errors_and_samples_across_workers():
+    # Per-worker error tallies and (bounded) sample lists must merge correctly on join.
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+
+    class _SelectiveFakeES:
+        """400s any op line containing 'bad', 201s the rest."""
+        def bulk(self, operations=None, **kw):
+            items = []
+            for op in operations:
+                if "bad" in op:
+                    items.append({"index": {"status": 400, "_id": op, "error": {"reason": "boom"}}})
+                else:
+                    items.append({"index": {"status": 201}})
+            return {"items": items}
+
+    lines = [f"ok{i}" for i in range(8)] + [f"bad{i}" for i in range(3)]
+    counts, samples = _zero_counts(), []
+    _ship_ndjson_lines(_SelectiveFakeES(), lines, _cfg(write_concurrency=3, chunk_size=2), counts, samples)
+    assert counts["written"] == 8 and counts["errors"] == 3
+    assert len(samples) == 3 and all("boom" in s["reason"] for s in samples)
+
+
+def test_ship_ndjson_lines_worker_exception_fails_closed(monkeypatch):
+    # RED-BEFORE-GREEN guard: a worker exception must propagate (via f.result()), so a partial write
+    # FAILS the partition rather than reporting the docs a dead worker never sent as a clean count.
+    # Deleting the `f.result()` loop makes this pass silently. _ship_ndjson_chunk normally catches
+    # transport errors and counts them, so force a raw raise to exercise the re-raise guard itself.
+    from databricks_es_connector import bulk as bulk_mod
+
+    def _boom(es, chunk, cfg, counts, samples):
+        raise RuntimeError("worker died mid-ship")
+
+    monkeypatch.setattr(bulk_mod, "_ship_ndjson_chunk", _boom)
+    with pytest.raises(RuntimeError, match="worker died"):
+        bulk_mod._ship_ndjson_lines(_ThreadSafeFakeES(), [f"L{i}" for i in range(10)],
+                                    _cfg(write_concurrency=3, chunk_size=2), _zero_counts(), [])
+
+
+def test_config_write_concurrency_must_be_positive():
+    with pytest.raises(ValueError, match="write_concurrency must be >= 1"):
+        EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=0)

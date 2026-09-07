@@ -15,7 +15,6 @@
 # COMMAND ----------
 import json, math, base64, datetime, requests, urllib3
 urllib3.disable_warnings()
-import numpy as np
 from dbx_test import NotebookTestFixture, run_notebook_tests
 from databricks_es_connector import EsConfig, bulk_write
 
@@ -219,11 +218,15 @@ class TestDatatypeCoverage(NotebookTestFixture):
         self._assert("s_float", 1.5)
         self._assert("s_double", 1.5)
 
-    def test_float32_widening(self):
-        # A Spark FLOAT stores its exact 32-bit value widened to double, not the literal 0.1.
-        assert self._got("s_float32_prec") == float(np.float32(0.1))
+    def test_float32_short_repr_roundtrips(self):
+        # to_json renders a FLOAT as its SHORT decimal repr (the shortest string that round-trips to
+        # the same float32), so 0.1f stores as 0.1 -- faithful to the literal, unlike the old per-row
+        # path which stored the widened double 0.10000000149011612. Read back into a FLOAT column it
+        # returns to the same float32, so float32 no longer has a widening round-trip delta.
+        self._assert("s_float32_prec", 0.1)
 
-    def test_decimal_to_float(self):
+    def test_decimal_within_scale(self):
+        # A decimal that fits in a double round-trips exactly (rendered 1.5 by to_json).
         self._assert("s_decimal", 1.5)
 
     def test_date_and_timestamp_epoch_millis(self):
@@ -291,14 +294,16 @@ class TestDatatypeCoverage(NotebookTestFixture):
         # A struct with one null field: present field kept, null field -> JSON null.
         self._assert("s_struct_null_fld", {"a": 1, "b": None})
 
-    # --- decimal precision loss at the documented boundary ---
-    def test_decimal_precision_loss(self):
-        # An 18-sig-fig decimal widened to a double loses its low digits, the connector's
-        # documented decimal->float behavior. Proves the README caveat end-to-end, not just in a
-        # unit test: what a client sends (…678) is NOT what ES holds (…680).
+    # --- decimal: full precision in _source (to_json), so an integer decimal is now EXACT ---
+    def test_decimal_hi_integer_is_exact(self):
+        # to_json renders a decimal at full precision, and an 18-digit decimal(38,0) is an exact
+        # integer JSON literal, so _source holds all 18 digits (JSON integer -> Python int, exact).
+        # The old per-row path went decimal->float64 and lost the low digits (…678 stored as …680);
+        # the JVM path no longer does. A decimal with a FRACTIONAL part beyond double's ~15-17 sig
+        # figs still loses its low fractional digits when the JSON number is parsed to a float on
+        # read; the cast-to-string workaround (test_read_roundtrip) remains for that case.
         got = self._got("s_decimal_hi")
-        assert int(got) == 123456789012345680, f"s_decimal_hi: got {got!r}"
-        assert int(got) != 123456789012345678, "expected the low digits to be lost to float64"
+        assert int(got) == 123456789012345678, f"s_decimal_hi: got {got!r} (expected exact 18 digits)"
 
     # --- Arrow-hostile: VARIANT (any depth) + INTERVAL, serialized to strings by the connector ---
     def test_variant_top_level(self):

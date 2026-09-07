@@ -4,20 +4,19 @@
 # MAGIC Pins the timezone contract from both sides against live ES:
 # MAGIC
 # MAGIC 1. **UTC session (regression guard):** a `timestamp` -- top-level AND nested in
-# MAGIC    struct/array/map -- must store its TRUE UTC instant and read back exactly. This is the
-# MAGIC    behavior that was already correct under UTC; these tests lock it so the tz fix (or any
-# MAGIC    future change) can't silently alter it.
+# MAGIC    struct/array/map -- must store its TRUE UTC instant and read back exactly.
 # MAGIC 2. **Non-UTC session (the fix):** the SAME instants written under `America/New_York` must
 # MAGIC    store the SAME epoch as under UTC. Before the fix (spark_prep.normalize_timestamps_for_utc)
 # MAGIC    the non-UTC epoch was shifted by the session offset (-5h); after it, the two agree.
 # MAGIC
-# MAGIC Companion to test_datatype_coverage.py (which runs its full matrix under a non-UTC session).
-# MAGIC Live ES + the `es_poc` scope required. Throwaway index, dropped in cleanup.
+# MAGIC The write path builds the `_bulk` line in Catalyst (build_ndjson): TimestampType is normalized
+# MAGIC to epoch-millis upstream (normalize_timestamps_for_utc), and DateType/TimestampNTZType are
+# MAGIC converted to the same epoch-millis inside build_ndjson. Companion to test_datatype_coverage.py
+# MAGIC (which runs its full matrix under a non-UTC session). Live ES + the `es_poc` scope required.
 
 # COMMAND ----------
 import json, datetime, requests, urllib3
 urllib3.disable_warnings()
-import pytest
 from dbx_test import NotebookTestFixture, run_notebook_tests
 from databricks_es_connector import EsConfig, bulk_write
 
@@ -25,14 +24,6 @@ SCOPE = "es_poc"
 INDEX = "connector-integration-timezone"          # throwaway; recreated + dropped by the fixture
 ES_HOSTS = dbutils.secrets.get(SCOPE, "hosts")
 ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "password"))
-
-# Every temporal assertion below runs against BOTH write paths with IDENTICAL expected epochs: the
-# default per-row Python path and serialize_in_spark=True (JVM to_json). The Spark path builds the
-# _bulk line in Catalyst and, as of 0.8.1, converts DateType/TimestampNTZType to the same epoch-millis
-# the default path does (build_ndjson; the earlier bug stored them as ISO strings). This fixture is
-# the raw-_source regression guard for that: both paths must land on the same session-independent
-# epoch. `doc_id` carries the path so both live in one index.
-PATHS = ["default", "spark"]
 
 # Known instants (session-INDEPENDENT ground truth), computed the plain way from a UTC datetime.
 def _epoch(y, mo, d, h=0, mi=0, s=0):
@@ -63,16 +54,11 @@ class TestTimezoneEpochStability(NotebookTestFixture):
     at every nesting depth. Writes the same instants under UTC and under America/New_York and asserts
     both land on the ground-truth epoch (and that ntz/date are unaffected)."""
 
-    def _write_under(self, tz, doc_id, serialize_in_spark):
+    def _write_under(self, tz, doc_id):
         spark.conf.set("spark.sql.session.timeZone", tz)
         df = spark.sql(_ROW_SQL.format(doc_id=doc_id))
         bulk_write(df, EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
-                                index=INDEX, id_field="doc_id", http_compress=True,
-                                serialize_in_spark=serialize_in_spark))
-
-    # doc_ids per (path, session): both write paths land in ONE index so a single search reads all.
-    _DOCS = {"default": {"utc": "utc", "ny": "ny"},
-             "spark": {"utc": "utc-sis", "ny": "ny-sis"}}
+                                index=INDEX, id_field="doc_id", http_compress=True))
 
     def run_setup(self):
         # Fresh index; all temporal columns mapped epoch_millis so ES stores the number verbatim.
@@ -86,10 +72,8 @@ class TestTimezoneEpochStability(NotebookTestFixture):
                                                             "number_of_replicas": 0}},
                                       "mappings": {"properties": props}}))
         try:
-            for path in PATHS:
-                sis = path == "spark"
-                self._write_under("UTC", self._DOCS[path]["utc"], sis)
-                self._write_under("America/New_York", self._DOCS[path]["ny"], sis)
+            self._write_under("UTC", "utc")
+            self._write_under("America/New_York", "ny")
         finally:
             spark.conf.set("spark.sql.session.timeZone", "UTC")   # leave the session as we found it
         requests.post(f"{ES_HOSTS}/{INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
@@ -97,83 +81,55 @@ class TestTimezoneEpochStability(NotebookTestFixture):
                             headers={"Content-Type": "application/json"},
                             data=json.dumps({"size": 10, "query": {"match_all": {}}})).json()
         docs = {h["_id"]: h["_source"] for h in hits.get("hits", {}).get("hits", [])}
-        # self.by_path[path] = {"utc": <_source>, "ny": <_source>}
-        self.by_path = {path: {sess: docs.get(did, {}) for sess, did in self._DOCS[path].items()}
-                        for path in PATHS}
+        self.utc = docs.get("utc", {})
+        self.ny = docs.get("ny", {})
 
     def run_cleanup(self):
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
 
-    # --- both rows present (per path) ---
-    @pytest.mark.parametrize("path", PATHS)
-    def test_both_rows_written(self, path):
-        utc, ny = self.by_path[path]["utc"], self.by_path[path]["ny"]
-        assert utc and ny, (path, bool(utc), bool(ny))
+    # --- both rows present ---
+    def test_both_rows_written(self):
+        assert self.utc and self.ny, (bool(self.utc), bool(self.ny))
 
-    # --- REGRESSION GUARD: UTC-session behavior is the true instant, unchanged (both paths) ---
-    @pytest.mark.parametrize("path", PATHS)
-    def test_utc_session_top_level_timestamp_is_true_instant(self, path):
-        utc = self.by_path[path]["utc"]
-        assert utc["s_ts"] == TS_INSTANT, (path, utc["s_ts"], TS_INSTANT)
-        assert utc["s_ts_preepoch"] == TS_PREEPOCH, (path, utc["s_ts_preepoch"])
+    # --- REGRESSION GUARD: UTC-session behavior is the true instant, unchanged ---
+    def test_utc_session_top_level_timestamp_is_true_instant(self):
+        assert self.utc["s_ts"] == TS_INSTANT, (self.utc["s_ts"], TS_INSTANT)
+        assert self.utc["s_ts_preepoch"] == TS_PREEPOCH, self.utc["s_ts_preepoch"]
 
-    @pytest.mark.parametrize("path", PATHS)
-    def test_utc_session_nested_timestamps_are_true_instant(self, path):
-        utc = self.by_path[path]["utc"]
-        assert utc["s_struct_ts"]["t"] == TS_INSTANT, (path, utc["s_struct_ts"])
-        assert utc["s_array_ts"] == [TS_INSTANT, TS_INSTANT], (path, utc["s_array_ts"])
-        assert utc["s_map_ts"]["k"] == TS_INSTANT, (path, utc["s_map_ts"])
-        assert utc["s_struct_array_ts"]["a"][0] == TS_INSTANT, (path, utc["s_struct_array_ts"])
+    def test_utc_session_nested_timestamps_are_true_instant(self):
+        assert self.utc["s_struct_ts"]["t"] == TS_INSTANT, self.utc["s_struct_ts"]
+        assert self.utc["s_array_ts"] == [TS_INSTANT, TS_INSTANT], self.utc["s_array_ts"]
+        assert self.utc["s_map_ts"]["k"] == TS_INSTANT, self.utc["s_map_ts"]
+        assert self.utc["s_struct_array_ts"]["a"][0] == TS_INSTANT, self.utc["s_struct_array_ts"]
 
-    @pytest.mark.parametrize("path", PATHS)
-    def test_utc_session_ntz_and_date(self, path):
-        # The date/ntz -> epoch-millis path: on serialize_in_spark this is build_ndjson's conversion
-        # (0.8.1); on the default path it is coerce_value. Both must land on the same epoch.
-        utc = self.by_path[path]["utc"]
-        assert utc["s_ntz"] == NTZ_AS_UTC, (path, utc["s_ntz"])
-        assert utc["s_date"] == DATE_MIDNIGHT, (path, utc["s_date"])
+    def test_utc_session_ntz_and_date(self):
+        # The date/ntz -> epoch-millis conversion happens in build_ndjson. Both must land on the epoch.
+        assert self.utc["s_ntz"] == NTZ_AS_UTC, self.utc["s_ntz"]
+        assert self.utc["s_date"] == DATE_MIDNIGHT, self.utc["s_date"]
 
-    # --- a non-UTC session stores the SAME epoch as UTC (no session-offset shift), both paths ---
-    @pytest.mark.parametrize("path", PATHS)
-    def test_non_utc_session_matches_utc_top_level(self, path):
-        ny = self.by_path[path]["ny"]
-        assert ny["s_ts"] == TS_INSTANT, (path, ny["s_ts"], TS_INSTANT)
-        assert ny["s_ts_preepoch"] == TS_PREEPOCH, (path, ny["s_ts_preepoch"])
+    # --- a non-UTC session stores the SAME epoch as UTC (no session-offset shift) ---
+    def test_non_utc_session_matches_utc_top_level(self):
+        assert self.ny["s_ts"] == TS_INSTANT, (self.ny["s_ts"], TS_INSTANT)
+        assert self.ny["s_ts_preepoch"] == TS_PREEPOCH, self.ny["s_ts_preepoch"]
 
-    @pytest.mark.parametrize("path", PATHS)
-    def test_non_utc_session_matches_utc_nested(self, path):
-        ny = self.by_path[path]["ny"]
-        assert ny["s_struct_ts"]["t"] == TS_INSTANT, (path, ny["s_struct_ts"])
-        assert ny["s_array_ts"] == [TS_INSTANT, TS_INSTANT], (path, ny["s_array_ts"])
-        assert ny["s_map_ts"]["k"] == TS_INSTANT, (path, ny["s_map_ts"])
-        assert ny["s_struct_array_ts"]["a"][0] == TS_INSTANT, (path, ny["s_struct_array_ts"])
+    def test_non_utc_session_matches_utc_nested(self):
+        assert self.ny["s_struct_ts"]["t"] == TS_INSTANT, self.ny["s_struct_ts"]
+        assert self.ny["s_array_ts"] == [TS_INSTANT, TS_INSTANT], self.ny["s_array_ts"]
+        assert self.ny["s_map_ts"]["k"] == TS_INSTANT, self.ny["s_map_ts"]
+        assert self.ny["s_struct_array_ts"]["a"][0] == TS_INSTANT, self.ny["s_struct_array_ts"]
 
-    @pytest.mark.parametrize("path", PATHS)
-    def test_non_utc_ntz_and_date_also_stable(self, path):
+    def test_non_utc_ntz_and_date_also_stable(self):
         # ntz is zoneless and date has no time-of-day: both are session-independent and must equal the
-        # UTC-session values on both write paths.
-        utc, ny = self.by_path[path]["utc"], self.by_path[path]["ny"]
-        assert ny["s_ntz"] == utc["s_ntz"] == NTZ_AS_UTC, (path, ny["s_ntz"], utc["s_ntz"])
-        assert ny["s_date"] == utc["s_date"] == DATE_MIDNIGHT, (path, ny["s_date"], utc["s_date"])
+        # UTC-session values.
+        assert self.ny["s_ntz"] == self.utc["s_ntz"] == NTZ_AS_UTC, (self.ny["s_ntz"], self.utc["s_ntz"])
+        assert self.ny["s_date"] == self.utc["s_date"] == DATE_MIDNIGHT, (self.ny["s_date"], self.utc["s_date"])
 
-    # --- the two sessions agree field-by-field on every temporal column (per path) ---
-    @pytest.mark.parametrize("path", PATHS)
-    def test_utc_and_non_utc_sessions_agree(self, path):
-        utc, ny = self.by_path[path]["utc"], self.by_path[path]["ny"]
+    # --- the two sessions agree field-by-field on every temporal column ---
+    def test_utc_and_non_utc_sessions_agree(self):
         cols = ["s_ts", "s_ts_preepoch", "s_struct_ts", "s_array_ts", "s_map_ts",
                 "s_struct_array_ts", "s_ntz", "s_date"]
-        diffs = {c: (utc.get(c), ny.get(c)) for c in cols if utc.get(c) != ny.get(c)}
-        assert not diffs, f"[{path}] session-dependent epochs (fix regressed): {diffs}"
-
-    # --- the two WRITE PATHS agree field-by-field: serialize_in_spark == default per-row, the direct
-    #     lock for the 0.8.1 date/ntz fix (a divergence here is the bug this release fixes) ---
-    @pytest.mark.parametrize("session", ["utc", "ny"])
-    def test_write_paths_agree(self, session):
-        d, s = self.by_path["default"][session], self.by_path["spark"][session]
-        cols = ["s_ts", "s_ts_preepoch", "s_struct_ts", "s_array_ts", "s_map_ts",
-                "s_struct_array_ts", "s_ntz", "s_date"]
-        diffs = {c: (d.get(c), s.get(c)) for c in cols if d.get(c) != s.get(c)}
-        assert not diffs, f"[{session}] default vs serialize_in_spark diverge: {diffs}"
+        diffs = {c: (self.utc.get(c), self.ny.get(c)) for c in cols if self.utc.get(c) != self.ny.get(c)}
+        assert not diffs, f"session-dependent epochs (fix regressed): {diffs}"
 
 
 # COMMAND ----------

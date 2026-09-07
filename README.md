@@ -225,7 +225,7 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   "deleted": 0,            # successful delete-by-id ops (non-zero only with has_deletes)
   "errors": 2,             # docs Elasticsearch rejected (exact count)
   "ignored": 0,            # delete-404 no-ops (deleting an already-absent doc: expected)
-  "coerced_nonfinite": 0,  # inf/-inf/NaN values that had to become JSON null to be sent
+  "coerced_nonfinite": 0,  # always 0 (see below): non-finite floats become null in Spark, uncounted
   "total_input": 1000,     # rows handed to the writer
   "unaccounted": 0,        # rows that produced NO per-document outcome (loss below that level)
   "overcounted": 0,        # more outcomes than input rows: impossible, so a bug in THIS library
@@ -250,10 +250,12 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   `unaccounted` so that it can never net against real loss: the two are accumulated per partition, so
   one partition over-counting cannot cancel out another partition genuinely losing rows. If you ever
   see a non-zero value, please report the result dict.
-- **`coerced_nonfinite` catches invisible nulls.** `inf`/`-inf`/`NaN` have no JSON representation
-  (ES rejects the bare `Infinity`/`NaN` tokens), so they must become JSON null to be sent at all.
-  That is the right behavior, but it means an upstream divide-by-zero lands in ES as a null with no
-  error and no error sample. A non-zero count here says real numbers became nulls.
+- **`coerced_nonfinite` is always `0`.** `inf`/`-inf`/`NaN` have no JSON representation (ES rejects
+  the bare `Infinity`/`NaN` tokens), so the connector still turns them into JSON null at any nesting
+  depth so the document is accepted, but this happens in Spark (`to_json` never sees a non-finite),
+  off the per-row Python path that used to count them, so the field is not incremented. The key is
+  kept in the result for shape stability. If you need to know a non-finite became null (e.g. to catch
+  an upstream divide-by-zero), detect it in Spark before the write.
 - **`error_samples` is a breadcrumb, not a dead-letter queue.** It retains up to the first 20
   failures (id, op, HTTP status, ES reason) so a failed write is diagnosable instead of an opaque
   count. The `errors` count is always exact; only the retained sample list is capped, so a batch
@@ -322,16 +324,17 @@ data stays across executors (never collected to the driver), so it scales for fu
 
 Reads honor the **same contract as writes**: `read_index(cfg, df.schema)` after `bulk_write(df,
 cfg)` reproduces the original DataFrame, **except** the deltas the
-[Datatype coverage](#datatype-coverage-write-transforms--read-inverse) table documents as one-way (decimal precision beyond
-~15-17 sig figs, sub-millisecond timestamp truncation, float32 widening). Each read coercion is the
-exact inverse of the write transform:
+[Datatype coverage](#datatype-coverage-write-transforms--read-inverse) table documents as one-way:
+sub-millisecond timestamp truncation, and a `decimal` with fractional precision beyond double's
+~15-17 sig figs (integer-valued decimals round-trip exactly). Each read coercion is the exact inverse
+of the write transform:
 
 | Declared Spark type | Stored in ES | Read back as |
 |---|---|---|
 | `timestamp` / `date` | epoch-millis integer | `datetime` / `date` (UTC) |
 | `timestamp_ntz` | epoch-millis integer | naive `datetime` (no tzinfo, the UTC wall-clock) |
 | `binary` | base64 string | `bytes` |
-| `decimal(p,s)` | float | `Decimal` (precision already lost on write) |
+| `decimal(p,s)` | full-precision JSON number | `Decimal` (exact if integer-valued; a fractional value past ~15-17 sig figs loses low digits when parsed to a float on read) |
 | `variant` / `interval` | JSON / interval string | string (re-parse with `parse_json` yourself) |
 | scalars / `struct` / `array` / `map` | same shape | same, recursively |
 
@@ -357,9 +360,9 @@ detect:
 
 **Booleans stored as strings are parsed, not trusted to `bool()`.** Reading an index the connector
 did not write, a field may hold the *string* `"false"`, and `bool("false")` is `True`, so the value
-would invert with nothing to notice it. Strings are matched against the same allow-list the write side
-uses: `"true"/"t"/"1"/"yes"/"y"` and `"false"/"f"/"0"/"no"/"n"`, case-insensitive and
-whitespace-trimmed. Anything else raises. Real JSON booleans and `0`/`1` are unaffected.
+would invert with nothing to notice it. Strings are matched against an explicit allow-list:
+`"true"/"t"/"1"/"yes"/"y"` and `"false"/"f"/"0"/"no"/"n"`, case-insensitive and whitespace-trimmed.
+Anything else raises. Real JSON booleans and `0`/`1` are unaffected.
 
 **`char`, `varchar` and `void` cannot be declared.** Spark cannot carry `CharType`, `VarcharType`, or
 `NullType` through the `mapInPandas` the reader uses, so they raise `ReadSchemaMismatch` naming the
@@ -417,10 +420,9 @@ fields specific to its direction. So a config is `connection + write behavior` o
 > **`EsConfig` is an alias for `EsWriteConfig`**, so code using the older name keeps working. New
 > code should use `EsWriteConfig`.
 
-The package also exports the pure value transforms for direct use or testing: `coerce_value` and
-`to_es_source` (Spark value → ES `_source`), `read_coerce` (the declared-type inverse), and
-`sanitize_for_arrow` (Spark-side, called automatically by `bulk_write`). Plus `reconcile_or_raise` and
-the exceptions `EsWriteError`, `AmbiguousDeleteFlag`, `ReadSchemaMismatch`.
+The package also exports, for direct use or testing: `read_coerce` (the declared-type read inverse)
+and `sanitize_for_arrow` (Spark-side, called automatically by `bulk_write`). Plus `reconcile_or_raise`
+and the exceptions `EsWriteError`, `ReadSchemaMismatch`.
 
 ### Connection (shared by both configs)
 
@@ -455,10 +457,10 @@ per-document level, and `max_retries=N` sets both at once, see
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
-| `index` | `str` | `""` | **Yes** | Target index. `bulk_write`/`build_action` raise if empty. |
+| `index` | `str` | `""` | **Yes** | Target index. `bulk_write` raises if empty. |
 | `id_field` | `str \| None` | `None` | No | Column used as the deterministic `_id` → idempotent upserts. If unset, ES assigns random IDs (replays duplicate). If set, the column must **exist** (`bulk_write` raises before writing) and be non-null in every row. |
 | `chunk_size` | `int` | `500` | No | How many documents the connector groups into each `_bulk` HTTP request (the `N` in [Retries on a write](#retries-on-a-write-two-layers)). A chunk is also flushed early if it first reaches 100 MB (elasticsearch-py's `max_chunk_bytes` default, which matches Elasticsearch's own `http.max_content_length` request ceiling). Larger values mean fewer, bigger requests (higher throughput but more executor memory per request); smaller values mean more, smaller requests. `500` suits most workloads; lower it for very large documents. |
-| `write_concurrency` | `int` | `1` | No | How many `_bulk` request streams run **in parallel within a single partition**. `1` (default) is one serial stream per partition, so write concurrency across the cluster is just the partition count. Raise it when the write is **latency-bound** — executors idle waiting on each bulk's ES round-trip, with CPU *and* network both under-utilized — rather than CPU- or bandwidth-bound; each partition then keeps `write_concurrency` requests in flight to fill that wait. Every stream is a full `streaming_bulk` with the same `chunk_size` and per-document retry, so error accounting is unchanged. Total requests hitting ES at once = (running partitions) × `write_concurrency`; raise it gradually and watch for 429s (if they climb, the ES cluster is the ceiling, not the client). Costs one executor thread and up to one chunk of in-flight docs per unit. |
+| `write_concurrency` | `int` | `1` | No | How many `_bulk` requests run **in parallel within a single partition**. `1` (default) ships a partition's chunks serially, so write concurrency across the cluster is just the partition count. Raise it when the write is **latency-bound** — executors idle waiting on each bulk's ES round-trip, with CPU *and* network both under-utilized — rather than CPU- or bandwidth-bound; each partition then fans its pre-built NDJSON across `write_concurrency` worker threads to keep that many requests in flight. Each worker ships with the same `chunk_size` and per-document retry, so error accounting is unchanged. Total requests hitting ES at once = (running partitions) × `write_concurrency`; raise it gradually and watch for 429s (if they climb, the ES cluster is the ceiling, not the client). Costs one executor thread and up to one chunk of in-flight docs per unit. |
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
 | `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses to retry. `429` is ES's write queue being full, the one reliably transient case. Adding `503` (a shard briefly unavailable, e.g. during relocation) is the main sensible extension: `retry_on_doc_status=(429, 503)`. Do **not** add deterministic statuses like `400` (malformed doc) or `409` (version conflict): the retry fails identically and only delays the real error. Empty with a non-zero `max_retries_per_doc` raises. |
 | `require_existing_index` | `bool` | `True` | No | Verify the index exists before writing. ES auto-creates a missing index, so a **typo'd index name** otherwise produces a brand-new dynamically-mapped index and a perfect-looking `written` count. One `indices.exists` call on the driver. Set `False` to allow auto-creation (e.g. with an index template). |
@@ -509,8 +511,8 @@ than raising `max_retries`.
 
 | Field | Type | Default | Required | Notes |
 |-------|------|---------|----------|-------|
-| `has_deletes` | `bool` | `False` | No | `False` = every row is an index/upsert. `True` routes rows whose `delete_flag_column` is truthy to an ES delete-by-`_id`. |
-| `delete_flag_column` | `str \| None` | `None` | when `has_deletes` | Boolean-ish column; a truthy value deletes that `_id`. A null value = not a delete. The column is pruned from the `_source` of kept rows so it is never indexed. It must **exist** in the DataFrame: `bulk_write` raises if it does not (see below). |
+| `has_deletes` | `bool` | `False` | No | `False` = every row is an index/upsert. `True` routes rows whose `delete_flag_column` is `true` to an ES delete-by-`_id`. |
+| `delete_flag_column` | `str \| None` | `None` | when `has_deletes` | A **boolean** column: `true` deletes that `_id`, `false` or null indexes. The column is pruned from the `_source` of kept rows so it is never indexed. It must **exist** and be `BooleanType`: `bulk_write` raises before writing if it is missing or a non-boolean type (see below). |
 
 > **A `delete_flag_column` that isn't in the DataFrame fails the write.** If the name is misspelled,
 > every row reads as not-flagged, so each intended delete would be applied as an **upsert** and the
@@ -520,11 +522,11 @@ than raising `max_retries`.
 > `strict_drop_fields`, `drop_fields` are validated in the same pass, for the same reason: a config
 > field that names a column must fail closed when the name is wrong.)
 
-> **Prefer a real boolean for the delete flag.** Strings are parsed against an allow-list in both
-> directions, case-insensitive and whitespace-trimmed: `"true"/"t"/"1"/"yes"/"y"` delete,
-> `"false"/"f"/"0"/"no"/"n"` and empty do not. Anything else raises `AmbiguousDeleteFlag` rather than
-> defaulting, since a value like `"on"` or `"2"` reads as truthy to a human but has no defined meaning
-> here. `.cast("boolean")` in Spark avoids the question entirely.
+> **The delete flag must be a real boolean.** Deletes are routed in Spark (`build_ndjson`) via
+> `flag === true`, which has no way to parse a string or integer flag; a non-boolean column would
+> compare to null for every row, route nothing to a delete, and silently upsert every intended
+> deletion. `bulk_write` rejects a non-`BooleanType` flag column on the driver before writing. Cast
+> the column in Spark first if needed: `df.withColumn("is_delete", col("is_delete").cast("boolean"))`.
 
 When `has_deletes=True` the constructor requires both `id_field` (you cannot delete without an
 `_id`) and `delete_flag_column`, and raises `ValueError` otherwise. Setting `delete_flag_column`
@@ -538,44 +540,6 @@ other status on a delete, is still counted in `errors`.
 
 See [Deletes](#deletes) above for the recommended Change-Data-Feed pattern and the
 cross-batch ordering caveat.
-
-**Serialization mode**
-
-| Field | Type | Default | Required | Notes |
-|-------|------|---------|----------|-------|
-| `serialize_in_spark` | `bool` | `False` | No | Where each document's JSON is built. `False` (default) is the per-row Python path (`coerce_value` → `build_action` → `streaming_bulk` serializes on the executor). `True` builds the whole `_bulk` action line in **Spark** (`to_json`, in the JVM) and ships the pre-built NDJSON without re-serializing in Python — much faster on wide/large writes, with a slightly different fidelity contract (below). Opt-in so the default path's round-trip guarantee is untouched. Index/upsert only: combining it with `has_deletes` raises. |
-
-#### Spark-native serialization (`serialize_in_spark=True`)
-
-The default write path shapes and JSON-serializes every row **in Python** on the executor. That
-per-row work is GIL-bound and is the throughput ceiling on wide or very large writes: the
-transform-and-serialize step, not the Elasticsearch send, dominates wall time. `serialize_in_spark=True`
-moves it into Spark — the entire `_bulk` action line (`{"index":{…}}\n{…_source…}`) is built once per
-row with `to_json` in Catalyst (multi-core JVM, no GIL), and the executor only forwards the pre-built
-NDJSON to `es.bulk(operations=…)`, which sends `str`/`bytes` lines verbatim (no Python re-encode).
-Measured ≈5× faster on the transform+serialize segment (30M rows, 32 cores).
-
-It is **opt-in** because `to_json` is a different serializer from `coerce_value`, so a few edge cases
-differ from the default path's documented round-trip contract:
-
-| Case | Default path (`coerce_value`) | `serialize_in_spark` (`to_json`) |
-|---|---|---|
-| `NaN` / `±inf` | JSON `null`, **counted** in `coerced_nonfinite` | JSON `null` (nulled in Spark at **any nesting depth** — struct/array/map **values**), but **not counted** (`coerced_nonfinite` is always `0`). Exception: a non-finite float used as a **map key** is left as-is (renders as `"NaN"`; a map key can't be nulled) — use string/int map keys |
-| `decimal` | → `double` (precision lost past ~15–17 sig figs) | rendered at **full precision** (more faithful) |
-| `float` (32-bit) | exact widened double (`0.10000000149…`) | short decimal repr (`0.1`) |
-| null / non-finite `id_field` value | whole write **raises** (`_require_id`) | **fails closed the same way**: the writer **raises**, failing the write unconditionally (not merely `unaccounted`), rather than shipping `"_id": null` which could auto-assign an id and duplicate on replay |
-| numeric `id_field` → `_id` string | Python `str(value)` | Spark `cast(string)` — can differ for `float`/`decimal` (e.g. scientific notation); use a **string** id if you mix both write paths and rely on `_id` equality |
-| non-string **map keys** (`timestamp` / `date` / `timestamp_ntz` / `decimal` / `binary`) | `_coerce_key` renders the key the same way as a value (e.g. a temporal key → epoch-millis string) | `to_json` stringifies the key to its own form instead (a temporal key → its ISO string), so a map **keyed by** such a type does **not** match the default path. Map **values** of these types still match. Use **string/int map keys** with `serialize_in_spark` for exact key parity |
-| everything else (nested struct/array/map **values**, `binary`→base64, `timestamp` / `date` / `timestamp_ntz`→epoch-millis at any nesting depth, kept null fields) | — | **matches** |
-
-Everything else is unchanged: `chunk_size`, per-document `429` retry (`max_retries_per_doc` /
-`retry_on_doc_status`), the `written`/`deleted`/`errors`/`ignored`/`unaccounted` accounting, and
-`reconcile_or_raise` all behave exactly as on the default path. One exception: **`write_concurrency`
-has no effect** with `serialize_in_spark=True` (each partition's chunks ship serially — its bottleneck
-was the GIL-bound per-row work, now in the JVM, not the ES round-trip; parallelism comes from the
-Spark partition count). Setting `write_concurrency > 1` with this mode warns. Use the default path when you need the
-full round-trip fidelity guarantee or delete routing; use `serialize_in_spark=True` for throughput on
-large index/upsert exports where the differences above are acceptable.
 
 ### Read behavior (`EsReadConfig`)
 
@@ -607,34 +571,34 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | `string`, `boolean` | unchanged | `"hi"` → `"hi"`; `true` → `true` |
 | `byte`/`short`/`int`/`long` | unchanged (all integer widths become one JSON number; width not preserved) | `5` → `5` |
 | `double` | unchanged; non-finite values (`Infinity`/`-Infinity`/`NaN`) become `null` (no JSON representation) | `1.5` → `1.5`; `Infinity` → `null` |
-| `float` (32-bit) | its **exact 32-bit value widened to double**, the stored number shows the float32 rounding, not the literal you typed (see note) | `0.1` (float) → `0.10000000149011612` |
-| `decimal(p,s)` | **float** (precision lost beyond ~15-17 sig figs) | `Decimal("1.50")` → `1.5` |
+| `float` (32-bit) | its **short decimal representation** (the shortest string that round-trips to the same float32), so it reads back into a `FLOAT` unchanged | `0.1` (float) → `0.1` |
+| `decimal(p,s)` | rendered at **full precision** (a JSON number); an integer-valued decimal is stored exactly, a fractional one loses digits past ~15-17 sig figs only when parsed back to a float on read (see note) | `Decimal("1.50")` → `1.5`; `Decimal("123456789012345678")` → `123456789012345678` |
 | `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped). The `timestamp` epoch is the true UTC instant, independent of `spark.sql.session.timeZone` (see below) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `timestamp_ntz` | **epoch milliseconds** of the wall-clock read as UTC (see below) | `2021-06-01 12:00:00` → `1622548800000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
-| `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) using the same transform as the value type. **A `decimal` key inherits the decimal precision loss, and for a key that means colliding keys drop entries (see note)** | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
+| `struct` / `map` | nested object (recursed). Non-string `map` keys are rendered to strings (JSON keys must be strings) by `to_json`, which uses the key's **own** string form, **not** the value transform: a `timestamp`/`date`/`timestamp_ntz` **key** becomes an ISO string (a value of the same type becomes epoch-millis). Map **values** follow the value transforms as usual (see note) | `{a: 1}` → `{"a": 1}`; `map<int,_>` `{1: "x"}` → `{"1": "x"}` |
 | `array` | array (recursed) | `[1, 2]` → `[1, 2]` |
 | `null` (any type) | present as JSON `null` (the field is kept, its value is `null`) | `None` → `null` |
 | `variant` | **string containing serialized JSON** (see below) | `{"k": 1}` → `"{\"k\":1}"` |
 | `interval` | **string** (see below) | `INTERVAL '1 02:03:04' DAY TO SECOND` → `"INTERVAL '1 02:03:04' DAY TO SECOND"` |
 
-**Why `float` looks "changed":** a Spark `FLOAT` is 32-bit and can't represent `0.1` exactly, it
-holds the nearest float32, whose true value is `0.10000000149011612`. The connector stores that
-exact value (widened to a 64-bit double) rather than reformatting it back to `0.1`, so the stored
-number is faithful to what Spark actually held, not to the source literal. Use `DOUBLE` if you need
-`0.1` to store as `0.1`.
+**`float` (32-bit) round-trips faithfully:** `to_json` renders a `FLOAT` as its **short decimal
+representation** — the shortest string that parses back to the same 32-bit float — so `0.1f` stores
+as `0.1`, not the widened double `0.10000000149011612`. Read back into a `FLOAT` column it returns to
+the same float32, so there is no float32 widening delta to expect.
 
-**`decimal` map keys lose entries, not just digits:** a `map<decimal(p,s), V>` key goes through the
-same `decimal` → float conversion as a decimal *value*, so it inherits the same ~15-17 significant
-figure limit. For a **key** that limit is destructive rather than merely lossy: two distinct keys that
-differ only beyond it render to the same string, and the later entry **overwrites** the earlier one,
-so the map comes back with fewer entries than it went in with. The row still produces exactly one
-document, so the write reports success and reconciliation stays clean, there is no error and no
-count. For example, `decimal(38,0)` keys `10000000000000000000000000000000000001` and
-`...002` both render `"1e+37"`, and `Decimal("1.000000000000000001")` and `Decimal("1.000000000000000002")`
-both render `"1.0"`. Only `decimal` keys are affected: an `int`/`bigint` key never passes through a
-float (Python integers are arbitrary precision), and `date`/`binary`/`string` keys render losslessly.
-**Use a `string` or integer key type if your keys need more than ~15-17 significant figures.**
+**`decimal` beyond double precision:** `to_json` writes a decimal at full precision into `_source`, so
+an **integer-valued** decimal is stored and read back exactly, however many digits it has (a JSON
+integer parses to an arbitrary-precision Python int). A decimal with a **fractional** part beyond
+double's ~15-17 significant figures loses its low fractional digits only when the stored JSON number
+is parsed to a float on **read**. If you need exact high-precision fractional values, cast the column
+to `string` in Spark before writing (declare `StringType` on read) — the documented workaround.
+
+**Non-string `map` keys use their own string form:** `to_json` stringifies a non-string map key to its
+own representation, which for a temporal key (`timestamp`/`date`/`timestamp_ntz`) is an **ISO string**,
+not the epoch-millis a value of that type gets. `int`/`bigint`/`string` keys render as you'd expect.
+A map **keyed by** a temporal/decimal/binary type is an unusual shape; **use `string` or integer map
+keys** if you rely on the key's exact form.
 
 **Timestamp precision:** epoch-millis is floored to the containing millisecond, consistently for
 pre- and post-epoch instants (matches Spark/Java `unix_millis`). Elasticsearch `date` is
@@ -762,11 +726,10 @@ through Delta Share: no code changes, only the `EsWriteConfig` / `EsReadConfig` 
 ```
 src/databricks_es_connector/   # the library (this is what ships in the .whl)
   config.py                    #   EsConnection base + EsWriteConfig / EsReadConfig (EsConfig alias)
-  transform.py                 #   pure-Python row shaping on WRITE (timestamps, numpy/arrays, decimal, binary, pruning)
-  bulk.py                      #   executor-side mapInPandas bulk write (batch entry point)
+  spark_prep.py                #   sanitize_for_arrow (Arrow-hostile VARIANT/INTERVAL -> JSON string) + timestamp -> epoch-millis normalization
+  spark_serialize.py           #   build_ndjson: build the whole _bulk NDJSON in Spark (to_json), the WRITE serializer
+  bulk.py                      #   executor-side mapInPandas bulk write: ship the NDJSON, classify + reconcile (batch entry point)
   stream.py                    #   foreachBatch helper for Structured Streaming
-  spark_prep.py                #   sanitize_for_arrow: Arrow-hostile types (VARIANT/INTERVAL) -> JSON string
-  spark_serialize.py           #   serialize_in_spark: build the _bulk NDJSON in Spark (to_json), not per-row Python
   read_transform.py            #   pure-Python inverse coercion on READ (ES value + type -> Spark value)
   read.py                      #   read_index (distributed sliced-scroll PIT reader)
 tests/                         # unit tests for the pure-Python layer (no Spark/ES needed)

@@ -1,17 +1,18 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Integration: delete propagation (has_deletes) live through mapInPandas + ES
-# MAGIC Owns the **delete-routing** contract end-to-end: with `has_deletes=True` and a
-# MAGIC `delete_flag_column`, rows whose flag is truthy are sent to ES as delete-by-`_id` while every
-# MAGIC other row indexes as usual. Proves (against real serverless Spark + ES, not a stub) that:
+# MAGIC Owns the **delete-routing** contract end-to-end: with `has_deletes=True` and a boolean
+# MAGIC `delete_flag_column`, rows whose flag is true are sent to ES as delete-by-`_id` (build_ndjson
+# MAGIC emits a delete "header" with no source line) while every other row indexes as usual. Proves
+# MAGIC (against real serverless Spark + ES, not a stub) that:
 # MAGIC   - flagged `_id`s are removed from ES and unflagged rows are indexed;
 # MAGIC   - `result["deleted"]` counts successful deletes exactly, and the flag column is not indexed;
 # MAGIC   - a delete of an `_id` that isn't in ES is a **404 no-op** (counted as neither delete nor
 # MAGIC     error), the connector's most subtle documented rule (`classify_bulk_result`'s scoped
 # MAGIC     404 suppression), which unit tests cover in isolation but has never run live.
 # MAGIC
-# MAGIC The pure-Python suite covers `build_action` delete routing and `classify_bulk_result` with
-# MAGIC hand-built inputs; this fixture is the live counterpart. Live ES + the `es_poc` scope required.
+# MAGIC The delete flag is a real boolean column, which the write path requires (bulk._preflight rejects
+# MAGIC a non-boolean flag: Catalyst has no way to parse a string flag). Live ES + `es_poc` scope.
 
 # COMMAND ----------
 import json, requests, urllib3
@@ -41,7 +42,7 @@ class TestDeletesRoundtrip(NotebookTestFixture):
         requests.put(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30,
                      headers={"Content-Type": "application/json"}, data=json.dumps(body))
 
-        # --- phase 1: seed 4 live docs (all unflagged => all index) ---
+        # --- phase 1: seed 4 live docs (all unflagged => all index). false/true are real booleans. ---
         seed = spark.sql("""
             SELECT 'k1' AS doc_id, 1 AS n, false AS _is_delete UNION ALL
             SELECT 'k2', 2, false UNION ALL

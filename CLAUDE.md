@@ -16,8 +16,8 @@ repo's correctness depends on and that are easy to violate without knowing them:
 - **The five-places rule.** Changing how a Spark datatype is handled requires five files to move
   together (write transform, read inverse, round-trip oracle, integration fixture, README tables) or
   fidelity silently breaks. `references/2-datatype-contract.md`.
-- **The fidelity contract.** `coerce_value` and `read_coerce` must stay exact inverses except for
-  three documented one-way deltas. `references/1-fidelity-model.md`.
+- **The fidelity contract.** `build_ndjson` (`to_json`, the write serializer) and `read_coerce` must
+  stay exact inverses except for two documented one-way deltas. `references/1-fidelity-model.md`.
 - **Docs describe the current state, never the history.** No "as of 0.6.0 we...", no before/after
   tables. Pruning obsolete text is part of syncing, not optional. Run the doc-review checklist in
   `references/5-doc-review.md` at the START of a session that will modify the repo, and again at

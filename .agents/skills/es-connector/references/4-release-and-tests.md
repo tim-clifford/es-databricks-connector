@@ -7,12 +7,14 @@ them, it never re-implements them.
 
 ## Two test tiers
 
-**`tests/`, pure-Python, fast, no infra (`pytest`).** The inner loop. Covers `coerce_value`,
-`read_coerce` (including the round-trip oracle), config validation, `classify_bulk_result` / result
-merging, the streaming glue, and the PURE helpers in `spark_prep.py` (`_type_has_timestamp`,
-`_type_is_arrow_hostile`, `_hostile_columns_from_describe`, etc.). The transform core is at 100%
-line coverage. This is where refactor safety mostly lives: a behavior-changing edit to the transform
-layer fails an oracle test here.
+**`tests/`, pure-Python, fast, no infra (`pytest`).** The inner loop. Covers `read_coerce` (the read
+inverse, against the stored form), config validation, `classify_bulk_result` / result merging, the
+NDJSON shipper + `write_concurrency` fan-out (`_ship_ndjson_chunk` / `_ship_ndjson_lines`, with a fake
+ES), the delete-flag boolean preflight, the pure `spark_serialize` helpers (`_payload_columns`,
+`_type_has_float`, `_type_has_date_or_ntz`, `_epoch_type`), the streaming glue, and the PURE helpers in
+`spark_prep.py` (`_type_has_timestamp`, `_type_is_arrow_hostile`, etc.). The write serializer itself
+(`build_ndjson` / `to_json`) needs Spark, so the write<->read round-trip oracle is in the integration
+tier, not here.
 
 ```bash
 python -m pytest -q                    # ~228 tests, sub-second
@@ -68,7 +70,7 @@ integration tier above is what has to be green.
 - **`scripts/check_readme_sync.py`**, asserts every shipped module, integration fixture, and release
   script is referenced by name in the README that should list it (whole-tree invariant; catches the
   drift a diff-scoped review can't). Exit 1 with the gaps. Matching is word-boundary aware
-  (`transform.py` is NOT satisfied by `read_transform.py`).
+  (`read.py` is NOT satisfied by `read_transform.py`).
 - **`scripts/check_tier_results.py`**, asserts the tier RAN what it claims to cover: every fixture
   appears in the newest `results.json` and every `test_*` method in its source is reported BY NAME
   with a status that asserted something. `Failed: 0` cannot establish this on its own, because

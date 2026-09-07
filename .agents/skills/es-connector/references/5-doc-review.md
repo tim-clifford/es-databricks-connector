@@ -89,9 +89,9 @@ Run top to bottom; each item is a concrete "does the doc still match the code" c
    closed?" Where the class can be named in code, name it (`bulk._COLUMN_NAMING_FIELDS`) and pin it
    with a test, so a future member fails until someone decides about it.
 5. **Datatype tables.** The README "Datatype coverage" (write) and "Read fidelity" (read) tables, and
-   this skill's `references/1-fidelity-model.md`, all match `coerce_value` / `read_coerce`, and the
-   one-way-delta list is exactly three (decimal, sub-ms timestamp, float32) unless a change
-   deliberately added a fourth (which must be documented in all three places). See ref 2.
+   this skill's `references/1-fidelity-model.md`, all match `build_ndjson` (`to_json`) / `read_coerce`,
+   and the one-way-delta list is exactly two (decimal fractional precision, sub-ms timestamp) unless a
+   change deliberately added a third (which must be documented in all three places). See ref 2.
 6. **File enumeration.** `scripts/check_readme_sync.py` exits 0 (modules, fixtures, scripts are
    listed). Then eyeball that each listed description is still ACCURATE, not just present.
 7. **Release process.** `RELEASING.md` steps match the actual scripts (`scripts/*.py`), the FEVM

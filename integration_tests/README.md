@@ -6,19 +6,22 @@ structurally cannot.
 
 ## Why this exists
 
-`tests/` is fast, infra-free, and covers the pure-Python layer (`coerce_value`,
-`classify_bulk_result`, `_merge_partition_results`, `EsConfig`, and the `make_foreach_batch`
-streaming glue) with hand-built inputs and a stubbed ES client. Two things can't be tested there and
-only manifest on a live serverless session:
+`tests/` is fast, infra-free, and covers the pure-Python layer (`read_coerce`,
+`classify_bulk_result`, `_merge_partition_results`, the NDJSON shipper + `write_concurrency` fan-out,
+`EsConfig`, and the `make_foreach_batch` streaming glue) with hand-built inputs and a stubbed ES
+client. The write serializer `build_ndjson` (`to_json`) needs Spark, so it and these things can't be
+tested there and only manifest on a live serverless session:
 
+- **`build_ndjson`**: the whole write transform (Spark/Catalyst `to_json`), so the write<->read
+  round-trip oracle lives here, not offline.
 - **`sanitize_for_arrow`**: the Spark-side VARIANT/INTERVAL serialization, including the fact that
   `df.schema` *throws* on a VARIANT column under Spark Connect (the reason the connector uses
   `DESCRIBE`). `tests/test_spark_prep.py` explicitly defers this to "a live cluster".
 - **The `bulk_write` `mapInPandas` path**: real Arrow conversion of every dtype, partition
   fan-out, and the result schema (`total_input` / `error_samples`) surviving the Spark→driver trip.
 
-These fixtures also serve as **live regression coverage for the 0.3.1 fidelity fixes** (non-string
-map keys, float32 widening, pre-epoch timestamp floor).
+These fixtures also serve as **live regression coverage for the fidelity contract** (non-string
+map keys, decimal precision, pre-epoch timestamp floor).
 
 This tier is **not** part of the fast local gate: it needs a workspace, the connector wheel on a
 Volume, and (for the round-trip) a reachable ES + the `es_poc` secret scope. Keep running `pytest`
@@ -29,8 +32,8 @@ for the fast inner loop; run this before a release or on connector PRs.
 Each fixture owns one concern:
 
 - **`test_datatype_coverage.py`**: live ES. The exhaustive datatype-fidelity test: one wide row
-  covering **every** Spark type + edge cases (byte/short/int/long, float32 widening, double,
-  decimal incl. an 18-sig-fig value that proves the documented precision loss, date/timestamp incl.
+  covering **every** Spark type + edge cases (byte/short/int/long, float32 short-repr, double,
+  decimal incl. an 18-digit integer value that now round-trips exactly at full precision, date/timestamp incl.
   pre-epoch floor and `timestamp_ntz` UTC interpretation, binary, unicode string, bool,
   struct/nested-struct/partial-null-struct, map incl. non-string keys/empty-map/null-value,
   array/empty-array/array-of-struct/null-element, non-finite floats, VARIANT at every depth,
@@ -69,7 +72,7 @@ Each fixture owns one concern:
   serverless `foreachBatch` runs server-side and can't feed a driver-local capture.)
 - **`test_read_roundtrip.py`**: live ES. Owns the **write → read round-trip**: `bulk_write` then
   `read_index` with the same schema reproduces the original rows, modulo the documented one-way
-  deltas (decimal precision, sub-ms timestamp floor, float32 widening). Exercises default fan-out,
+  deltas (decimal fractional precision, sub-ms timestamp floor). Exercises default fan-out,
   multi-shard sliced-scroll fan-out, and single-slice (`num_slices=1`) multi-page `search_after`
   paging over one PIT.
 - **`test_timezone_utc.py`**: live ES. Owns the **timestamp timezone contract**: a `timestamp` (at

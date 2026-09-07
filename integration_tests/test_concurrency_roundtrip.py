@@ -1,12 +1,13 @@
 # Databricks notebook source
 # MAGIC %md
 # MAGIC # Integration: per-partition write concurrency (live mapInPandas + threaded bulk + ES)
-# MAGIC Proves `EsWriteConfig.write_concurrency > 1` is CORRECT under real serverless Spark: the
-# MAGIC threaded fan-out inside each partition (several concurrent `streaming_bulk` streams merged
-# MAGIC through a bounded queue) must not lose, duplicate, or mis-count a single document, and must
-# MAGIC keep per-document error accounting and deterministic-`_id` idempotency intact. The unit tier
-# MAGIC (`tests/test_bulk_concurrency.py`) proves the merge/retry/fail-closed logic off-cluster; only
-# MAGIC this tier proves it over the real `mapInPandas` write to a live ES. Live ES + `es_poc` scope.
+# MAGIC Proves `EsWriteConfig.write_concurrency > 1` is CORRECT under real serverless Spark: several
+# MAGIC workers each ship their strided slice of the partition's pre-built NDJSON via
+# MAGIC `es.bulk(operations=...)` (`bulk._ship_ndjson_lines`), and the fan-out must not lose,
+# MAGIC duplicate, or mis-count a single document, keeping per-document error accounting and
+# MAGIC deterministic-`_id` idempotency intact. The unit tier proves the merge/fail-closed logic
+# MAGIC off-cluster (`tests/test_spark_serialize.py`); only this tier proves it over the real
+# MAGIC `mapInPandas` write to a live ES. Live ES + `es_poc` scope.
 
 # COMMAND ----------
 import json, requests, urllib3
@@ -24,11 +25,11 @@ ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "p
 
 class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
     """write_concurrency > 1 writes every doc exactly once with correct counts, is idempotent on
-    re-write, and still counts a rejected doc, all over the live threaded mapInPandas path."""
+    re-write, and still counts a rejected doc, all over the live threaded mapInPandas write."""
 
     def run_setup(self):
-        # chunk_size deliberately small so each of the CONCURRENCY threads sends several bulk
-        # requests (fan-out spans multiple chunks per stream), not one chunk each.
+        # chunk_size deliberately small so each of the CONCURRENCY workers sends several bulk
+        # requests (fan-out spans multiple chunks per worker), not one chunk each.
         self.cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
                             index=INDEX, id_field="doc_id", http_compress=True,
                             write_concurrency=CONCURRENCY, chunk_size=100)
@@ -40,7 +41,7 @@ class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
                      headers={"Content-Type": "application/json"}, data=json.dumps(body))
 
         # N unique rows across a few partitions, so mapInPandas runs several partitions AND each
-        # partition fans across CONCURRENCY threads. Unique doc_id => ES _count == N iff nothing was
+        # partition fans across CONCURRENCY workers. Unique doc_id => ES _count == N iff nothing was
         # lost or duplicated by the concurrent merge.
         df = (spark.range(N)
                    .selectExpr("concat('d', id) AS doc_id", "CAST(id AS INT) AS n")
@@ -79,7 +80,7 @@ class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
         assert r["overcounted"] == 0, r      # no doc classified twice by the merge
 
     def test_es_holds_exactly_n_docs(self):
-        # Ground truth: the live index has exactly N docs, so the concurrent streams neither dropped
+        # Ground truth: the live index has exactly N docs, so the concurrent workers neither dropped
         # nor duplicated any document.
         assert self.es_count == N, self.es_count
 

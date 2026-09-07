@@ -1,8 +1,9 @@
 """Spark-side prep for types that cannot cross Arrow into mapInPandas.
 
-Most Spark types survive the Arrow -> pandas conversion inside `bulk_write` and are made
-JSON-safe by `transform.coerce_value`. A few types fail Arrow conversion *before* any Python
-code runs, so they cannot be fixed on the executor: they must be rewritten in Spark first:
+Most Spark types survive the Arrow -> pandas conversion inside `bulk_write` and are serialized by
+`to_json` in Catalyst (see `spark_serialize.build_ndjson`). A few types fail Arrow conversion
+*before* any Python code runs, so they cannot be fixed on the executor: they must be rewritten in
+Spark first:
 
   - VARIANT. Arrow has no VARIANT type. A column whose type contains VARIANT at ANY nesting
     depth (e.g. `variant`, `struct<...,v:variant>`, `array<struct<...,v:variant>>`) cannot be
@@ -16,7 +17,7 @@ string), while a scalar (top-level) INTERVAL is `cast(... as string)`, because S
 REJECTS a scalar interval (`[DATATYPE_MISMATCH.INVALID_JSON_SCHEMA] Input schema must be a struct,
 an array, a map or a variant`). It is called automatically by `bulk_write`, so callers do NOT need
 to pre-process anything, any valid Spark DataFrame just works. Only Arrow-hostile columns are
-touched; every other column is left exactly as-is (and handled downstream by `coerce_value`).
+touched; every other column is left exactly as-is (and serialized downstream by `to_json`).
 
 Serverless / Spark Connect constraint (this is why the implementation looks the way it does):
 On Spark Connect, ANY schema accessor that builds Python type objects throws on a VARIANT column:
@@ -144,26 +145,23 @@ def sanitize_for_arrow(df: "DataFrame") -> "DataFrame":
 # --- timestamp -> epoch-millis in Spark (timezone-safe) --------------------------------------
 # Why this exists: Spark's Arrow export converts a `TimestampType` (an instant) to a naive pandas
 # Timestamp using `spark.sql.session.timeZone`, i.e. the session-LOCAL wall-clock with the zone
-# dropped. Under any non-UTC session, `transform.coerce_value` (which reads a naive datetime as
-# UTC) then computes an epoch offset by the session's UTC offset -- silent timestamp corruption,
-# present since 0.1.0 and only surfaced by running the datatype test under a non-UTC session.
+# dropped. If that naive wall-clock were then serialized as-is, the stored epoch would be off by the
+# session's UTC offset under any non-UTC session -- silent timestamp corruption, only surfaced by
+# running the datatype test under a non-UTC session.
 #
 # Fix, mirroring how the elasticsearch-hadoop connector stays tz-safe: convert every `TimestampType`
 # to its epoch-millis long IN SPARK via `unix_millis`, which operates on the instant and is therefore
 # independent of session.timeZone (verified on serverless under UTC / America/New_York /
-# Asia/Kolkata; correct for pre-epoch and sub-millisecond flooring too). The value then reaches the
-# executor already an integer, so coerce_value passes it straight through and the READ path is
-# unchanged (it already reconstructs a `timestamp` from epoch-millis).
+# Asia/Kolkata; correct for pre-epoch and sub-millisecond flooring too). The stored epoch is then the
+# true UTC instant regardless of session tz, and `read_coerce` reconstructs a `timestamp` from it.
 #
 # Deliberately NOT touched:
 #   - TimestampNTZType: a zoneless wall-clock. The connector's contract is to read it AS UTC, which
-#     is exactly what the current path already produces (verified). `unix_millis` also REJECTS ntz.
-#   - DateType: has no time-of-day, converts to midnight-UTC epoch correctly already (verified).
-# Only `TimestampType` at any nesting depth is rewritten. On the DEFAULT path the above two are then
-# turned into epoch-millis in Python by `transform.coerce_value` (they cross Arrow as native
-# date/datetime). The `serialize_in_spark` path never runs coerce_value, so it converts DateType and
-# TimestampNTZType to the same epoch-millis itself in `spark_serialize.build_ndjson` (which runs after
-# this), NOT here, so the default path's proven behavior is untouched.
+#     is exactly what `build_ndjson` produces. `unix_millis` also REJECTS ntz.
+#   - DateType: has no time-of-day, converts to midnight-UTC epoch correctly.
+# Only `TimestampType` at any nesting depth is rewritten here. DateType and TimestampNTZType are
+# converted to the same epoch-millis in `spark_serialize.build_ndjson` (which runs after this), so the
+# whole temporal contract is epoch-millis end to end.
 
 
 def _type_has_timestamp(dt: "DataType") -> bool:

@@ -6,13 +6,18 @@ was lost, coerced, or sent somewhere unintended. Every one of these was verified
 
 Grouped by the failure they prevent:
   1. a rejected micro-batch advancing the Structured Streaming checkpoint (the worst one)
-  2. per-document 429s never being retried
+  2. per-document 429 retry configuration (the config half; the shipper half is in test_spark_serialize)
   3. reconciliation being unable to tell a delete-404 no-op from a lost row
  10. a typo'd index name auto-creating a dynamically-mapped index
  11/12. read_coerce returning plausible-looking wrong values on a schema mismatch
  13. a misspelled drop_fields entry silently pruning nothing (PII egress control failing open)
- 15. inf/-inf/NaN becoming JSON null with no count
- 16. an ambiguous delete-flag string silently meaning "not a delete"
+ 14/17-21. read-config plumbing, column-naming preflight, read guards, and the overcount split
+
+Two hardening behaviors that used to live here moved with the 0.9.0 single-write-path change: the
+inf/-inf/NaN -> JSON null coercion is now uncounted (built in Spark, proven in the integration tier),
+and delete flags must be a real boolean (routing is proven in integration test_deletes_roundtrip and
+the boolean preflight in test_spark_serialize), so the per-row coerce_value/_is_delete_flagged tests
+are gone.
 """
 import inspect
 import json
@@ -22,13 +27,12 @@ import pytest
 import databricks_es_connector.bulk as bulk_mod
 import databricks_es_connector.stream as stream_mod
 from databricks_es_connector.bulk import (
-    EsWriteError, _merge_partition_results, make_partition_writer, reconcile_or_raise,
+    EsWriteError, _merge_partition_results, reconcile_or_raise,
 )
 from databricks_es_connector.config import EsConfig, EsReadConfig, EsWriteConfig
 from databricks_es_connector.read_transform import (
     ReadSchemaMismatch, read_coerce, _INT_WIDTH_BOUNDS)
 from databricks_es_connector.stream import IGNORE, LOG, RAISE, make_foreach_batch
-from databricks_es_connector.transform import AmbiguousDeleteFlag, build_action, coerce_value
 
 
 def _cfg(**kw):
@@ -209,34 +213,6 @@ def test_negative_unaccounted_does_not_raise():
 # =====================================================================================
 # Item 2: per-document retries for retryable rejections (429)
 # =====================================================================================
-
-def test_writer_passes_per_doc_retry_settings_to_streaming_bulk(monkeypatch):
-    # streaming_bulk's own default is max_retries=0, so an item-level 429 got ZERO retries. The
-    # transport-level EsConnection.max_retries does not cover it: _bulk returns HTTP 200 even when
-    # individual documents fail, so the transport retry never sees them.
-    pd = pytest.importorskip("pandas")
-    import elasticsearch
-    import elasticsearch.helpers
-
-    captured = {}
-
-    class _FakeES:
-        def __init__(self, **kw):
-            pass
-
-    def _stub(es, actions, **kw):
-        captured.update(kw)
-        return iter([(True, {"index": {"status": 201}})])
-
-    monkeypatch.setattr(elasticsearch, "Elasticsearch", _FakeES)
-    monkeypatch.setattr(elasticsearch.helpers, "streaming_bulk", _stub)
-
-    writer = make_partition_writer(_cfg(max_retries_per_doc=5, retry_on_doc_status=(429, 503)))
-    list(writer(iter([pd.DataFrame({"doc_id": ["a"]})])))
-
-    assert captured["max_retries"] == 5
-    assert tuple(captured["retry_on_status"]) == (429, 503)
-
 
 def test_config_default_retries_per_doc_is_nonzero():
     # The whole point: the default must not be elasticsearch-py's 0.
@@ -450,8 +426,18 @@ def test_retry_warning_points_at_the_caller_not_the_library():
 # =====================================================================================
 
 class _ColsDF:
-    def __init__(self, cols):
+    """Stand-in DataFrame for _preflight. Exposes .columns and a minimal .schema (types default to
+    'string'; pass `types={col: 'boolean'}` for the delete-flag type check)."""
+    def __init__(self, cols, types=None):
         self.columns = list(cols)
+        types = types or {}
+        fields = []
+        for c in cols:
+            tn = types.get(c, "string")
+            dt = type("_T", (), {"typeName": (lambda t: (lambda self: t))(tn),
+                                 "simpleString": (lambda t: (lambda self: t))(tn)})()
+            fields.append(type("_F", (), {"name": c, "dataType": dt})())
+        self.schema = type("_S", (), {"fields": fields})()
 
 
 def test_preflight_rejects_unknown_drop_field():
@@ -552,107 +538,6 @@ def test_preflight_skips_index_check_when_disabled(monkeypatch):
 
     monkeypatch.setattr(elasticsearch, "Elasticsearch", _boom)
     bulk_mod._preflight(_ColsDF(["doc_id"]), _cfg(require_existing_index=False))
-
-
-# =====================================================================================
-# Item 15: inf / -inf / NaN silently becoming JSON null must be COUNTED
-# =====================================================================================
-
-def test_coerce_value_counts_infinity():
-    stats = {}
-    assert coerce_value(float("inf"), stats) is None
-    assert coerce_value(float("-inf"), stats) is None
-    assert stats["coerced_nonfinite"] == 2
-
-
-def test_coerce_value_counts_nan():
-    # A NaN is a real value that became null, unlike a None that was already null.
-    stats = {}
-    assert coerce_value(float("nan"), stats) is None
-    assert stats["coerced_nonfinite"] == 1
-
-
-def test_coerce_value_does_not_count_a_genuine_none():
-    stats = {}
-    assert coerce_value(None, stats) is None
-    assert stats.get("coerced_nonfinite", 0) == 0
-
-
-def test_coerce_value_counts_nested_nonfinite():
-    # A divide-by-zero inside a struct/array is just as invisible as one at the top level.
-    stats = {}
-    coerce_value({"a": [1.0, float("inf")], "b": {"c": float("-inf")}}, stats)
-    assert stats["coerced_nonfinite"] == 2
-
-
-def test_coerce_value_without_stats_still_works():
-    # The counter is optional; the pure transform must keep its old signature behavior.
-    assert coerce_value(float("inf")) is None
-
-
-def test_build_action_threads_stats_through():
-    stats = {}
-    build_action({"doc_id": "a", "ratio": float("inf")}, index="i", id_field="doc_id", stats=stats)
-    assert stats["coerced_nonfinite"] == 1
-
-
-def test_writer_reports_coerced_nonfinite(monkeypatch):
-    pd = pytest.importorskip("pandas")
-    import elasticsearch
-    import elasticsearch.helpers
-
-    class _FakeES:
-        def __init__(self, **kw):
-            pass
-
-    monkeypatch.setattr(elasticsearch, "Elasticsearch", _FakeES)
-    monkeypatch.setattr(elasticsearch.helpers, "streaming_bulk",
-                        lambda es, actions, **kw: iter([(True, {"index": {"status": 201}})]))
-
-    writer = make_partition_writer(_cfg())
-    out = list(writer(iter([pd.DataFrame({"doc_id": ["a"], "ratio": [float("inf")]})])))
-    assert int(out[0].iloc[0]["coerced_nonfinite"]) == 1
-
-
-# =====================================================================================
-# Item 16: an ambiguous delete-flag string must raise, not quietly mean "not a delete"
-# =====================================================================================
-
-@pytest.mark.parametrize("flag", ["on", "enabled", "delete", "2", "-1", "yep", "0.0"])
-def test_ambiguous_delete_flag_raises(flag):
-    # Each of these reads as truthy to a human but used to mean "keep the document", leaving a doc
-    # in ES that should have been deleted, with no error and no count.
-    with pytest.raises(AmbiguousDeleteFlag):
-        build_action({"doc_id": "a", "_is_delete": flag}, index="i", id_field="doc_id",
-                     has_deletes=True, delete_flag_column="_is_delete")
-
-
-@pytest.mark.parametrize("flag", ["true", "True", "TRUE", " t ", "1", "yes", "Y"])
-def test_recognized_true_strings_still_delete(flag):
-    action = build_action({"doc_id": "a", "_is_delete": flag}, index="i", id_field="doc_id",
-                          has_deletes=True, delete_flag_column="_is_delete")
-    assert action["_op_type"] == "delete"
-
-
-@pytest.mark.parametrize("flag", ["false", "False", "f", "0", "no", "N", "", "   "])
-def test_recognized_false_strings_still_index(flag):
-    action = build_action({"doc_id": "a", "_is_delete": flag}, index="i", id_field="doc_id",
-                          has_deletes=True, delete_flag_column="_is_delete")
-    assert action.get("_op_type") != "delete"
-
-
-def test_null_delete_flag_is_not_a_delete():
-    # A missing flag must never be read as a delete.
-    action = build_action({"doc_id": "a", "_is_delete": None}, index="i", id_field="doc_id",
-                          has_deletes=True, delete_flag_column="_is_delete")
-    assert action.get("_op_type") != "delete"
-
-
-def test_boolean_delete_flag_is_unambiguous():
-    for value, is_delete in ((True, True), (False, False), (1, True), (0, False)):
-        action = build_action({"doc_id": "a", "_is_delete": value}, index="i", id_field="doc_id",
-                              has_deletes=True, delete_flag_column="_is_delete")
-        assert (action.get("_op_type") == "delete") is is_delete
 
 
 # =====================================================================================
@@ -843,7 +728,8 @@ def test_preflight_delete_flag_error_is_actionable():
 
 def test_preflight_accepts_a_present_delete_flag_column():
     cfg = _cfg(has_deletes=True, delete_flag_column="_is_delete", require_existing_index=False)
-    bulk_mod._preflight(_ColsDF(["doc_id", "_is_delete"]), cfg)   # must not raise
+    # The flag must be a real boolean (0.9.0 routes deletes in Catalyst via `flag === true`).
+    bulk_mod._preflight(_ColsDF(["doc_id", "_is_delete"], types={"_is_delete": "boolean"}), cfg)
 
 
 def test_preflight_ignores_delete_flag_when_deletes_are_off():
@@ -901,8 +787,8 @@ def test_read_coerce_still_accepts_string():
 # Item 19: a BooleanType read must not turn the string "false" into True
 #
 # bool("false") is True, so an ES field storing the STRING "false" (common when reading an index
-# the connector did not write) silently inverts. Proven live: Row(doc_id='b1', flag=True).
-# Mirrors the write side's _is_delete_flagged, which already refuses to guess.
+# the connector did not write) silently inverts. Proven live: Row(doc_id='b1', flag=True). The read
+# side parses an explicit allow-list in both directions and refuses anything else, rather than guess.
 # =====================================================================================
 
 def test_read_coerce_boolean_parses_false_strings():
@@ -923,42 +809,19 @@ def test_read_coerce_boolean_rejects_ambiguous_strings():
 
 
 def test_read_coerce_boolean_rejects_empty_and_whitespace_strings():
-    """The one input where the read side deliberately does NOT match the write side.
+    """An empty/whitespace string declared boolean does not parse: raise, don't invent a value.
 
-    `transform._is_delete_flagged("")` returns False, because there an empty string means "no flag
-    present" and an absent flag must never be read as a delete. Here the caller has DECLARED the
-    column boolean and Elasticsearch stored a string, so "" is a value that does not parse rather
-    than an absence: a real null reads as None long before this branch. Returning False would invent
-    a datum the source does not contain, in the column type where nobody re-checks.
+    The caller has DECLARED this column boolean and Elasticsearch stored a string, so "" is a value
+    that does not parse rather than an absence (a real null reads as None long before this branch).
+    Returning False would invent a datum the source does not contain, in the column type where nobody
+    re-checks.
 
-    Pinned because nothing covered it: an "obvious" symmetry fix would silently turn unparseable
-    data into False, and this is the test that would stop it.
+    Pinned because nothing covered it: an "obvious" fix would silently turn unparseable data into
+    False, and this is the test that would stop it.
     """
     for s in ("", " ", "   ", "\t", "\n"):
         with pytest.raises(ReadSchemaMismatch):
             read_coerce(s, "boolean")
-
-
-def test_write_side_still_treats_an_empty_delete_flag_as_absent():
-    # The other half of the asymmetry, pinned so a later "make these consistent" change has to
-    # break a test rather than silently start deleting (or refusing) rows. An empty flag means the
-    # row is not a delete, matching the null rule.
-    from databricks_es_connector.transform import _is_delete_flagged
-
-    for s in ("", " ", "   ", "\t"):
-        assert _is_delete_flagged(s) is False, f"{s!r} must mean 'not a delete', not raise"
-
-
-def test_read_and_write_boolean_parsing_agree_on_every_recognized_string():
-    # Whatever the empty-string difference, the two allow-lists must not drift apart on the values
-    # they DO recognize: a string that deletes a row on write must read back as True, and vice
-    # versa. Divergence there would be a genuine round-trip inversion.
-    from databricks_es_connector.transform import _is_delete_flagged
-
-    for s in ("true", "True", "TRUE", "t", "1", "yes", "y", " t "):
-        assert _is_delete_flagged(s) is True and read_coerce(s.strip(), "boolean") is True, s
-    for s in ("false", "False", "FALSE", "f", "0", "no", "n"):
-        assert _is_delete_flagged(s) is False and read_coerce(s, "boolean") is False, s
 
 
 def test_read_coerce_boolean_keeps_real_booleans_and_numbers():
@@ -1150,15 +1013,3 @@ def test_positive_unaccounted_still_raises():
               "unaccounted": 3, "error_samples": []}
     with pytest.raises(EsWriteError, match="unaccounted"):
         reconcile_or_raise(result, index="i")
-
-
-# =====================================================================================
-# Item 21: to_es_source's `id_field` parameter was accepted but had NO effect (dead parameter)
-# =====================================================================================
-
-def test_to_es_source_has_no_dead_id_field_parameter():
-    import databricks_es_connector.transform as tmod
-    params = inspect.signature(tmod.to_es_source).parameters
-    assert "id_field" not in params, (
-        "to_es_source accepted id_field but ignored it entirely; a public parameter that lies is "
-        "worse than no parameter")
