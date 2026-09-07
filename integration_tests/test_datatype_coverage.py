@@ -312,14 +312,22 @@ class TestDatatypeCoverage(NotebookTestFixture):
         # fractional zeros -- 123456789012345678.00 -- i.e. a JSON number carrying a decimal point.
         # On read that parses to a double and loses digits past ~15-17 sig figs EVEN THOUGH the value
         # is integral, unlike the scale-0 s_decimal_hi above (a bare integer literal, exact). So the
-        # contract "integer-valued decimals are exact" holds ONLY at scale 0; this pins the limitation
-        # end-to-end. `requests` parses the returned _source number exactly as the ES client would (a
-        # value with a decimal point -> Python float), so the low digits are already gone here.
+        # contract "integer-valued decimals are exact" holds ONLY at scale 0; this pins the limitation.
+        #
+        # DISCRIMINATE BY TYPE, not by value: applying float() ourselves would itself lose the low
+        # digits and make the check pass no matter what (a check that cannot fail). The real signal is
+        # the PARSED TYPE. `requests` parses the returned _source number the way the ES client would:
+        # a value with a decimal point ("...678.00") -> Python FLOAT (lossy); a bare integer literal
+        # ("...678", the scale-0 case) -> exact Python int. So a float here PROVES the scale>0 lossy
+        # render, and this fails red if to_json did not emit the decimal point (it would arrive as an
+        # exact int, as the scale-0 sibling s_decimal_hi does).
         got = self._got("s_decimal_hi_s2")
-        assert int(round(float(got))) != 123456789012345678, (
-            f"s_decimal_hi_s2: expected a scale-2 integral decimal to lose low digits on read, but "
-            f"got exact {got!r} -- if this fires, to_json did NOT emit trailing '.00' and the "
-            "scale>0 precision-loss finding is wrong; revisit the decimal docs.")
+        assert isinstance(got, float), (
+            f"s_decimal_hi_s2: expected a float (scale-2 written with a decimal point -> lossy), got "
+            f"{type(got).__name__} {got!r}. If this is an exact int, to_json did NOT emit trailing "
+            "'.00' and the scale>0 precision-loss finding is wrong; revisit the decimal docs.")
+        assert int(got) != 123456789012345678, (
+            f"s_decimal_hi_s2: the stored float should have lost the low digits, but int(got)={int(got)}")
 
     # --- Arrow-hostile: VARIANT (any depth) + INTERVAL, serialized to strings by the connector ---
     def test_variant_top_level(self):
