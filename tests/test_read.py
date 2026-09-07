@@ -98,6 +98,13 @@ def test_reject_non_string_map_keys_allows_string_keys():
                                  ("st", ("struct", [("x", "int")]))])   # no raise
 
 
+def test_reject_non_string_map_keys_allows_collated_string_keys():
+    # A COLLATED string is still a StringType and reads back as a string, so its map key round-trips.
+    # Its simpleString() is "string collate <name>" (Spark 4.x), which must be accepted, not rejected.
+    _reject_non_string_map_keys([("m", ("map", "string collate UNICODE", "int")),
+                                 ("m2", ("map", "string collate en_US", "string"))])   # no raise
+
+
 def test_reject_non_string_map_keys_rejects_int_key():
     with pytest.raises(ReadSchemaMismatch, match="key type 'int'.*map<string,V>"):
         _reject_non_string_map_keys([("m", ("map", "int", "string"))])

@@ -83,12 +83,15 @@ def _reject_non_string_map_keys_in_token(token, path: str) -> None:
         _reject_non_string_map_keys_in_token(token[1], f"{path}[]")
     elif kind == "map":
         key_token, val_token = token[1], token[2]
-        # Only an exact `string` key round-trips. char/varchar are string-family but are themselves
-        # unsupported read types (read_coerce._UNSUPPORTED_SCALAR_TOKENS: they fail the mapInPandas
-        # return-schema cast with "Invalid return type"), so a `map<varchar(n),V>` would not round-trip
-        # either; rejecting it here just fails earlier with a clearer, map-specific message pointing at
-        # the same fix (declare the key as StringType). Anything else non-string is likewise rejected.
-        if key_token != "string":
+        # A `StringType` key round-trips: keys read back as JSON strings. That includes a COLLATED
+        # string, whose simpleString() is "string collate <name>" (Spark 4.x), so accept that prefix
+        # too or a collated-string key is wrongly rejected. char/varchar, by contrast, are string-family
+        # but are themselves unsupported read types (read_coerce._UNSUPPORTED_SCALAR_TOKENS: they fail
+        # the mapInPandas return-schema cast with "Invalid return type"), so a `map<varchar(n),V>` would
+        # not round-trip anyway; rejecting it here just fails earlier with a clearer, map-specific
+        # message pointing at the same fix (declare the key as StringType). Everything non-string
+        # (int/timestamp/decimal/binary/...) is rejected.
+        if not (key_token == "string" or key_token.startswith("string collate ")):
             raise ReadSchemaMismatch(
                 f"map field {path!r} is declared with key type {key_token!r}, but Elasticsearch "
                 "stores JSON object keys as strings (the write path stringifies every non-string "
