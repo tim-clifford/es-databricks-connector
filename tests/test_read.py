@@ -103,6 +103,16 @@ def test_reject_non_string_map_keys_rejects_int_key():
         _reject_non_string_map_keys([("m", ("map", "int", "string"))])
 
 
+def test_reject_non_string_map_keys_rejects_string_family_but_unsupported_keys():
+    # char/varchar are string-family but are themselves unsupported read types (they fail the
+    # mapInPandas return-schema cast), so a map keyed by them cannot round-trip and is rejected here
+    # too, consistently, pointing at the same fix (declare the key as StringType). Only an exact
+    # `string` key is accepted.
+    for keytok in ("varchar(10)", "char(5)", "int", "timestamp"):
+        with pytest.raises(ReadSchemaMismatch, match="map<string,V>"):
+            _reject_non_string_map_keys([("m", ("map", keytok, "string"))])
+
+
 def test_reject_non_string_map_keys_rejects_nested_map_key():
     # A bad map key nested inside a struct / array / map VALUE is caught, and the path names it.
     with pytest.raises(ReadSchemaMismatch, match=r"'outer\.inner'.*key type 'timestamp'"):
