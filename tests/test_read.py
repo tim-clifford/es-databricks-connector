@@ -9,7 +9,9 @@ import pytest
 from databricks_es_connector import EsReadConfig
 from databricks_es_connector.read import (
     _coerce_hit, _schema_field_tokens, _resolve_num_slices, _make_slice_reader, _spark_type_token,
+    _reject_non_string_map_keys,
 )
+from databricks_es_connector.read_transform import ReadSchemaMismatch
 
 
 def _rcfg(**kw):
@@ -82,6 +84,72 @@ def test_spark_type_token_builds_container_tuples():
             ("n", "long"),
         ],
     )
+
+
+# --- _reject_non_string_map_keys: a map key type other than string cannot round-trip ---------
+# ES stores JSON object keys as strings and the write path stringifies non-string keys, so only
+# map<string,V> is readable. The guard walks the declared token tree and fails closed on the driver.
+
+def test_reject_non_string_map_keys_allows_string_keys():
+    # map<string,int> and every non-map shape must pass untouched.
+    _reject_non_string_map_keys([("m", ("map", "string", "int")),
+                                 ("s", "string"),
+                                 ("a", ("array", "long")),
+                                 ("st", ("struct", [("x", "int")]))])   # no raise
+
+
+def test_reject_non_string_map_keys_allows_collated_string_keys():
+    # A COLLATED string is still a StringType and reads back as a string, so its map key round-trips.
+    # Its simpleString() is "string collate <name>" (Spark 4.x), which must be accepted, not rejected.
+    _reject_non_string_map_keys([("m", ("map", "string collate UNICODE", "int")),
+                                 ("m2", ("map", "string collate en_US", "string"))])   # no raise
+
+
+def test_reject_non_string_map_keys_rejects_int_key():
+    with pytest.raises(ReadSchemaMismatch, match="key type 'int'.*map<string,V>"):
+        _reject_non_string_map_keys([("m", ("map", "int", "string"))])
+
+
+def test_reject_non_string_map_keys_rejects_string_family_but_unsupported_keys():
+    # char/varchar are string-family but are themselves unsupported read types (they fail the
+    # mapInPandas return-schema cast), so a map keyed by them cannot round-trip and is rejected here
+    # too, consistently, pointing at the same fix (declare the key as StringType). Only an exact
+    # `string` key is accepted.
+    for keytok in ("varchar(10)", "char(5)", "int", "timestamp"):
+        with pytest.raises(ReadSchemaMismatch, match="map<string,V>"):
+            _reject_non_string_map_keys([("m", ("map", keytok, "string"))])
+
+
+def test_reject_non_string_map_keys_rejects_complex_key_without_crashing():
+    # A complex map key type (array/struct/map) makes _spark_type_token hand us a TUPLE key token.
+    # It must be rejected with ReadSchemaMismatch, NOT crash with AttributeError on .startswith.
+    for keytok in (("array", "int"), ("struct", [("x", "int")]), ("map", "string", "int")):
+        with pytest.raises(ReadSchemaMismatch, match="map<string,V>"):
+            _reject_non_string_map_keys([("m", ("map", keytok, "string"))])
+
+
+def test_reject_non_string_map_keys_rejects_nested_map_key():
+    # A bad map key nested inside a struct / array / map VALUE is caught, and the path names it.
+    with pytest.raises(ReadSchemaMismatch, match=r"'outer\.inner'.*key type 'timestamp'"):
+        _reject_non_string_map_keys([("outer", ("struct", [("inner", ("map", "timestamp", "long"))]))])
+    with pytest.raises(ReadSchemaMismatch, match=r"'arr\[\]'"):
+        _reject_non_string_map_keys([("arr", ("array", ("map", "int", "string")))])
+    # value-side map: outer key is fine (string), inner map value carries a bad key
+    with pytest.raises(ReadSchemaMismatch, match=r"'m\{\}'"):
+        _reject_non_string_map_keys([("m", ("map", "string", ("map", "int", "int")))])
+
+
+def test_read_index_rejects_non_string_map_key_before_touching_es(monkeypatch):
+    # The guard fires in read_index before a PIT is opened: a map<int,_> schema raises and ES is
+    # never contacted (mirrors test_read_index_validates_before_touching_es for the empty schema).
+    import databricks_es_connector.read as read_mod
+    es = _FakeSearchES([])
+    _install_fake_es(monkeypatch, es)
+    schema = _FakeStruct([("m", _FakeMap(_FakeScalar("int"), _FakeScalar("string")))])
+    with pytest.raises(ReadSchemaMismatch, match="map<string,V>"):
+        read_mod.read_index(_FakeSpark(), _rcfg(), schema)
+    # Raised before the try/finally that opens+closes the driver client and PIT: neither ran.
+    assert es.calls == [] and es.client_closed == 0 and es.closed == []
 
 
 # --- _coerce_hit: map one ES hit to a schema-shaped row --------------------------------------

@@ -95,7 +95,8 @@ class TestDatatypeCoverage(NotebookTestFixture):
               array(1, CAST(NULL AS INT), 3)                  AS s_array_null_el, -- null array ELEMENT
               named_struct('inner', named_struct('x',1))      AS s_nested_struct,
               named_struct('a', 1, 'b', CAST(NULL AS INT))    AS s_struct_null_fld, -- partial-null struct
-              CAST(123456789012345678 AS DECIMAL(38,0))       AS s_decimal_hi,    -- 18 sig figs: lossy
+              CAST(123456789012345678 AS DECIMAL(38,0))       AS s_decimal_hi,    -- 18 digits, scale 0: exact
+              CAST(123456789012345678 AS DECIMAL(38,2))       AS s_decimal_hi_s2, -- same value, scale 2: lossy on read
               double('Infinity')                              AS s_pos_inf,       -- non-finite
               double('-Infinity')                             AS s_neg_inf,
               double('NaN')                                   AS s_nan,
@@ -143,6 +144,7 @@ class TestDatatypeCoverage(NotebookTestFixture):
               CAST(NULL AS STRUCT<inner:STRUCT<x:INT>>)      AS s_nested_struct,
               CAST(NULL AS STRUCT<a:INT,b:INT>)              AS s_struct_null_fld,
               CAST(NULL AS DECIMAL(38,0))                    AS s_decimal_hi,
+              CAST(NULL AS DECIMAL(38,2))                    AS s_decimal_hi_s2,
               CAST(NULL AS DOUBLE)                           AS s_pos_inf,
               CAST(NULL AS DOUBLE)                           AS s_neg_inf,
               CAST(NULL AS DOUBLE)                           AS s_nan,
@@ -305,6 +307,28 @@ class TestDatatypeCoverage(NotebookTestFixture):
         got = self._got("s_decimal_hi")
         assert int(got) == 123456789012345678, f"s_decimal_hi: got {got!r} (expected exact 18 digits)"
 
+    def test_decimal_scale2_integer_loses_precision(self):
+        # SCALE MATTERS. A decimal WITH SCALE (s>0) is rendered by to_json WITH its trailing
+        # fractional zeros -- 123456789012345678.00 -- i.e. a JSON number carrying a decimal point.
+        # On read that parses to a double and loses digits past ~15-17 sig figs EVEN THOUGH the value
+        # is integral, unlike the scale-0 s_decimal_hi above (a bare integer literal, exact). So the
+        # contract "integer-valued decimals are exact" holds ONLY at scale 0; this pins the limitation.
+        #
+        # DISCRIMINATE BY TYPE, not by value: applying float() ourselves would itself lose the low
+        # digits and make the check pass no matter what (a check that cannot fail). The real signal is
+        # the PARSED TYPE. `requests` parses the returned _source number the way the ES client would:
+        # a value with a decimal point ("...678.00") -> Python FLOAT (lossy); a bare integer literal
+        # ("...678", the scale-0 case) -> exact Python int. So a float here PROVES the scale>0 lossy
+        # render, and this fails red if to_json did not emit the decimal point (it would arrive as an
+        # exact int, as the scale-0 sibling s_decimal_hi does).
+        got = self._got("s_decimal_hi_s2")
+        assert isinstance(got, float), (
+            f"s_decimal_hi_s2: expected a float (scale-2 written with a decimal point -> lossy), got "
+            f"{type(got).__name__} {got!r}. If this is an exact int, to_json did NOT emit trailing "
+            "'.00' and the scale>0 precision-loss finding is wrong; revisit the decimal docs.")
+        assert int(got) != 123456789012345678, (
+            f"s_decimal_hi_s2: the stored float should have lost the low digits, but int(got)={int(got)}")
+
     # --- Arrow-hostile: VARIANT (any depth) + INTERVAL, serialized to strings by the connector ---
     def test_variant_top_level(self):
         self._assert_variant("s_variant", {"k": 1, "nested": [2, 3]})
@@ -346,7 +370,7 @@ class TestDatatypeCoverage(NotebookTestFixture):
     def test_no_unexpected_fields(self):
         expected_cols = {
             "doc_id", "s_string", "s_bool", "s_byte", "s_short", "s_int", "s_long", "s_float",
-            "s_double", "s_float32_prec", "s_decimal", "s_decimal_hi", "s_date", "s_timestamp",
+            "s_double", "s_float32_prec", "s_decimal", "s_decimal_hi", "s_decimal_hi_s2", "s_date", "s_timestamp",
             "s_ts_preepoch", "s_timestamp_ntz", "s_binary", "s_struct", "s_map", "s_map_int", "s_map_intkey",
             "s_empty_map", "s_map_null_val", "s_array", "s_array_struct", "s_empty_array",
             "s_array_null_el", "s_struct_null_fld", "s_nested_struct", "s_pos_inf", "s_neg_inf",

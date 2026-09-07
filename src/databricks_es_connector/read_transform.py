@@ -192,7 +192,10 @@ def read_coerce(value: Any, target: Any) -> Any:
             seq = value if isinstance(value, (list, tuple)) else [value]   # ES scalar-as-1-elem
             return [read_coerce(x, elem) for x in seq]
         if kind == "map":
-            # JSON object keys are always strings; coerce values by the value sub-token.
+            # JSON object keys are always strings, so keys pass through as-is and only values are
+            # coerced (by the value sub-token). A non-string declared key type cannot round-trip and is
+            # rejected up front by read._reject_non_string_map_keys (driver-side, before any read), so
+            # the key token here is always "string" on the read_index path.
             valtype = target[2]
             return {k: read_coerce(v, valtype) for k, v in dict(value).items()}
         if kind == "struct":

@@ -325,16 +325,17 @@ data stays across executors (never collected to the driver), so it scales for fu
 Reads honor the **same contract as writes**: `read_index(cfg, df.schema)` after `bulk_write(df,
 cfg)` reproduces the original DataFrame, **except** the deltas the
 [Datatype coverage](#datatype-coverage-write-transforms--read-inverse) table documents as one-way:
-sub-millisecond timestamp truncation, and a `decimal` with fractional precision beyond double's
-~15-17 sig figs (integer-valued decimals round-trip exactly). Each read coercion is the exact inverse
-of the write transform:
+sub-millisecond timestamp truncation, and a `decimal` whose stored JSON number is parsed to a double
+on read (exact only at scale 0, where `to_json` writes a bare integer literal; a `decimal(p,s)` with
+`s>0` writes a decimal point and loses low digits past ~15-17 sig figs even for an integral value).
+Each read coercion is the exact inverse of the write transform:
 
 | Declared Spark type | Stored in ES | Read back as |
 |---|---|---|
 | `timestamp` / `date` | epoch-millis integer | `datetime` / `date` (UTC) |
 | `timestamp_ntz` | epoch-millis integer | naive `datetime` (no tzinfo, the UTC wall-clock) |
 | `binary` | base64 string | `bytes` |
-| `decimal(p,s)` | full-precision JSON number | `Decimal` (exact if integer-valued; a fractional value past ~15-17 sig figs loses low digits when parsed to a float on read) |
+| `decimal(p,s)` | full-precision JSON number (the declared scale is kept, so a scale>0 value carries a decimal point) | `Decimal` (exact only when written without a decimal point, i.e. scale 0; a `decimal(p,s)` with `s>0` parses to a float on read and loses low digits past ~15-17 sig figs, integral value or not) |
 | `variant` / `interval` | JSON / interval string | string (re-parse with `parse_json` yourself) |
 | scalars / `struct` / `array` / `map` | same shape | same, recursively |
 
@@ -343,6 +344,21 @@ of the write transform:
 alone is ambiguous, so the reader must be told the intended type. There is no mapping inference:
 declare the schema explicitly. (ES also has no array type: a field declared `array<T>` is read as a
 list even if ES returned a scalar.)
+
+**Maps read back as `map<string,V>`:** JSON object keys are always strings, and the write path
+stringifies every non-string map key, so map keys can only be read back as strings. A declared
+`map<K,V>` whose key type `K` is not `string` therefore cannot round-trip, and `read_index` rejects
+it with `ReadSchemaMismatch` naming the fix (the original key type is not recoverable from `_source`);
+the map values are unaffected. `read_index` also returns **only the fields in the declared schema**:
+any other field present in `_source` is not read back.
+
+**A column name that literally contains a dot** (a column named `a.b`, not a `struct` field)
+round-trips on an ordinary index but is hazardous: ES maps it as a nested object (`a` with subfield
+`b`), so it collides at write time with any sibling field named `a` of a different type (the document
+is rejected, visible in the write result's `errors`), and under a synthetic-`_source` index mode
+(logsdb / time series) `_source` is reconstructed from the mapping, so a column declared `a.b` reads
+back `null`. Dotted ECS-style fields that arrive as Spark `struct`s (`source.ip` as a struct) render
+as nested objects and are safe; the hazard is only a name that literally contains a dot.
 
 **A declared type that doesn't fit the stored value raises `ReadSchemaMismatch`** rather than
 coercing, because every coercion here yields plausible-looking wrong data that nothing downstream can
@@ -572,7 +588,7 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 | `byte`/`short`/`int`/`long` | unchanged (all integer widths become one JSON number; width not preserved) | `5` → `5` |
 | `double` | unchanged; non-finite values (`Infinity`/`-Infinity`/`NaN`) become `null` (no JSON representation) | `1.5` → `1.5`; `Infinity` → `null` |
 | `float` (32-bit) | its **short decimal representation** (the shortest string that round-trips to the same float32), so it reads back into a `FLOAT` unchanged | `0.1` (float) → `0.1` |
-| `decimal(p,s)` | rendered at **full precision** (a JSON number); an integer-valued decimal is stored exactly, a fractional one loses digits past ~15-17 sig figs only when parsed back to a float on read (see note) | `Decimal("1.50")` → `1.5`; `Decimal("123456789012345678")` → `123456789012345678` |
+| `decimal(p,s)` | rendered at **full precision** (a JSON number), keeping the declared scale; read back exactly only when written without a decimal point (scale 0). A `decimal(p,s)` with `s>0` writes trailing fractional zeros and parses to a float on read, losing low digits past ~15-17 sig figs even for an integral value (see note) | `decimal(38,0)` `123456789012345678` → `123456789012345678` (exact); the same value as `decimal(38,2)` → lossy on read |
 | `date` / `timestamp` | **epoch milliseconds** (integer), floored to the millisecond (sub-ms precision dropped). The `timestamp` epoch is the true UTC instant, independent of `spark.sql.session.timeZone` (see below) | `2021-01-01T00:00:00Z` → `1609459200000` |
 | `timestamp_ntz` | **epoch milliseconds** of the wall-clock read as UTC (see below) | `2021-06-01 12:00:00` → `1622548800000` |
 | `binary` | **base64 string** | `b"\x01\x02"` → `"AQI="` |
@@ -585,20 +601,29 @@ DataFrame. Values are transformed on the way to Elasticsearch as follows. These 
 **`float` (32-bit) round-trips faithfully:** `to_json` renders a `FLOAT` as its **short decimal
 representation** — the shortest string that parses back to the same 32-bit float — so `0.1f` stores
 as `0.1`, not the widened double `0.10000000149011612`. Read back into a `FLOAT` column it returns to
-the same float32, so there is no float32 widening delta to expect.
+the same float32, so there is no float32 widening delta to expect. This exact round-trip depends on
+Spark's `to_json` rendering a `FLOAT` at float precision rather than widening it to a double; it is a
+Spark behavior the integration tier pins (`test_datatype_coverage::test_float32_short_repr_roundtrips`),
+not a guarantee the connector code makes on its own, so a future change to that rendering would
+resurface the delta (and the tier would catch it).
 
-**`decimal` beyond double precision:** `to_json` writes a decimal at full precision into `_source`, so
-an **integer-valued** decimal is stored and read back exactly, however many digits it has (a JSON
-integer parses to an arbitrary-precision Python int). A decimal with a **fractional** part beyond
-double's ~15-17 significant figures loses its low fractional digits only when the stored JSON number
-is parsed to a float on **read**. If you need exact high-precision fractional values, cast the column
-to `string` in Spark before writing (declare `StringType` on read) — the documented workaround.
+**`decimal` beyond double precision (scale matters):** `to_json` writes a decimal at full precision
+into `_source`, keeping the declared scale. At **scale 0** the number is a bare integer literal, so it
+round-trips exactly however many digits it has (a JSON integer parses to an arbitrary-precision Python
+int). At **scale > 0** the number carries a decimal point (a `decimal(38,2)` value of
+`123456789012345678` is written `123456789012345678.00`), and a JSON number with a decimal point parses
+to a **double** on read, so it loses low digits past ~15-17 significant figures **even when the value
+is integral**, not only for fractional values. If you need exact high-precision decimals, cast the
+column to `string` in Spark before writing (declare `StringType` on read); that is the documented
+workaround and round-trips exactly at any precision or scale.
 
 **Non-string `map` keys use their own string form:** `to_json` stringifies a non-string map key to its
 own representation, which for a temporal key (`timestamp`/`date`/`timestamp_ntz`) is an **ISO string**,
 not the epoch-millis a value of that type gets. `int`/`bigint`/`string` keys render as you'd expect.
-A map **keyed by** a temporal/decimal/binary type is an unusual shape; **use `string` or integer map
-keys** if you rely on the key's exact form.
+A non-finite float used as a map **key** is stringified to `"NaN"`/`"Infinity"`/`"-Infinity"` (not
+turned to `null` like a non-finite *value*), since the non-finite rewrite only touches values.
+A map **keyed by** a temporal/decimal/binary/float type is an unusual shape; **use `string` or integer
+map keys** if you rely on the key's exact form.
 
 **Timestamp precision:** epoch-millis is floored to the containing millisecond, consistently for
 pre- and post-epoch instants (matches Spark/Java `unix_millis`). Elasticsearch `date` is

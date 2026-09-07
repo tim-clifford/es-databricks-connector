@@ -153,10 +153,11 @@ Hardening still needed before production for SIEM/audit data:
   string form. Field pruning (`drop_fields`) is a client opt-out to shrink payload, never a capability
   limit. Non-string `map` keys are stringified by `to_json` to their own form (a temporal key becomes
   an ISO string, unlike a temporal value → epoch-millis). Caveats to raise with a customer:
-  (1) a `decimal` is written at full precision, so an integer-valued decimal round-trips **exactly**,
-  but a **fractional** decimal beyond double's ~15-17 sig figs loses its low fractional digits when the
-  stored JSON number is parsed to a float on read: cast to string in Spark if exact high-precision
-  fractions matter (money/IDs); (2) added fields need matching ES mapping entries or ES dynamic-maps
+  (1) a `decimal` is written at full precision but keeps its declared scale, so it round-trips
+  **exactly only at scale 0** (a bare integer literal); a `decimal(p,s)` with `s>0` is written with a
+  decimal point (e.g. `123456789012345678.00`) and parses to a double on read, losing low digits past
+  double's ~15-17 sig figs **even for an integral value**: cast to string in Spark if exact
+  high-precision decimals matter (money/IDs); (2) added fields need matching ES mapping entries or ES dynamic-maps
   and guesses the type; (3) `timestamp`→epoch-millis is floored to the millisecond (sub-ms precision
   dropped; ES `date` is ms-resolution: use `date_nanos` for finer). A Spark `FLOAT` (32-bit) is
   written as its short decimal repr (`0.1`→`0.1`) and round-trips faithfully into a `FLOAT` column, so

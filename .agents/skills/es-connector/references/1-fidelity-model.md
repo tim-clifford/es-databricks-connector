@@ -17,12 +17,12 @@ removed in 0.9.0). The read inverse is `read_transform.read_coerce`.
 | `byte`/`short`/`int`/`long` | one JSON number (width not preserved in ES) | `int(value)` to the declared width | yes (value; width is the declared type's) |
 | `double` | unchanged; non-finite (`inf`/`-inf`/`NaN`) -> JSON `null` | `float(value)` | yes, except non-finite -> null (one-way) |
 | `float` (32-bit) | its **short decimal repr** (shortest string round-tripping to the same float32, e.g. `0.1`) | `float(value)` | yes (reads back into a `FLOAT` unchanged) |
-| `decimal(p,s)` | **full precision** JSON number | `Decimal(str(value))` | integer-valued: exact; fractional: **one-way past ~15-17 sig figs** (lost on the read float-parse) |
+| `decimal(p,s)` | **full precision** JSON number (declared scale kept) | `Decimal(str(value))` | scale 0 (bare integer literal): exact at any width; **scale > 0** (carries a decimal point): **one-way past ~15-17 sig figs** on the read float-parse, integral value or not |
 | `date` | epoch-millis (midnight UTC) | `date` (UTC date component) | yes |
 | `timestamp` | epoch-millis of the true UTC instant (via `unix_millis` in Spark) | aware UTC `datetime` | yes to the ms; **one-way: sub-ms floored** |
 | `timestamp_ntz` | epoch-millis of the wall-clock read as UTC | **naive** `datetime` (zone dropped) | yes to the ms |
 | `binary` | **base64 string** | `base64.b64decode` -> `bytes` | yes |
-| `struct` / `map` | nested object (recursed); non-string map keys stringified by `to_json` to their own form (a temporal key -> ISO string, unlike a temporal VALUE -> epoch-millis) | recurse per field/value type; keys stay strings | yes (keys stay strings, one-way) |
+| `struct` / `map` | nested object (recursed); non-string map keys stringified by `to_json` to their own form (a temporal key -> ISO string, unlike a temporal VALUE -> epoch-millis; a non-finite float key -> `"NaN"`/`"Infinity"`, not null) | recurse per field/value type; keys stay strings (a declared non-string map key type is rejected on read with `ReadSchemaMismatch` in `read._reject_non_string_map_keys`) | yes (keys stay strings, one-way) |
 | `array` | array (recursed) | list (recursed); a bare ES scalar is wrapped to `[x]` | yes |
 | `null` (any type) | JSON `null` (field kept) | `None` | yes |
 | `variant` | **JSON string** (serialized in `sanitize_for_arrow`) | the JSON string (caller re-parses with `parse_json`) | one-way: caller must re-parse |
@@ -30,18 +30,26 @@ removed in 0.9.0). The read inverse is `read_transform.read_coerce`.
 
 ## The two documented one-way deltas (the ONLY acceptable losses)
 
-1. **Decimal fractional precision** beyond double's ~15-17 significant figures. `to_json` writes the
-   decimal at full precision, so an integer-valued decimal round-trips exactly; a value with a
-   fractional part past ~15-17 sig figs loses its low digits when the stored JSON number is parsed to
-   a float on read. Mitigation the README documents: `CAST(col AS STRING)` in Spark before writing,
-   declare `StringType` on read, exact.
+1. **Decimal precision past ~15-17 significant figures, on read (scale-dependent).** `to_json` writes
+   the decimal at full precision but KEEPS THE DECLARED SCALE. At scale 0 the number is a bare integer
+   literal and round-trips exactly at any width. At scale > 0 it carries a decimal point (a
+   `decimal(38,2)` `123456789012345678` is written `123456789012345678.00`), and a JSON number with a
+   decimal point parses to a DOUBLE on read, so it loses low digits past ~15-17 sig figs EVEN FOR AN
+   INTEGRAL VALUE, not only a fractional one. Proven live: `test_datatype_coverage` writes the same
+   18-digit value at `decimal(38,0)` (exact) and `decimal(38,2)` (lossy). Mitigation the README
+   documents: `CAST(col AS STRING)` in Spark before writing, declare `StringType` on read, exact at
+   any scale.
 2. **Sub-millisecond timestamp** precision. `unix_millis` floors to the millisecond (ES `date` is
    ms-resolution by default). Mitigation: map as `date_nanos` and send nanos yourself.
 
 **`float` (32-bit) is NOT a delta anymore** (it was in 0.8.x and earlier, when the per-row path stored
 the exact widened double). `to_json` renders a `FLOAT` as its short decimal repr, which reads back
 into a `FLOAT` unchanged. Dropping float32 took the delta count from three to two; that was a
-deliberate 0.9.0 contract change (the single-path consolidation), not a slip.
+deliberate 0.9.0 contract change (the single-path consolidation), not a slip. This exact round-trip
+RELIES on Spark's `to_json` rendering a `FLOAT` at float precision (not widening it to a double): it
+is a Spark behavior, pinned by `integration_tests/test_datatype_coverage.py`
+(`test_float32_short_repr_roundtrips`), not a guarantee the connector code can make, so a future
+Spark change to that rendering would resurface the delta and that test is what would catch it.
 
 If a change would introduce a THIRD one-way delta, that is a contract change: it must be added to the
 README tables, this file, and called out explicitly to the user, not slipped in.

@@ -20,7 +20,7 @@ import logging
 from typing import TYPE_CHECKING, Optional
 
 from .config import EsReadConfig
-from .read_transform import read_coerce
+from .read_transform import read_coerce, ReadSchemaMismatch
 
 if TYPE_CHECKING:  # pragma: no cover
     from pyspark.sql import DataFrame, SparkSession
@@ -56,6 +56,56 @@ def _spark_type_token(dtype: "DataType"):
 def _schema_field_tokens(schema: "StructType"):
     """[(field_name, type_token), ...] for the top-level fields of the declared schema."""
     return [(f.name, _spark_type_token(f.dataType)) for f in schema.fields]
+
+
+def _reject_non_string_map_keys(field_tokens, _path: str = "") -> None:
+    """Raise ReadSchemaMismatch if the declared schema contains a `map` with a non-`string` key type.
+
+    JSON object keys are always strings, and the write path stringifies every non-string map key
+    (`to_json`; documented), so a `map` read from `_source` can only ever yield string keys. A
+    declared `map<K,V>` with `K` other than `string` therefore cannot be satisfied: mapInPandas would
+    fail the Arrow cast to the declared key type (or, on a runtime with an unsafe cast, mis-key
+    SILENTLY). Fail closed here -- once per read on the driver, before any ES round-trip -- naming the
+    fix, rather than letting an opaque per-partition cast error (or silent corruption) surface later.
+    Recurses the token tree so a map nested inside a struct/array/map value is caught too. `map`
+    VALUES are unaffected (they carry their own value transform); only the KEY type is constrained.
+    """
+    for name, token in field_tokens:
+        _reject_non_string_map_keys_in_token(token, f"{_path}{name}")
+
+
+def _reject_non_string_map_keys_in_token(token, path: str) -> None:
+    """Recurse one type token, raising ReadSchemaMismatch on a non-string map key (see caller)."""
+    if not isinstance(token, tuple):
+        return
+    kind = token[0]
+    if kind == "array":
+        _reject_non_string_map_keys_in_token(token[1], f"{path}[]")
+    elif kind == "map":
+        key_token, val_token = token[1], token[2]
+        # A `StringType` key round-trips: keys read back as JSON strings. That includes a COLLATED
+        # string, whose simpleString() is "string collate <name>" (Spark 4.x), so accept that prefix
+        # too or a collated-string key is wrongly rejected. char/varchar, by contrast, are string-family
+        # but are themselves unsupported read types (read_coerce._UNSUPPORTED_SCALAR_TOKENS: they fail
+        # the mapInPandas return-schema cast with "Invalid return type"), so a `map<varchar(n),V>` would
+        # not round-trip anyway; rejecting it here just fails earlier with a clearer, map-specific
+        # message pointing at the same fix (declare the key as StringType). Everything non-string
+        # (int/timestamp/decimal/binary/...) is rejected. A COMPLEX key type (array/struct/map) makes
+        # _spark_type_token hand us a TUPLE key_token, so guard isinstance(str) before .startswith or
+        # it would raise AttributeError instead of this clear rejection; a complex key is non-string
+        # and rejected all the same.
+        if not (isinstance(key_token, str)
+                and (key_token == "string" or key_token.startswith("string collate "))):
+            raise ReadSchemaMismatch(
+                f"map field {path!r} is declared with key type {key_token!r}, but Elasticsearch "
+                "stores JSON object keys as strings (the write path stringifies every non-string "
+                "map key), so map keys can only be read back as strings. Declare this field as "
+                "map<string,V> (its values are unaffected); the original key type is not "
+                "recoverable from _source.")
+        _reject_non_string_map_keys_in_token(val_token, f"{path}{{}}")
+    elif kind == "struct":
+        for fname, sub in token[1]:
+            _reject_non_string_map_keys_in_token(sub, f"{path}.{fname}")
 
 
 def _coerce_hit(source: dict, doc_id, field_tokens, id_field: Optional[str], include_id: bool):
@@ -211,6 +261,9 @@ def read_index(spark: "SparkSession", cfg: EsReadConfig, schema: "StructType") -
     _validate(cfg, schema)
     query = cfg.query or {"match_all": {}}
     field_tokens = _schema_field_tokens(schema)
+    # Fail closed on an unsatisfiable map key type before opening a PIT (see the function docstring):
+    # ES keys are strings, so only map<string,V> can round-trip.
+    _reject_non_string_map_keys(field_tokens)
 
     from elasticsearch import Elasticsearch
     es = Elasticsearch(**cfg.client_kwargs())

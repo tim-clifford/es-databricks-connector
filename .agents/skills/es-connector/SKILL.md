@@ -75,8 +75,10 @@ non-serializable crosses the wire).
 ## The fidelity contract (read this before touching any transform)
 
 `build_ndjson` / `to_json` (write) and `read_coerce` (read) MUST stay exact inverses, except for the
-documented one-way deltas: **decimal** *fractional* precision beyond ~15-17 sig figs (integer decimals
-are exact) and **sub-millisecond timestamp** floor. Everything else round-trips exactly -- including
+documented one-way deltas: **decimal** precision beyond ~15-17 sig figs on read (exact only at scale 0,
+where `to_json` writes a bare integer literal; a `decimal(p,s)` with `s>0` writes a decimal point and
+parses to a double on read, losing low digits even for an integral value) and **sub-millisecond
+timestamp** floor. Everything else round-trips exactly -- including
 `float` (32-bit), which `to_json` renders as its short decimal repr and reads back into a `FLOAT`
 unchanged (0.9.0 dropped the old float32-widening delta, three -> two). See
 [references/1-fidelity-model.md](references/1-fidelity-model.md) for the full per-type table (stored
