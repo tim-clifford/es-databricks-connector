@@ -168,6 +168,35 @@ def test_ndjson_writer_null_line_raises(monkeypatch):
         list(writer(iter([pd.DataFrame({"_ndjson": ["good", float("nan")]})])))
 
 
+def test_ndjson_writer_reuses_one_pool_across_batches(monkeypatch):
+    # A partition arrives as a STREAM of Arrow batches. With write_concurrency>1 the thread pool is
+    # created ONCE per partition (in _write) and reused for every batch, not spun up per batch. Feed
+    # the writer three batches and assert exactly one pool was constructed, while every line still
+    # ships exactly once with the correct tally. (RED-BEFORE-GREEN: creating the pool per
+    # _ship_ndjson_lines call, as before, would construct one per batch -> this asserts == 1.)
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    import concurrent.futures as cf
+
+    es = _ThreadSafeFakeES()
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
+
+    pools_created = []
+    real_pool = cf.ThreadPoolExecutor
+    monkeypatch.setattr(cf, "ThreadPoolExecutor",
+                        lambda *a, **k: pools_created.append(real_pool(*a, **k)) or pools_created[-1])
+
+    writer = make_ndjson_partition_writer(_cfg(write_concurrency=3, chunk_size=2))
+    batches = [pd.DataFrame({"_ndjson": [f"b0_{i}" for i in range(5)]}),
+               pd.DataFrame({"_ndjson": [f"b1_{i}" for i in range(4)]}),
+               pd.DataFrame({"_ndjson": [f"b2_{i}" for i in range(3)]})]
+    out = list(writer(iter(batches)))
+    row = out[0].iloc[0]
+    assert int(row["written"]) == 12 and int(row["total_input"]) == 12
+    assert len(es.all_ops) == 12                 # every line shipped exactly once across batches
+    assert len(pools_created) == 1               # ONE pool for the whole partition, not per batch
+
+
 def test_ship_chunk_transport_error_counts_errors_not_crash():
     # A whole-request transport failure (es.bulk raises) must be recorded as chunk errors and NOT
     # propagate out (which would abort the mapInPandas partition). Mirrors streaming_bulk's
