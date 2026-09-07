@@ -167,7 +167,7 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         pending = retry_lines
 
 
-def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: list) -> None:
+def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: list, pool=None) -> None:
     """Ship all of one partition-batch's pre-built NDJSON action `lines`, chunked by cfg.chunk_size,
     tallying into `counts` / `error_samples`.
 
@@ -179,6 +179,13 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     Strided slices (`lines[i::n]`) spread any positional ordering evenly across workers; order does not
     matter, each action is independent. Each worker tallies into a PRIVATE counts dict + sample list
     (no shared-state lock), merged here after the pool joins.
+
+    `pool` (optional) is a caller-owned ThreadPoolExecutor reused across every batch of the partition,
+    so thread spin-up is paid once per partition instead of once per Arrow batch (see
+    make_ndjson_partition_writer). When omitted, a local pool is created and torn down for this call --
+    the behavior direct callers/tests rely on. Either way the futures are joined here before returning,
+    so shipping stays bounded to the current batch and the null-id check upstream still runs before
+    any worker dispatches.
 
     A worker exception is re-raised on this thread after join (`f.result()`), so a partial write FAILS
     the partition rather than silently reporting the docs a dead worker never sent as a clean success
@@ -192,8 +199,6 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
             _ship_ndjson_chunk(es, lines[i:i + cfg.chunk_size], cfg, counts, error_samples)
         return
 
-    from concurrent.futures import ThreadPoolExecutor
-
     slices = [lines[i::n] for i in range(n)]
     # One private (counts, samples) pair per worker, so threads never touch shared state; merged below.
     partials = [({"written": 0, "deleted": 0, "ignored": 0, "errors": 0}, []) for _ in range(n)]
@@ -204,10 +209,17 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         for i in range(0, len(sl), cfg.chunk_size):
             _ship_ndjson_chunk(es, sl[i:i + cfg.chunk_size], cfg, local_counts, local_samples)
 
-    with ThreadPoolExecutor(max_workers=n) as pool:
+    if pool is not None:
+        # Reuse the partition-scoped pool; join before returning so this batch fully ships first.
         futures = [pool.submit(_worker, i) for i in range(n)]
         for f in futures:
             f.result()   # re-raise the first worker exception; a partial write must fail the partition
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n) as local_pool:
+            futures = [local_pool.submit(_worker, i) for i in range(n)]
+            for f in futures:
+                f.result()   # re-raise the first worker exception; a partial write must fail the partition
 
     for local_counts, local_samples in partials:
         for k in counts:
@@ -225,7 +237,8 @@ def make_ndjson_partition_writer(cfg: EsConfig):
     line (build_ndjson's signal for a null/non-finite id) RAISES here, failing the write
     unconditionally, rather than being counted as `unaccounted` (which would only surface under
     raise_on_error=True). Shipping is delegated to `_ship_ndjson_lines`, which fans each batch across
-    `cfg.write_concurrency` worker threads (1 = serial).
+    `cfg.write_concurrency` worker threads (1 = serial) using a single pool reused for the whole
+    partition (created once here, not per Arrow batch).
     """
     def _write(iterator: "Iterator") -> "Iterator":
         import pandas as pd
@@ -235,25 +248,38 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
         total_input = 0
         error_samples = []
-        for pdf in iterator:
-            lines = []
-            for line in pdf["_ndjson"].values:
-                total_input += 1
+        # One thread pool for the whole PARTITION, not one per Arrow batch. mapInPandas hands a
+        # partition to this closure as a stream of ~maxRecordsPerBatch-row batches; creating the pool
+        # here (once) and reusing it for every batch pays thread spin-up once per partition instead of
+        # once per batch. write_concurrency <= 1 stays threadless (pool = None). Shipping still joins
+        # per batch inside _ship_ndjson_lines, so peak memory stays bounded to one batch.
+        pool = None
+        if cfg.write_concurrency > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            pool = ThreadPoolExecutor(max_workers=cfg.write_concurrency)
+        try:
+            for pdf in iterator:
+                col = pdf["_ndjson"]
+                total_input += len(col)
                 # A null action line means build_ndjson hit a null/non-finite id (its only null-line
                 # source). RAISE here, failing the partition (and so the whole write) loudly and
                 # UNCONDITIONALLY. Do NOT merely count it as `unaccounted`: that only surfaces via
                 # reconcile_or_raise, which the batch default (raise_on_error=False) skips, so a null
                 # id would silently drop. Checked BEFORE dispatch so a null id fails the write before
                 # any worker ships. pandas renders a null object cell as None OR float NaN depending on
-                # dtype, so guard both (`line != line` is True only for NaN).
-                if line is None or (isinstance(line, float) and line != line):
+                # dtype; Series.isna() catches BOTH in one C-level pass, so there is no per-row Python
+                # loop on the hot path (the last per-row Python cost the 0.9.0 Catalyst path left).
+                if col.isna().any():
                     raise ValueError(
                         "build_ndjson produced a null action line: the id_field value is null or "
                         "non-finite (NaN/inf) in at least one row. Every row needs a non-null, finite "
                         "id. Fix the id column, or leave id_field unset to let Elasticsearch assign ids.")
-                lines.append(line)
-            if lines:
-                _ship_ndjson_lines(es, lines, cfg, counts, error_samples)
+                lines = col.tolist()   # C-level conversion; no Python per-row iteration
+                if lines:
+                    _ship_ndjson_lines(es, lines, cfg, counts, error_samples, pool=pool)
+        finally:
+            if pool is not None:
+                pool.shutdown(wait=True)
         yield pd.DataFrame({
             "written": [counts["written"]], "deleted": [counts["deleted"]],
             "errors": [counts["errors"]], "ignored": [counts["ignored"]],
