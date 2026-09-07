@@ -1,6 +1,6 @@
 # Reference 3: Elasticsearch behavior gotchas
 
-These are the recurring customer/reviewer questions. All three are **standard Elasticsearch
+These are the recurring customer/reviewer questions. All of them are **standard Elasticsearch
 behavior**, not connector bugs, but the connector's design (schema-agnostic writes, relies on ES
 dynamic mapping, no explicit mapping created) makes users hit them, so the connector's docs must
 explain them. Each is verified (live serverless probes and/or Elastic docs), not asserted from memory.
@@ -67,6 +67,39 @@ Consequences:
 Proven live in `integration_tests/test_dynamic_mapping_coercion.py` (both halves, with the two
 "surprise" assertions being genuinely red-able if ES ever stopped coercing/truncating). Documented in
 the README "Dynamic-mapping gotcha" note.
+
+## 4. A field name that literally contains a dot is expanded into a nested object
+
+If a column's NAME contains a dot (`a.b`, distinct from a Spark `struct` with a subfield `b`), ES
+treats the dot as a path separator and maps it as a nested object: `{"a.b": 42}` maps under `a` ->
+`b`. Verified live (default index): `_source` keeps the literal key `{"a.b": 42}` VERBATIM, so a
+`read_index` of a column declared `a.b` still round-trips on an ordinary index. Two real hazards
+remain:
+
+- **Mapping collision (write time, visible):** if the same or another document has a sibling field
+  named `a` of a different type (a scalar, or an object with a different `b` type), ES cannot map `a`
+  as both, and the document is rejected (`document_parsing_exception` / `mapper_parsing_exception`),
+  which shows up in the connector's write result `errors` / `error_samples`, not silently.
+- **Synthetic `_source` (silent):** under a synthetic-`_source` index mode (logsdb, time-series data
+  streams), ES does NOT store `_source` verbatim, it reconstructs it from the indexed fields, so the
+  dotted key comes back as `{"a": {"b": 42}}`. A column declared `a.b` then reads back `null` with no
+  error, because the reader looks up the flat name `a.b`. The verbatim-`_source` assumption the whole
+  fidelity model rests on holds only for STORED `_source`.
+
+Not a connector bug; standard ES field-name handling. Ordinary dotted ECS-style fields arrive from
+Spark as `struct`s (`source.ip` is a struct with subfield `ip`), which render as genuine nested
+objects and are unaffected. The hazard is only a Spark column whose NAME literally contains a dot;
+avoid those (rename with `withColumnRenamed`, or model the nesting as a `struct`).
+
+## 5. An empty string into a strictly-typed field is rejected at write
+
+`to_json` writes an empty string `""` faithfully, but a field with an EXPLICIT strict mapping that
+cannot parse `""` (an `ip`, a `date`, or a numeric type) rejects the document with a 400. This is
+VISIBLE, not silent: it surfaces in the connector write result's `errors` / `error_samples`, not as
+lost data. Verified against ES behavior: `ip`/`date`/numeric mappings do not accept `""`. Fixes:
+send `null` or omit the field when the value is empty, or map the field as `keyword`/`text` if `""` is
+a legitimate value. A DYNAMICALLY-mapped string field accepts `""` fine (it becomes `text`+`keyword`);
+the rejection only happens against a strict non-string mapping the user pre-created.
 
 ## General principle
 
