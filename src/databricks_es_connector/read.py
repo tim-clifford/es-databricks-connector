@@ -90,8 +90,12 @@ def _reject_non_string_map_keys_in_token(token, path: str) -> None:
         # the mapInPandas return-schema cast with "Invalid return type"), so a `map<varchar(n),V>` would
         # not round-trip anyway; rejecting it here just fails earlier with a clearer, map-specific
         # message pointing at the same fix (declare the key as StringType). Everything non-string
-        # (int/timestamp/decimal/binary/...) is rejected.
-        if not (key_token == "string" or key_token.startswith("string collate ")):
+        # (int/timestamp/decimal/binary/...) is rejected. A COMPLEX key type (array/struct/map) makes
+        # _spark_type_token hand us a TUPLE key_token, so guard isinstance(str) before .startswith or
+        # it would raise AttributeError instead of this clear rejection; a complex key is non-string
+        # and rejected all the same.
+        if not (isinstance(key_token, str)
+                and (key_token == "string" or key_token.startswith("string collate "))):
             raise ReadSchemaMismatch(
                 f"map field {path!r} is declared with key type {key_token!r}, but Elasticsearch "
                 "stores JSON object keys as strings (the write path stringifies every non-string "

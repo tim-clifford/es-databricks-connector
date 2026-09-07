@@ -120,6 +120,14 @@ def test_reject_non_string_map_keys_rejects_string_family_but_unsupported_keys()
             _reject_non_string_map_keys([("m", ("map", keytok, "string"))])
 
 
+def test_reject_non_string_map_keys_rejects_complex_key_without_crashing():
+    # A complex map key type (array/struct/map) makes _spark_type_token hand us a TUPLE key token.
+    # It must be rejected with ReadSchemaMismatch, NOT crash with AttributeError on .startswith.
+    for keytok in (("array", "int"), ("struct", [("x", "int")]), ("map", "string", "int")):
+        with pytest.raises(ReadSchemaMismatch, match="map<string,V>"):
+            _reject_non_string_map_keys([("m", ("map", keytok, "string"))])
+
+
 def test_reject_non_string_map_keys_rejects_nested_map_key():
     # A bad map key nested inside a struct / array / map VALUE is caught, and the path names it.
     with pytest.raises(ReadSchemaMismatch, match=r"'outer\.inner'.*key type 'timestamp'"):
