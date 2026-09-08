@@ -550,6 +550,48 @@ def test_fast_path_disabled_with_deletes():
     assert es.calls == [(["a", "b"], None)]
 
 
+class _NoGetResponse:
+    """Mimics elasticsearch-py 8.x's ObjectApiResponse: supports resp["k"] and "k" in resp, but has
+    NO .get method (a plain-dict assumption would AttributeError on a live cluster)."""
+    def __init__(self, body): self._body = dict(body)
+    def __getitem__(self, k): return self._body[k]
+    def __contains__(self, k): return k in self._body
+
+
+class _ObjResponseFakeES:
+    """Fake whose bulk() returns an ObjectApiResponse-like object (no .get), one per queued body."""
+    def __init__(self, bodies):
+        self._bodies = list(bodies)
+        self.calls = []
+    def bulk(self, operations=None, filter_path=None, **kw):
+        self.calls.append((list(operations), filter_path))
+        return _NoGetResponse(self._bodies.pop(0))
+
+
+def test_fast_path_reads_errors_from_objectapiresponse_without_get():
+    # Real ES 8.x returns an ObjectApiResponse (indexing + `in`, no .get). The clean-probe flag read
+    # must not assume a plain dict, or it AttributeErrors on the exact write this path targets.
+    es = _ObjResponseFakeES([{"errors": False}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
+    assert counts["written"] == 2 and es.calls == [(["a", "b"], "errors")]
+
+
+def test_fast_path_objectapiresponse_error_reships_and_classifies():
+    # Same non-dict response type on the error path: errors=True -> full re-ship -> per-item classify.
+    es = _ObjResponseFakeES([
+        {"errors": True},
+        {"items": [{"index": {"status": 201, "_id": "a"}},
+                   {"index": {"status": 400, "_id": "b", "error": {"reason": "boom"}}}]},
+    ])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, samples)
+    assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
+    assert samples and samples[0]["_id"] == "b"
+    assert es.calls[1] == (["a", "b"], None)
+
+
 def test_fast_path_probe_transport_error_counts_errors_not_crash():
     # The minimal probe raising (transport failure) must count every line as an error, not crash.
     class _RaisingES:

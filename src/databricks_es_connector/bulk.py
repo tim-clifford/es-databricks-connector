@@ -149,7 +149,12 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
                 error_samples.append({"_id": None, "op_type": "bulk",
                                       "status": None, "reason": f"{type(_e).__name__}: {_e}"[:300]})
             return
-        if resp.get("errors", True) is False:
+        # elasticsearch-py 8.x returns an ObjectApiResponse (supports resp["k"] / "k" in resp, no
+        # .get), so read the flag the same isinstance-guarded way the full path reads items below.
+        # An absent flag falls closed to True (re-ship full).
+        errors = (resp.get("errors", True) if isinstance(resp, dict)
+                  else resp["errors"] if "errors" in resp else True)
+        if errors is False:
             counts["written"] += len(lines)
             return
         # errors true or the flag absent: re-ship in full below to get per-item detail and retry.
