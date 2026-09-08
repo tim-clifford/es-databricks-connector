@@ -447,7 +447,7 @@ def test_ship_ndjson_lines_worker_exception_fails_closed(monkeypatch):
     # transport errors and counts them, so force a raw raise to exercise the re-raise guard itself.
     from databricks_es_connector import bulk as bulk_mod
 
-    def _boom(es, chunk, cfg, counts, samples):
+    def _boom(es, chunk, cfg, counts, samples, stats=None):
         raise RuntimeError("worker died mid-ship")
 
     monkeypatch.setattr(bulk_mod, "_ship_ndjson_chunk", _boom)
@@ -605,6 +605,139 @@ def test_fast_path_probe_transport_error_counts_errors_not_crash():
     assert counts["errors"] == 3 and samples
 
 
+# --- bulk_stats: per-partition send aggregates (docs/send, rtt vs ES took) ---------------------
+# Off by default and zero-overhead. When on, each es.bulk send is timed and (docs, rtt_ms, took_ms)
+# recorded; the writer aggregates per partition and _merge_partition_results surfaces one entry per
+# partition under result["bulk_stats"]. `took` is requested via filter_path so it is available
+# without the per-item array (the GIL win is preserved).
+
+def test_config_bulk_stats_default_off():
+    assert _cfg().bulk_stats is False
+
+
+def test_percentile_linear_interpolation():
+    from databricks_es_connector.bulk import _percentile
+    assert _percentile([], 50) is None
+    assert _percentile([5.0], 50) == 5.0
+    assert _percentile([10.0, 20.0, 30.0], 50) == 20.0
+    assert _percentile([10.0, 20.0, 30.0], 95) == 29.0     # 0.95*2=1.9 -> 20*.1+30*.9
+    assert _percentile([10.0, 20.0, 30.0], 0) == 10.0
+    assert _percentile([10.0, 20.0, 30.0], 100) == 30.0
+
+
+def test_aggregate_bulk_stats_computes_send_and_latency_summary():
+    from databricks_es_connector.bulk import _aggregate_bulk_stats
+    # (docs, rtt_ms, took_ms); one send has a None took (ES omitted it) -> excluded from took only.
+    agg = _aggregate_bulk_stats([(100, 10.0, 5.0), (100, 20.0, 15.0), (50, 30.0, None)])
+    assert agg["n_sends"] == [3]
+    assert agg["docs_sent"] == [250]           # retries would count again; here 3 distinct sends
+    assert agg["rtt_ms_mean"] == [20.0] and agg["rtt_ms_p50"] == [20.0]
+    assert agg["rtt_ms_p95"] == [29.0] and agg["rtt_ms_max"] == [30.0]
+    assert agg["took_ms_mean"] == [10.0]       # (5+15)/2, None excluded
+    assert agg["took_ms_p50"] == [10.0] and agg["took_ms_max"] == [15.0]
+
+
+def test_aggregate_bulk_stats_empty_partition_is_nulls_not_crash():
+    from databricks_es_connector.bulk import _aggregate_bulk_stats
+    agg = _aggregate_bulk_stats([])
+    assert agg["n_sends"] == [0] and agg["docs_sent"] == [0]
+    assert agg["rtt_ms_mean"] == [None] and agg["rtt_ms_max"] == [None]
+    assert agg["took_ms_p95"] == [None]
+
+
+def test_ship_chunk_records_a_send_on_the_fast_path():
+    # stats list given -> the clean fast-path send is timed and recorded, and `took` is requested.
+    es = _RecordingES([{"errors": False, "took": 7}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    stats = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, stats=stats, error_samples=[])
+    assert counts["written"] == 2
+    assert es.calls == [(["a", "b"], "errors,took")]    # took requested, items still omitted
+    assert len(stats) == 1
+    docs, rtt_ms, took_ms = stats[0]
+    assert docs == 2 and took_ms == 7 and rtt_ms >= 0.0
+
+
+def test_ship_chunk_no_stats_and_no_took_when_disabled():
+    # stats=None (default) -> no recording, and the fast path requests only "errors" (no took).
+    es = _RecordingES([{"errors": False}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
+    assert counts["written"] == 2 and es.calls == [(["a", "b"], "errors")]
+
+
+def test_ship_chunk_records_took_on_full_path():
+    # Full path (id_field=None) records the send too, reading took from the full response.
+    es = _RecordingES([{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}], "took": 3}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    stats = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, stats=stats, error_samples=[])
+    assert counts["written"] == 2 and len(stats) == 1
+    assert stats[0][0] == 2 and stats[0][2] == 3
+
+
+def test_ship_ndjson_lines_merges_stats_across_workers():
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+    es = _FastFakeES()   # returns {"errors": False} on the probe; no took, so took_ms is None
+    lines = [f"L{i}" for i in range(10)]
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    stats = []
+    _ship_ndjson_lines(es, lines, _cfg(write_concurrency=3, chunk_size=2), counts, [], stats=stats)
+    # write_concurrency=3 strides 10 lines into slices of 4/3/3, each chunked by 2 -> 2+2+2 = 6 sends;
+    # every line is shipped exactly once (docs sum to 10), and every send is recorded.
+    assert len(stats) == 6 and sum(s[0] for s in stats) == 10
+    assert all(s[1] >= 0.0 for s in stats)
+
+
+def test_writer_emits_per_partition_bulk_stats_columns(monkeypatch):
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    es = _FastFakeES()
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
+    writer = make_ndjson_partition_writer(_cfg(bulk_stats=True, chunk_size=2))
+    out = list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b", "c", "d", "e"]})])))
+    row = out[0].iloc[0]
+    assert "n_sends" in out[0].columns and "rtt_ms_p95" in out[0].columns
+    assert int(row["n_sends"]) == 3 and int(row["docs_sent"]) == 5   # chunks [2,2,1]
+    assert float(row["rtt_ms_max"]) >= 0.0
+
+
+def test_writer_omits_stats_columns_when_off(monkeypatch):
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: _FastFakeES())
+    writer = make_ndjson_partition_writer(_cfg(chunk_size=2))   # bulk_stats default off
+    out = list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b", "c"]})])))
+    assert "n_sends" not in out[0].columns
+
+
+def test_merge_builds_per_partition_bulk_stats_list():
+    from databricks_es_connector.bulk import _merge_partition_results
+    rows = [
+        {"written": 4, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+         "total_input": 4, "error_samples": "[]", "n_sends": 2, "docs_sent": 4,
+         "rtt_ms_mean": 12.0, "rtt_ms_p50": 12.0, "rtt_ms_p95": 18.0, "rtt_ms_max": 20.0,
+         "took_ms_mean": 4.0, "took_ms_p50": 4.0, "took_ms_p95": 6.0, "took_ms_max": 7.0},
+        {"written": 6, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+         "total_input": 6, "error_samples": "[]", "n_sends": 3, "docs_sent": 6,
+         "rtt_ms_mean": 9.0, "rtt_ms_p50": 9.0, "rtt_ms_p95": 11.0, "rtt_ms_max": 12.0,
+         "took_ms_mean": 3.0, "took_ms_p50": 3.0, "took_ms_p95": 4.0, "took_ms_max": 5.0},
+    ]
+    result = _merge_partition_results(rows)
+    assert result["written"] == 10
+    assert "bulk_stats" in result and len(result["bulk_stats"]) == 2
+    assert result["bulk_stats"][0]["n_sends"] == 2 and result["bulk_stats"][1]["rtt_ms_max"] == 12.0
+
+
+def test_merge_omits_bulk_stats_when_rows_lack_it():
+    # Backward compat: rows without stat columns must NOT add a bulk_stats key (core key set unchanged).
+    from databricks_es_connector.bulk import _merge_partition_results
+    rows = [{"written": 3, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
+             "total_input": 3, "error_samples": "[]"}]
+    result = _merge_partition_results(rows)
+    assert "bulk_stats" not in result
+
+
 class _FastFakeES:
     """Thread-safe fake for the fast path: filter_path='errors' returns {'errors': False} (probe),
     a full call returns per-item 201s. Records the (ops, filter_path) of every call."""
@@ -619,9 +752,9 @@ class _FastFakeES:
         with self._lock:
             self.calls.append((ops, filter_path))
             self.all_ops.extend(ops)
-        if filter_path == "errors":
-            return {"errors": False}
-        return {"items": [{"index": {"status": 201}} for _ in ops]}
+        if filter_path and "errors" in filter_path:      # "errors" or "errors,took" (stats mode)
+            return {"errors": False, "took": 1}
+        return {"items": [{"index": {"status": 201}} for _ in ops], "took": 1}
 
 
 def test_fast_path_under_fan_out_ships_each_line_once_via_probe():

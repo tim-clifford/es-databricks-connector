@@ -149,6 +149,14 @@ class EsWriteConfig(EsConnection):
     max_retries_per_doc: int = 3
     retry_on_doc_status: tuple = (429,)     # per-doc statuses worth retrying (429 = ES queue full)
 
+    # Diagnostics: when True, time every individual `es.bulk` send and surface PER-PARTITION
+    # aggregates (send count, docs/send, and client round-trip vs ES `took` distributions) on the
+    # result dict under `bulk_stats`, so a caller can see where the DBR<->ES round trip goes without
+    # a per-send row explosion. Off by default and zero-overhead when off (no timing, no extra
+    # response field). When on, the fast path also requests `took` (filter_path="errors,took"), which
+    # still omits the per-item array. See bulk._aggregate_bulk_stats / _merge_partition_results.
+    bulk_stats: bool = False
+
     # --- doc shaping ---
     drop_fields: tuple = field(default_factory=tuple)  # columns to prune before indexing (egress lever)
     # drop_fields is frequently used as a PII/egress control, and a misspelled column name would

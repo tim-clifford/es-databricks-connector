@@ -114,7 +114,52 @@ def iter_bulk_response_outcomes(items):
         yield op_type, body, ok, classify_bulk_result(ok, op_type, status)
 
 
-def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: list) -> None:
+def _percentile(sorted_vals, q):
+    """Linear-interpolation percentile of a PRE-SORTED list (q in 0..100); None if empty. No numpy."""
+    n = len(sorted_vals)
+    if n == 0:
+        return None
+    if n == 1:
+        return float(sorted_vals[0])
+    idx = (q / 100.0) * (n - 1)
+    lo = int(idx)
+    frac = idx - lo
+    if lo + 1 < n:
+        return float(sorted_vals[lo] * (1.0 - frac) + sorted_vals[lo + 1] * frac)
+    return float(sorted_vals[lo])
+
+
+def _aggregate_bulk_stats(stats):
+    """Reduce a partition's (docs, rtt_ms, took_ms) send records to single-row summary columns.
+
+    `stats` is the list bulk_stats collects, one tuple per es.bulk send. Returns a {column: [value]}
+    dict (single-row, for the mapInPandas summary DataFrame): send count, total docs sent (retries
+    included), and the client round-trip (rtt) vs ES-service (`took`) distributions. A per-send `took`
+    may be None if ES did not return it; those are excluded from the took aggregates only.
+    """
+    n_sends = len(stats)
+    docs_sent = sum(s[0] for s in stats)
+    rtts = sorted(s[1] for s in stats)
+    tooks = sorted(s[2] for s in stats if s[2] is not None)
+
+    def _mean(xs):
+        return float(sum(xs) / len(xs)) if xs else None
+
+    return {
+        "n_sends": [n_sends],
+        "docs_sent": [docs_sent],
+        "rtt_ms_mean": [_mean(rtts)],
+        "rtt_ms_p50": [_percentile(rtts, 50)],
+        "rtt_ms_p95": [_percentile(rtts, 95)],
+        "rtt_ms_max": [float(rtts[-1]) if rtts else None],
+        "took_ms_mean": [_mean(tooks)],
+        "took_ms_p50": [_percentile(tooks, 50)],
+        "took_ms_p95": [_percentile(tooks, 95)],
+        "took_ms_max": [float(tooks[-1]) if tooks else None],
+    }
+
+
+def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: list, stats=None) -> None:
     """Ship one chunk of pre-built NDJSON action lines and tally the outcomes into `counts`.
 
     `lines` is a list where each element is ONE row's action ("header\\nsource"), so es.bulk returns
@@ -125,6 +170,18 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     exponential backoff; everything else is tallied immediately.
     """
     import time as _t
+
+    def _send(ops, filter_path=None):
+        # One es.bulk send. When `stats` is collecting, time the client round trip and record
+        # (docs, rtt_ms, took_ms) for this send; otherwise zero overhead (no perf_counter, no took).
+        kw = {"filter_path": filter_path} if filter_path else {}
+        if stats is None:
+            return es.bulk(operations=ops, **kw)
+        _t0 = _t.perf_counter()
+        resp = es.bulk(operations=ops, **kw)
+        _rtt = (_t.perf_counter() - _t0) * 1000.0
+        stats.append((len(ops), _rtt, resp["took"] if "took" in resp else None))
+        return resp
 
     # Fast path (GIL avoidance): when writes are idempotent (id_field set) and there are no deletes,
     # a clean chunk needs only the top-level `errors` flag, not per-item detail. Ship with
@@ -140,7 +197,9 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     # re-ship would duplicate the docs the probe already wrote.
     if cfg.id_field is not None and not cfg.has_deletes:
         try:
-            resp = es.bulk(operations=list(lines), filter_path="errors")
+            # `took` (ES service time) is only needed when collecting stats; requesting it still
+            # omits the per-item array, so the GIL win is preserved.
+            resp = _send(list(lines), filter_path=("errors,took" if stats is not None else "errors"))
         except Exception as _e:  # noqa: BLE001
             # Same fail-closed handling as the full path: a whole-request transport failure counts
             # every line as an error rather than aborting the partition.
@@ -163,7 +222,7 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     attempt = 0
     while pending:
         try:
-            resp = es.bulk(operations=pending)
+            resp = _send(pending)
         except Exception as _e:  # noqa: BLE001
             # A whole-request transport failure (persistent 429/503, dropped connection) survived the
             # client's transport_max_retries. Record it rather than letting it abort the partition:
@@ -200,7 +259,8 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         pending = retry_lines
 
 
-def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: list, pool=None) -> None:
+def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: list, pool=None,
+                       stats=None) -> None:
     """Ship all of one partition-batch's pre-built NDJSON action `lines`, chunked by cfg.chunk_size,
     tallying into `counts` / `error_samples`.
 
@@ -229,18 +289,21 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     n = cfg.write_concurrency
     if n <= 1:
         for i in range(0, len(lines), cfg.chunk_size):
-            _ship_ndjson_chunk(es, lines[i:i + cfg.chunk_size], cfg, counts, error_samples)
+            _ship_ndjson_chunk(es, lines[i:i + cfg.chunk_size], cfg, counts, error_samples, stats=stats)
         return
 
     slices = [lines[i::n] for i in range(n)]
-    # One private (counts, samples) pair per worker, so threads never touch shared state; merged below.
-    partials = [({"written": 0, "deleted": 0, "ignored": 0, "errors": 0}, []) for _ in range(n)]
+    # One private (counts, samples, stats) triple per worker, so threads never touch shared state;
+    # merged below. `stats` is a per-worker list only when the caller is collecting (else None).
+    partials = [({"written": 0, "deleted": 0, "ignored": 0, "errors": 0}, [],
+                 ([] if stats is not None else None)) for _ in range(n)]
 
     def _worker(idx):
-        local_counts, local_samples = partials[idx]
+        local_counts, local_samples, local_stats = partials[idx]
         sl = slices[idx]
         for i in range(0, len(sl), cfg.chunk_size):
-            _ship_ndjson_chunk(es, sl[i:i + cfg.chunk_size], cfg, local_counts, local_samples)
+            _ship_ndjson_chunk(es, sl[i:i + cfg.chunk_size], cfg, local_counts, local_samples,
+                               stats=local_stats)
 
     if pool is not None:
         # Reuse the partition-scoped pool; join before returning so this batch fully ships first.
@@ -254,12 +317,16 @@ def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: li
             for f in futures:
                 f.result()   # re-raise the first worker exception; a partial write must fail the partition
 
-    for local_counts, local_samples in partials:
+    for local_counts, local_samples, local_stats in partials:
         for k in counts:
             counts[k] += local_counts[k]
         # Keep the merged sample list bounded exactly as the serial path does (ERROR_SAMPLE_CAP total).
         if len(error_samples) < ERROR_SAMPLE_CAP and local_samples:
             error_samples.extend(local_samples[:ERROR_SAMPLE_CAP - len(error_samples)])
+        # Stats are unbounded per partition by design (aggregated to fixed-size summary columns in the
+        # writer), so merge every worker's send records.
+        if stats is not None and local_stats:
+            stats.extend(local_stats)
 
 
 def make_ndjson_partition_writer(cfg: EsConfig):
@@ -281,6 +348,9 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
         total_input = 0
         error_samples = []
+        # Per-send timing records for the whole partition, aggregated to fixed-size summary columns
+        # below. None (the default) when bulk_stats is off, so the hot path pays nothing.
+        stats = [] if cfg.bulk_stats else None
         # One thread pool for the whole PARTITION, not one per Arrow batch. mapInPandas hands a
         # partition to this closure as a stream of ~maxRecordsPerBatch-row batches; creating the pool
         # here (once) and reusing it for every batch pays thread spin-up once per partition instead of
@@ -309,16 +379,21 @@ def make_ndjson_partition_writer(cfg: EsConfig):
                         "id. Fix the id column, or leave id_field unset to let Elasticsearch assign ids.")
                 lines = col.tolist()   # C-level conversion; no Python per-row iteration
                 if lines:
-                    _ship_ndjson_lines(es, lines, cfg, counts, error_samples, pool=pool)
+                    _ship_ndjson_lines(es, lines, cfg, counts, error_samples, pool=pool, stats=stats)
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)
-        yield pd.DataFrame({
+        out = {
             "written": [counts["written"]], "deleted": [counts["deleted"]],
             "errors": [counts["errors"]], "ignored": [counts["ignored"]],
             "coerced_nonfinite": [0], "total_input": [total_input],
             "error_samples": [json.dumps(error_samples)],
-        })
+        }
+        # Per-partition send aggregates (only when bulk_stats is on; columns must match the extended
+        # summary_schema in bulk_write).
+        if cfg.bulk_stats:
+            out.update(_aggregate_bulk_stats(stats))
+        yield pd.DataFrame(out)
 
     return _write
 
@@ -378,7 +453,7 @@ def _merge_partition_results(rows) -> dict:
         _samples_json = r["error_samples"] if "error_samples" in r else None
         if len(samples) < ERROR_SAMPLE_CAP and _samples_json:
             samples.extend(json.loads(_samples_json))
-    return {
+    result = {
         "written": written, "deleted": deleted, "errors": errors, "ignored": ignored,
         "coerced_nonfinite": coerced_nonfinite,
         "total_input": total_input,
@@ -389,6 +464,16 @@ def _merge_partition_results(rows) -> dict:
         "overcounted": overcounted,
         "error_samples": samples[:ERROR_SAMPLE_CAP],
     }
+    # Optional per-partition bulk-send aggregates: present only when the rows carry them (cfg.bulk_stats
+    # was on). Kept OUT of the result otherwise, so the core key set is unchanged when off. One entry
+    # per partition; the caller (e.g. an on_batch hook) rolls up or logs as it sees fit.
+    _STAT_KEYS = ("n_sends", "docs_sent", "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
+                  "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max")
+    bulk_stats = [{k: (r[k] if k in r else None) for k in _STAT_KEYS}
+                  for r in rows if "n_sends" in r]
+    if bulk_stats:
+        result["bulk_stats"] = bulk_stats
+    return result
 
 
 class EsWriteError(RuntimeError):
@@ -577,6 +662,12 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
         rejected docs, so a failure is actionable rather than an opaque count. Bounded, not a full
         dead-letter log.
 
+    When `cfg.bulk_stats=True`, the result additionally carries 'bulk_stats': one entry per partition,
+    each {n_sends, docs_sent, rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max}. `rtt_ms` is the
+    client-observed round trip per es.bulk send, `took_ms` is Elasticsearch's own service time, so
+    rtt_ms vs took_ms splits the round trip into network/queue vs ES processing. Absent (no key) when
+    bulk_stats is off, so the core result shape is unchanged. Diagnostic only; off by default.
+
     `raise_on_error=True` applies `reconcile_or_raise` to the result, raising EsWriteError when any
     document was rejected or any row went unaccounted for. It defaults to False here so a BATCH
     caller keeps full control of the result (and every shipped demo checks it explicitly), but note
@@ -602,6 +693,11 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     _preflight(df, cfg)
     summary_schema = ("written long, deleted long, errors long, ignored long, "
                       "coerced_nonfinite long, total_input long, error_samples string")
+    if cfg.bulk_stats:
+        # Extra per-partition columns the writer emits under bulk_stats; must match _aggregate_bulk_stats.
+        summary_schema += (", n_sends long, docs_sent long, "
+                           "rtt_ms_mean double, rtt_ms_p50 double, rtt_ms_p95 double, rtt_ms_max double, "
+                           "took_ms_mean double, took_ms_p50 double, took_ms_p95 double, took_ms_max double")
     # Build the whole `_bulk` action line in Catalyst (JVM) via build_ndjson, then ship the pre-built
     # NDJSON with no per-row Python shaping/serialization (make_ndjson_partition_writer, fanned across
     # write_concurrency worker threads). This is the only write path.
