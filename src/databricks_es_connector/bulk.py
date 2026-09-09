@@ -274,74 +274,110 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         pending = retry_lines
 
 
-def _ship_ndjson_lines(es, lines, cfg: EsConfig, counts: dict, error_samples: list, pool=None,
-                       stats=None) -> None:
-    """Ship all of one partition-batch's pre-built NDJSON action `lines`, chunked by cfg.chunk_size,
-    tallying into `counts` / `error_samples`.
+class _PipelinedShipper:
+    """Ships a partition's pre-built NDJSON to Elasticsearch with a BOUNDED number of `es.bulk` sends
+    in flight, fed CONTINUOUSLY across Arrow-batch boundaries (there is no per-batch join).
 
-    `cfg.write_concurrency == 1` (default) chunks and ships serially, no threads. `> 1` fans the batch
-    across that many worker threads, each shipping its OWN strided slice with its OWN
-    `_ship_ndjson_chunk` calls, so `write_concurrency` bulk requests are in flight at once to fill the
-    ES round-trip wait. Without this a partition shipped its chunks one blocking es.bulk at a time --
-    the last serial bottleneck, since the per-row work is already off the GIL (built in Catalyst).
-    Strided slices (`lines[i::n]`) spread any positional ordering evenly across workers; order does not
-    matter, each action is independent. Each worker tallies into a PRIVATE counts dict + sample list
-    (no shared-state lock), merged here after the pool joins.
+    Why this exists (the barrier it removes): a partition arrives from mapInPandas as a stream of Arrow
+    batches. The previous design fanned each batch across `write_concurrency` worker threads and then
+    JOINED all of them before pulling the next batch. That per-batch join was the throughput ceiling on
+    a latency-bound write: every batch waited on its SLOWEST send (a long round-trip tail stalls the
+    whole batch), and while the next batch's NDJSON was assembled no request was in flight, so the
+    measured effective concurrency sat well below `write_concurrency` (~1.56 of a configured 2 in the
+    field). Feeding a bounded pool of sends that spans batch boundaries keeps ~`write_concurrency`
+    requests in flight at all times: a straggler ties up one slot instead of freezing the partition,
+    and raising `write_concurrency` now converts into sustained throughput instead of just more sends
+    to wait on at each barrier.
 
-    `pool` (optional) is a caller-owned ThreadPoolExecutor reused across every batch of the partition,
-    so thread spin-up is paid once per partition instead of once per Arrow batch (see
-    make_ndjson_partition_writer). When omitted, a local pool is created and torn down for this call --
-    the behavior direct callers/tests rely on. Either way the futures are joined here before returning,
-    so shipping stays bounded to the current batch and the null-id check upstream still runs before
-    any worker dispatches.
+    Concurrency model, chosen so accounting needs NO lock:
+      - A caller-owned ThreadPoolExecutor (`max_workers == write_concurrency`) runs the sends. One
+        pool per partition (created in make_ndjson_partition_writer), so thread spin-up is paid once.
+      - `feed(lines)` splits into `chunk_size` chunks and submits each as its own task; `_ship_one`
+        ships exactly one chunk into a PRIVATE (counts, samples, stats) triple and RETURNS it. Nothing
+        a worker touches is shared, so there is no shared-state lock and no double-count on retries.
+      - Backpressure: at most `max_inflight` (== `write_concurrency`) tasks are outstanding at once.
+        Before submitting, `feed` blocks in `_drain` until a slot frees, so peak memory is bounded to
+        `max_inflight` chunks (~a few chunks of ~1 KB/doc), not the whole partition. Because
+        `max_inflight == max_workers`, submitted tasks are never queued behind a full pool.
+      - MERGING the per-task partials happens only on the producer (writer) thread, inside `_drain` /
+        `close`, never on a worker -- that is what lets the shared totals stay lock-free.
 
-    A worker exception is re-raised on this thread after join (`f.result()`), so a partial write FAILS
-    the partition rather than silently reporting the docs a dead worker never sent as a clean success
-    -- the exact silent loss this module exists to prevent. (`_ship_ndjson_chunk` itself catches
-    transport errors and counts them rather than raising, so in practice a worker raises only on a
-    programming error, but the guard is kept as a backstop.)
+    Request sizing is now governed SOLELY by `chunk_size` (bounded above by the Arrow batch size),
+    independent of `write_concurrency`. The old design strided each batch into `write_concurrency`
+    slices before chunking, so a large `chunk_size` produced ~`maxRecordsPerBatch / write_concurrency`
+    docs per send; here it is `min(chunk_size, batch_rows)`. For the common case `chunk_size <=
+    batch_rows / write_concurrency` the per-send size is identical to before; it differs only when
+    `chunk_size` is set large on purpose (then sends are correspondingly bigger -- the intended knob).
+
+    Fail-closed: `close()` joins every outstanding send and re-raises the FIRST worker exception
+    (`f.result()`), so a partial write FAILS the partition rather than reporting the docs a dead worker
+    never sent as a clean success -- the exact silent loss this module exists to prevent.
+    `_ship_ndjson_chunk` itself catches transport errors and counts them (never raises), so in practice
+    a worker raises only on a programming error, but the guard is a mandatory backstop, not a nicety:
+    dropping it makes a lost partition report success.
     """
-    n = cfg.write_concurrency
-    if n <= 1:
-        for i in range(0, len(lines), cfg.chunk_size):
-            _ship_ndjson_chunk(es, lines[i:i + cfg.chunk_size], cfg, counts, error_samples, stats=stats)
-        return
 
-    slices = [lines[i::n] for i in range(n)]
-    # One private (counts, samples, stats) triple per worker, so threads never touch shared state;
-    # merged below. `stats` is a per-worker list only when the caller is collecting (else None).
-    partials = [({"written": 0, "deleted": 0, "ignored": 0, "errors": 0}, [],
-                 ([] if stats is not None else None)) for _ in range(n)]
+    def __init__(self, es, cfg: EsConfig, pool, counts: dict, error_samples: list, stats=None,
+                 max_inflight=None):
+        self._es = es
+        self._cfg = cfg
+        self._pool = pool
+        self._counts = counts               # SHARED totals; mutated only on the producer thread
+        self._error_samples = error_samples
+        self._stats = stats                 # SHARED send-record list (bulk_stats on) or None
+        self._pending = set()               # outstanding futures, bounded by _max_inflight
+        # Keep at most this many sends outstanding. == write_concurrency: the pool can run them all
+        # concurrently (no queuing) and memory stays at a few chunks. A larger value would only add
+        # queued-but-not-running work and more in-flight memory for a sub-millisecond refill gain.
+        self._max_inflight = max_inflight if max_inflight is not None else cfg.write_concurrency
 
-    def _worker(idx):
-        local_counts, local_samples, local_stats = partials[idx]
-        sl = slices[idx]
-        for i in range(0, len(sl), cfg.chunk_size):
-            _ship_ndjson_chunk(es, sl[i:i + cfg.chunk_size], cfg, local_counts, local_samples,
-                               stats=local_stats)
+    def _ship_one(self, chunk):
+        """Runs on a worker thread. PRIVATE accounting only, returned to the producer for merging so no
+        lock is needed. `_ship_ndjson_chunk` catches transport errors and counts them; anything it
+        raises is a programming error that must fail the partition (surfaced via `close`)."""
+        local_counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+        local_samples: list = []
+        local_stats = [] if self._stats is not None else None
+        _ship_ndjson_chunk(self._es, chunk, self._cfg, local_counts, local_samples, stats=local_stats)
+        return local_counts, local_samples, local_stats
 
-    if pool is not None:
-        # Reuse the partition-scoped pool; join before returning so this batch fully ships first.
-        futures = [pool.submit(_worker, i) for i in range(n)]
-        for f in futures:
-            f.result()   # re-raise the first worker exception; a partial write must fail the partition
-    else:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=n) as local_pool:
-            futures = [local_pool.submit(_worker, i) for i in range(n)]
-            for f in futures:
-                f.result()   # re-raise the first worker exception; a partial write must fail the partition
-
-    for local_counts, local_samples, local_stats in partials:
-        for k in counts:
-            counts[k] += local_counts[k]
+    def _merge(self, local_counts, local_samples, local_stats):
+        """Fold one completed task's partial into the shared totals. Producer thread only."""
+        for k in self._counts:
+            self._counts[k] += local_counts[k]
         # Keep the merged sample list bounded exactly as the serial path does (ERROR_SAMPLE_CAP total).
-        if len(error_samples) < ERROR_SAMPLE_CAP and local_samples:
-            error_samples.extend(local_samples[:ERROR_SAMPLE_CAP - len(error_samples)])
+        if len(self._error_samples) < ERROR_SAMPLE_CAP and local_samples:
+            self._error_samples.extend(local_samples[:ERROR_SAMPLE_CAP - len(self._error_samples)])
         # Stats are unbounded per partition by design (aggregated to fixed-size summary columns in the
-        # writer), so merge every worker's send records.
-        if stats is not None and local_stats:
-            stats.extend(local_stats)
+        # writer), so keep every send record.
+        if self._stats is not None and local_stats:
+            self._stats.extend(local_stats)
+
+    def _drain_one(self):
+        """Wait for at least one outstanding send to finish and merge every send that completed. A
+        worker exception surfaces here via `f.result()` and propagates -- failing the partition closed.
+        Merging happens here, on the producer thread, which is why the shared totals need no lock."""
+        from concurrent.futures import wait, FIRST_COMPLETED
+        done, self._pending = wait(self._pending, return_when=FIRST_COMPLETED)
+        for f in done:
+            self._merge(*f.result())   # re-raise the first worker exception; a partial write must fail
+
+    def feed(self, lines):
+        """Submit one Arrow batch's pre-built lines as `chunk_size` sends, WITHOUT draining to zero, so
+        in-flight requests carry across the batch boundary. Blocks only when `max_inflight` sends are
+        already outstanding (backpressure). The upstream null-id guard runs before this is called, so a
+        bad id still fails the write before any send is queued."""
+        cs = self._cfg.chunk_size
+        for i in range(0, len(lines), cs):
+            while len(self._pending) >= self._max_inflight:
+                self._drain_one()
+            self._pending.add(self._pool.submit(self._ship_one, lines[i:i + cs]))
+
+    def close(self):
+        """Join every outstanding send and merge it, re-raising the first worker exception. Must be
+        called before the partition summary is emitted so a dead worker fails the partition."""
+        while self._pending:
+            self._drain_one()
 
 
 def make_ndjson_partition_writer(cfg: EsConfig):
@@ -351,9 +387,10 @@ def make_ndjson_partition_writer(cfg: EsConfig):
     non-finite floats are turned to null in Spark (build_ndjson), not counted per row. A null action
     line (build_ndjson's signal for a null/non-finite id) RAISES here, failing the write
     unconditionally, rather than being counted as `unaccounted` (which would only surface under
-    raise_on_error=True). Shipping is delegated to `_ship_ndjson_lines`, which fans each batch across
-    `cfg.write_concurrency` worker threads (1 = serial) using a single pool reused for the whole
-    partition (created once here, not per Arrow batch).
+    raise_on_error=True). Shipping is delegated to a `_PipelinedShipper` (created once here), which
+    keeps `cfg.write_concurrency` bulk sends in flight CONTINUOUSLY across Arrow batches (no per-batch
+    join) using a single pool reused for the whole partition. `cfg.write_concurrency == 1` skips the
+    pool and ships serially.
     """
     def _write(iterator: "Iterator") -> "Iterator":
         import pandas as pd
@@ -361,10 +398,11 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         from elasticsearch import Elasticsearch
 
         # Partition wall clock (bulk_stats only): spans the whole partition -- Arrow batch iteration,
-        # NDJSON handoff, and shipping (incl. the per-batch join and pool shutdown). Compared to the
-        # summed send time (send_busy_ms) it gives the effective in-flight concurrency the partition
+        # NDJSON handoff, and shipping (incl. the final join at close and pool shutdown). Compared to
+        # the summed send time (send_busy_ms) it gives the effective in-flight concurrency the partition
         # reached (busy/wall ~ 1 means sends ran serially; ~ write_concurrency means fully overlapped),
-        # and wall well above busy/concurrency exposes non-ship overhead or idle between batches.
+        # and wall well above busy/concurrency exposes non-ship overhead or idle between batches. This
+        # ratio is the metric the pipelining change targets: it should rise toward write_concurrency.
         _partition_t0 = _time.perf_counter()
         es = Elasticsearch(**cfg.client_kwargs())
         counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
@@ -373,15 +411,17 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         # Per-send timing records for the whole partition, aggregated to fixed-size summary columns
         # below. None (the default) when bulk_stats is off, so the hot path pays nothing.
         stats = [] if cfg.bulk_stats else None
-        # One thread pool for the whole PARTITION, not one per Arrow batch. mapInPandas hands a
-        # partition to this closure as a stream of ~maxRecordsPerBatch-row batches; creating the pool
-        # here (once) and reusing it for every batch pays thread spin-up once per partition instead of
-        # once per batch. write_concurrency <= 1 stays threadless (pool = None). Shipping still joins
-        # per batch inside _ship_ndjson_lines, so peak memory stays bounded to one batch.
+        # One thread pool + shipper for the whole PARTITION, not one per Arrow batch. mapInPandas hands
+        # a partition to this closure as a stream of ~maxRecordsPerBatch-row batches; the shipper feeds
+        # every batch's sends into one bounded in-flight pool WITHOUT draining between batches, so the
+        # ES round-trip wait is filled continuously and thread spin-up is paid once. write_concurrency
+        # <= 1 stays threadless (pool = shipper = None) and ships serially below.
         pool = None
+        shipper = None
         if cfg.write_concurrency > 1:
             from concurrent.futures import ThreadPoolExecutor
             pool = ThreadPoolExecutor(max_workers=cfg.write_concurrency)
+            shipper = _PipelinedShipper(es, cfg, pool, counts, error_samples, stats=stats)
         try:
             for pdf in iterator:
                 col = pdf["_ndjson"]
@@ -390,10 +430,11 @@ def make_ndjson_partition_writer(cfg: EsConfig):
                 # source). RAISE here, failing the partition (and so the whole write) loudly and
                 # UNCONDITIONALLY. Do NOT merely count it as `unaccounted`: that only surfaces via
                 # reconcile_or_raise, which the batch default (raise_on_error=False) skips, so a null
-                # id would silently drop. Checked BEFORE dispatch so a null id fails the write before
-                # any worker ships. pandas renders a null object cell as None OR float NaN depending on
-                # dtype; Series.isna() catches BOTH in one C-level pass, so there is no per-row Python
-                # loop on the hot path (the last per-row Python cost the 0.9.0 Catalyst path left).
+                # id would silently drop. Checked BEFORE dispatch (per batch), so a null id fails the
+                # write before this batch's sends are queued. pandas renders a null object cell as None
+                # OR float NaN depending on dtype; Series.isna() catches BOTH in one C-level pass, so
+                # there is no per-row Python loop on the hot path (the last per-row Python cost the
+                # 0.9.0 Catalyst path left).
                 if col.isna().any():
                     raise ValueError(
                         "build_ndjson produced a null action line: the id_field value is null or "
@@ -401,7 +442,17 @@ def make_ndjson_partition_writer(cfg: EsConfig):
                         "id. Fix the id column, or leave id_field unset to let Elasticsearch assign ids.")
                 lines = col.tolist()   # C-level conversion; no Python per-row iteration
                 if lines:
-                    _ship_ndjson_lines(es, lines, cfg, counts, error_samples, pool=pool, stats=stats)
+                    if shipper is not None:
+                        shipper.feed(lines)      # in-flight sends carry across the batch boundary
+                    else:
+                        for i in range(0, len(lines), cfg.chunk_size):
+                            _ship_ndjson_chunk(es, lines[i:i + cfg.chunk_size], cfg, counts,
+                                               error_samples, stats=stats)
+            # Join all outstanding sends and merge them BEFORE the summary is built. Re-raises the first
+            # worker exception, so a dead worker fails the partition rather than yielding a clean count.
+            # Inside the try: a raise here must skip the yield and hit the finally teardown.
+            if shipper is not None:
+                shipper.close()
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)

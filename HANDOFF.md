@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.9.3)
+# Production Readiness / Known Limitations (0.9.4)
 
 `databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
 bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent

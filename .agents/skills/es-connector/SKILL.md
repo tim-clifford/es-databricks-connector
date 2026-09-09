@@ -55,10 +55,11 @@ deleted.)
    whose boolean `delete_flag_column` is true) -> a one-column `_ndjson` DataFrame. The JVM does the
    document serialization; no per-row Python. This is the only write path.
 5. `df.mapInPandas(make_ndjson_partition_writer(cfg), ...)` (per-partition, executor-side): ships the
-   pre-built NDJSON lines via `es.bulk(operations=...)`, fanned across `cfg.write_concurrency` worker
-   threads (`_ship_ndjson_lines`), classifying each response item individually (`classify_bulk_result`
-   / `iter_bulk_response_outcomes`). Then `_merge_partition_results(rows)` sums the per-partition
-   counts and derives `unaccounted`; `raise_on_error=True` applies `reconcile_or_raise`.
+   pre-built NDJSON lines via `es.bulk(operations=...)`. For `cfg.write_concurrency > 1` a
+   `_PipelinedShipper` keeps that many sends in flight CONTINUOUSLY across the partition's Arrow
+   batches (a bounded pool, no per-batch join), classifying each response item individually
+   (`classify_bulk_result` / `iter_bulk_response_outcomes`). Then `_merge_partition_results(rows)` sums
+   the per-partition counts and derives `unaccounted`; `raise_on_error=True` applies `reconcile_or_raise`.
 
 **Read path** (`read_index` in `read.py`): opens a Point-in-Time, fans out
 `spark.range(num_slices).mapInPandas(...)` (pass `num_slices=1` for a single unsliced reader on small

@@ -4,7 +4,9 @@ The Spark-side builder (spark_serialize.build_ndjson) needs a live Spark session
 the integration tier; here we cover everything that does NOT need Spark:
   - iter_bulk_response_outcomes: es.bulk response item -> WRITTEN/DELETED/IGNORED/ERROR.
   - _ship_ndjson_chunk: tallying + the per-document 429 retry the connector treats as load-bearing.
-  - _ship_ndjson_lines: the write_concurrency fan-out (all lines shipped once, tally == serial).
+  - _PipelinedShipper: the write_concurrency cross-batch pipeline (bounded in-flight, no loss/dupe/
+    miscount, cross-batch continuity, backpressure bound, straggler tolerance, fail-closed on a
+    worker exception).
   - make_ndjson_partition_writer: chunking by chunk_size, the yielded summary schema, total_input.
   - _preflight: deletes require a BooleanType flag column.
   - _payload_columns: which columns land in _source.
@@ -170,10 +172,10 @@ def test_ndjson_writer_null_line_raises(monkeypatch):
 
 def test_ndjson_writer_reuses_one_pool_across_batches(monkeypatch):
     # A partition arrives as a STREAM of Arrow batches. With write_concurrency>1 the thread pool is
-    # created ONCE per partition (in _write) and reused for every batch, not spun up per batch. Feed
-    # the writer three batches and assert exactly one pool was constructed, while every line still
-    # ships exactly once with the correct tally. (RED-BEFORE-GREEN: creating the pool per
-    # _ship_ndjson_lines call, as before, would construct one per batch -> this asserts == 1.)
+    # created ONCE per partition (in _write) and reused by the _PipelinedShipper for every batch, not
+    # spun up per batch. Feed the writer three batches and assert exactly one pool was constructed,
+    # while every line still ships exactly once with the correct tally. (RED-BEFORE-GREEN: creating a
+    # pool per batch would construct three -> this asserts == 1.)
     pd = pytest.importorskip("pandas")
     import elasticsearch
     import concurrent.futures as cf
@@ -195,6 +197,69 @@ def test_ndjson_writer_reuses_one_pool_across_batches(monkeypatch):
     assert int(row["written"]) == 12 and int(row["total_input"]) == 12
     assert len(es.all_ops) == 12                 # every line shipped exactly once across batches
     assert len(pools_created) == 1               # ONE pool for the whole partition, not per batch
+
+
+def test_ndjson_writer_reconciles_under_concurrency_with_errors_across_batches(monkeypatch):
+    # End-to-end through make_ndjson_partition_writer + _merge_partition_results on the PIPELINED path:
+    # multiple Arrow batches, write_concurrency>1, some docs rejected. Every input row must produce
+    # exactly one outcome (written or error), so written+errors == total_input, unaccounted==0,
+    # overcounted==0, and the rejected doc is sampled. This is the no-loss + correct-reporting-under-
+    # failure guarantee on the concurrent, cross-batch write path.
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    import threading
+    from databricks_es_connector.bulk import _merge_partition_results
+
+    class _SelectiveThreadSafeES:
+        """400s any op line containing 'bad', 201s the rest. Thread-safe; closeable."""
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.all_ops = []
+            self.closed = False
+
+        def bulk(self, operations=None, filter_path=None, **kw):
+            ops = list(operations)
+            with self._lock:
+                self.all_ops.extend(ops)
+            return {"items": [{"index": {"status": 400, "_id": op, "error": {"reason": "boom"}}}
+                              if "bad" in op else {"index": {"status": 201}} for op in ops]}
+
+        def close(self):
+            self.closed = True
+
+    es = _SelectiveThreadSafeES()
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
+    # id_field=None -> full classify path (a 'bad' row is a 400 error). 3 batches, each mixing good and
+    # bad rows, chunk_size=2 so sends straddle batch boundaries under write_concurrency=3.
+    writer = make_ndjson_partition_writer(_cfg(id_field=None, write_concurrency=3, chunk_size=2))
+    batches = [pd.DataFrame({"_ndjson": ["ok0", "ok1", "bad0", "ok2", "ok3"]}),
+               pd.DataFrame({"_ndjson": ["ok4", "bad1", "ok5"]}),
+               pd.DataFrame({"_ndjson": ["ok6", "ok7", "ok8", "bad2"]})]
+    out = list(writer(iter(batches)))
+    row = out[0].iloc[0]
+    assert int(row["total_input"]) == 12
+    assert int(row["written"]) == 9 and int(row["errors"]) == 3
+    # No row lost or double-counted below the per-doc level, across the concurrent cross-batch merge.
+    result = _merge_partition_results([row])
+    assert result["unaccounted"] == 0 and result["overcounted"] == 0
+    assert result["written"] + result["errors"] == result["total_input"] == 12
+    assert len(result["error_samples"]) == 3 and all("boom" in s["reason"] for s in result["error_samples"])
+    assert es.closed is True
+
+
+def test_ndjson_writer_null_line_in_later_batch_still_raises(monkeypatch):
+    # Cross-batch null-id guard: batch 0 ships fine (its sends may still be in flight), then batch 1
+    # carries a null action line (build_ndjson's null/non-finite-id signal). The per-batch guard runs
+    # BEFORE each batch is fed, so the writer still RAISES and fails the partition -- pipelining must
+    # not let a later null id slip through as `unaccounted`.
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: _ThreadSafeFakeES())
+    writer = make_ndjson_partition_writer(_cfg(id_field=None, write_concurrency=3, chunk_size=2))
+    batches = [pd.DataFrame({"_ndjson": [f"b0_{i}" for i in range(6)]}),
+               pd.DataFrame({"_ndjson": ["b1_ok", None]})]
+    with pytest.raises(ValueError, match="null action line"):
+        list(writer(iter(batches)))
 
 
 def test_ship_chunk_transport_error_counts_errors_not_crash():
@@ -224,9 +289,9 @@ def test_config_accepts_deletes():
 
 def test_config_write_concurrency_sizes_connection_pool():
     import warnings
-    # write_concurrency fans the chunk shipping across worker threads (bulk._ship_ndjson_lines) and
-    # must not warn on its own; the per-node connection pool is sized to it so the workers are not
-    # capped below the configured value.
+    # write_concurrency drives the cross-batch pipeline (bulk._PipelinedShipper) and must not warn on
+    # its own; the per-node connection pool is sized to it so the in-flight sends are not capped below
+    # the configured value.
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         cfg = EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=4)
@@ -365,9 +430,10 @@ def test_preflight_accepts_boolean_delete_flag():
     _preflight(_fake_df([("id", "string"), ("d", "boolean")]), cfg)   # must not raise (require_existing_index=False)
 
 
-# --- _ship_ndjson_lines: the write_concurrency fan-out over pre-built lines --------------------
-# No Spark: _ship_ndjson_lines takes an ES client and a list of lines, so a thread-safe fake client
-# exercises the fan-out directly. The live end-to-end proof is integration test_concurrency_roundtrip.
+# --- _PipelinedShipper: the write_concurrency cross-batch pipeline over pre-built lines ------------
+# No Spark: _PipelinedShipper takes an ES client + a caller-owned pool, and `feed(lines)` per batch
+# then `close()` exercises the pipeline exactly as make_ndjson_partition_writer drives it. The live
+# end-to-end proof is integration test_concurrency_roundtrip.
 
 class _ThreadSafeFakeES:
     """Returns 201 for every operation and records what it shipped. Thread-safe for fan-out tests."""
@@ -389,27 +455,37 @@ def _zero_counts():
     return {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
 
 
-def test_ship_ndjson_lines_fans_all_lines_exactly_once():
-    from databricks_es_connector.bulk import _ship_ndjson_lines
+def _run_shipper(es, batches, cfg, stats=None, max_inflight=None):
+    """Feed `batches` (a list of line-lists, one per Arrow batch) through a _PipelinedShipper on a real
+    pool, close, and return (counts, samples). Mirrors how make_ndjson_partition_writer drives it:
+    feed each batch WITHOUT draining to zero, so in-flight sends carry across batch boundaries."""
+    from concurrent.futures import ThreadPoolExecutor
+    from databricks_es_connector.bulk import _PipelinedShipper
+    counts, samples = _zero_counts(), []
+    with ThreadPoolExecutor(max_workers=cfg.write_concurrency) as pool:
+        shipper = _PipelinedShipper(es, cfg, pool, counts, samples, stats=stats, max_inflight=max_inflight)
+        for b in batches:
+            shipper.feed(b)
+        shipper.close()
+    return counts, samples
+
+
+def test_pipelined_shipper_ships_all_lines_exactly_once():
     es = _ThreadSafeFakeES()
     lines = [f"L{i}" for i in range(10)]
-    counts, samples = _zero_counts(), []
-    _ship_ndjson_lines(es, lines, _cfg(id_field=None, write_concurrency=3, chunk_size=2), counts, samples)
-    # every line shipped exactly once across the workers -- no drops, no duplicates
-    assert sorted(es.all_ops) == sorted(lines)
-    assert len(es.all_ops) == 10
+    counts, _ = _run_shipper(es, [lines], _cfg(id_field=None, write_concurrency=3, chunk_size=2))
+    # every line shipped exactly once across the in-flight sends -- no drops, no duplicates
+    assert sorted(es.all_ops) == sorted(lines) and len(es.all_ops) == 10
     assert counts["written"] == 10 and counts["errors"] == 0
 
 
-def test_ship_ndjson_lines_concurrency_matches_serial_tally():
-    # The whole point of the fan-out: identical accounting regardless of write_concurrency.
-    from databricks_es_connector.bulk import _ship_ndjson_lines
+def test_pipelined_shipper_concurrency_matches_serial_tally():
+    # Identical accounting and set of shipped ops regardless of write_concurrency (1 == 4).
     lines = [f"L{i}" for i in range(7)]
 
     def run(wc):
         es = _ThreadSafeFakeES()
-        counts, samples = _zero_counts(), []
-        _ship_ndjson_lines(es, lines, _cfg(id_field=None, write_concurrency=wc, chunk_size=2), counts, samples)
+        counts, _ = _run_shipper(es, [lines], _cfg(id_field=None, write_concurrency=wc, chunk_size=2))
         return counts, sorted(es.all_ops)
 
     serial_counts, serial_ops = run(1)
@@ -418,10 +494,22 @@ def test_ship_ndjson_lines_concurrency_matches_serial_tally():
     assert serial_ops == conc_ops == sorted(lines)
 
 
-def test_ship_ndjson_lines_merges_errors_and_samples_across_workers():
-    # Per-worker error tallies and (bounded) sample lists must merge correctly on join.
-    from databricks_es_connector.bulk import _ship_ndjson_lines
+def test_pipelined_shipper_carries_across_batches_no_loss():
+    # The core new guarantee: sends carry across Arrow-batch boundaries (no per-batch join), and EVERY
+    # line of EVERY batch is shipped exactly once with correct counts -- no loss, no dupe across the
+    # boundary. Three batches of differing, chunk-straddling sizes.
+    es = _ThreadSafeFakeES()
+    batches = [[f"b0_{i}" for i in range(5)],
+               [f"b1_{i}" for i in range(4)],
+               [f"b2_{i}" for i in range(3)]]
+    all_lines = [x for b in batches for x in b]
+    counts, _ = _run_shipper(es, batches, _cfg(id_field=None, write_concurrency=3, chunk_size=2))
+    assert sorted(es.all_ops) == sorted(all_lines) and len(es.all_ops) == 12
+    assert counts == {"written": 12, "deleted": 0, "ignored": 0, "errors": 0}
 
+
+def test_pipelined_shipper_merges_errors_and_samples_across_sends():
+    # Per-send error tallies and (bounded) sample lists must merge correctly as sends complete.
     class _SelectiveFakeES:
         """400s any op line containing 'bad', 201s the rest."""
         def bulk(self, operations=None, **kw):
@@ -434,17 +522,17 @@ def test_ship_ndjson_lines_merges_errors_and_samples_across_workers():
             return {"items": items}
 
     lines = [f"ok{i}" for i in range(8)] + [f"bad{i}" for i in range(3)]
-    counts, samples = _zero_counts(), []
-    _ship_ndjson_lines(_SelectiveFakeES(), lines, _cfg(write_concurrency=3, chunk_size=2), counts, samples)
+    counts, samples = _run_shipper(_SelectiveFakeES(), [lines], _cfg(write_concurrency=3, chunk_size=2))
     assert counts["written"] == 8 and counts["errors"] == 3
     assert len(samples) == 3 and all("boom" in s["reason"] for s in samples)
 
 
-def test_ship_ndjson_lines_worker_exception_fails_closed(monkeypatch):
-    # RED-BEFORE-GREEN guard: a worker exception must propagate (via f.result()), so a partial write
-    # FAILS the partition rather than reporting the docs a dead worker never sent as a clean count.
-    # Deleting the `f.result()` loop makes this pass silently. _ship_ndjson_chunk normally catches
-    # transport errors and counts them, so force a raw raise to exercise the re-raise guard itself.
+def test_pipelined_shipper_worker_exception_fails_closed(monkeypatch):
+    # RED-BEFORE-GREEN guard: a worker exception must propagate (via f.result() in _drain/close), so a
+    # partial write FAILS the partition rather than reporting the docs a dead worker never sent as a
+    # clean count. Deleting the `f.result()` re-raise (using e.g. `f.done()` without reading the
+    # result) makes this pass silently. _ship_ndjson_chunk normally catches transport errors and
+    # counts them, so force a raw raise to exercise the re-raise guard itself.
     from databricks_es_connector import bulk as bulk_mod
 
     def _boom(es, chunk, cfg, counts, samples, stats=None):
@@ -452,8 +540,132 @@ def test_ship_ndjson_lines_worker_exception_fails_closed(monkeypatch):
 
     monkeypatch.setattr(bulk_mod, "_ship_ndjson_chunk", _boom)
     with pytest.raises(RuntimeError, match="worker died"):
-        bulk_mod._ship_ndjson_lines(_ThreadSafeFakeES(), [f"L{i}" for i in range(10)],
-                                    _cfg(write_concurrency=3, chunk_size=2), _zero_counts(), [])
+        _run_shipper(_ThreadSafeFakeES(), [[f"L{i}" for i in range(10)]],
+                     _cfg(write_concurrency=3, chunk_size=2))
+
+
+def test_pipelined_shipper_bounds_inflight_and_pipelines():
+    # Two properties in one deterministic check, with sends held on a gate so they pile up:
+    #   (1) BACKPRESSURE: at most write_concurrency sends are ever OUTSTANDING (submitted) at once, so
+    #       peak memory is bounded to write_concurrency chunks, not the whole partition. A counting
+    #       pool proves submissions stall at the cap (the pool's own max_workers cap would hide this,
+    #       so we count submit() calls, not running threads).
+    #   (2) PIPELINING: it actually REACHES write_concurrency in flight (not accidental serialization).
+    import threading, time
+    from concurrent.futures import ThreadPoolExecutor
+    from databricks_es_connector.bulk import _PipelinedShipper
+
+    WC = 3
+    gate = threading.Event()
+    lock = threading.Lock()
+    st = {"in_flight": 0, "max_in_flight": 0, "submitted": 0}
+
+    class _BlockingES:
+        def bulk(self, operations=None, **kw):
+            with lock:
+                st["in_flight"] += 1
+                st["max_in_flight"] = max(st["max_in_flight"], st["in_flight"])
+            gate.wait(5)
+            with lock:
+                st["in_flight"] -= 1
+            return {"errors": False}
+
+    class _CountingPool:
+        def __init__(self, real): self._real = real
+        def submit(self, fn, *a, **k):
+            with lock: st["submitted"] += 1
+            return self._real.submit(fn, *a, **k)
+
+    lines = [f"L{i}" for i in range(30)]           # 30 chunks at chunk_size=1, far more than WC
+    cfg = _cfg(write_concurrency=WC, chunk_size=1)
+    counts, samples = _zero_counts(), []
+    real_pool = ThreadPoolExecutor(max_workers=WC)
+    try:
+        shipper = _PipelinedShipper(_BlockingES(), cfg, _CountingPool(real_pool), counts, samples)
+        done = threading.Event()
+
+        def _producer():
+            for i in range(0, len(lines), 5):
+                shipper.feed(lines[i:i + 5])
+            shipper.close()
+            done.set()
+
+        t = threading.Thread(target=_producer)
+        t.start()
+        # Wait until WC sends are in flight (all blocked on the gate), then confirm it stalls there.
+        deadline = time.time() + 5
+        while st["in_flight"] < WC and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)                            # give any (buggy) extra submissions time to appear
+        with lock:
+            assert st["max_in_flight"] == WC, st   # (2) pipelines to write_concurrency
+            assert st["in_flight"] == WC, st       # still exactly WC in flight, no more
+            assert st["submitted"] == WC, st       # (1) backpressure: only WC submitted, rest blocked
+        assert not done.is_set()                   # producer is blocked at the cap, not finished
+        gate.set()                                 # release every send
+        t.join(10)
+        assert done.is_set()
+    finally:
+        gate.set()
+        real_pool.shutdown(wait=True)
+    assert counts["written"] == 30 and st["submitted"] == 30   # after release, all 30 ship
+
+
+def test_pipelined_shipper_straggler_does_not_freeze_partition():
+    # The barrier this change removes: one slow send must NOT stall the partition. A single straggler
+    # blocks on a gate while many fast sends keep completing; assert the fast sends all finish WHILE
+    # the straggler is still in flight (the old per-batch join would have frozen everything on it).
+    import threading, time
+    from concurrent.futures import ThreadPoolExecutor
+    from databricks_es_connector.bulk import _PipelinedShipper
+
+    WC = 3
+    gate = threading.Event()
+    straggler_running = threading.Event()
+    lock = threading.Lock()
+    shipped = []
+
+    class _StragglerES:
+        def bulk(self, operations=None, **kw):
+            (op,) = operations                     # chunk_size=1 -> one op per send
+            if op == "SLOW":
+                straggler_running.set()
+                gate.wait(5)                       # hold the slot until released
+            with lock:
+                shipped.append(op)
+            return {"errors": False}
+
+    lines = ["SLOW"] + [f"F{i}" for i in range(20)]
+    cfg = _cfg(write_concurrency=WC, chunk_size=1)
+    counts, samples = _zero_counts(), []
+    real_pool = ThreadPoolExecutor(max_workers=WC)
+    try:
+        shipper = _PipelinedShipper(_StragglerES(), cfg, real_pool, counts, samples)
+        done = threading.Event()
+
+        def _producer():
+            shipper.feed(lines)
+            shipper.close()
+            done.set()
+
+        t = threading.Thread(target=_producer)
+        t.start()
+        assert straggler_running.wait(5)           # straggler is in flight, holding one slot
+        # The 20 fast sends must all complete while SLOW is still blocked -> progress despite a straggler.
+        deadline = time.time() + 5
+        while len(shipped) < 20 and time.time() < deadline:
+            time.sleep(0.01)
+        with lock:
+            assert len(shipped) == 20, shipped     # every fast send finished...
+            assert "SLOW" not in shipped           # ...while the straggler is still in flight
+        assert not done.is_set()                   # close() is still waiting on the straggler
+        gate.set()                                 # release the straggler
+        t.join(10)
+        assert done.is_set()
+    finally:
+        gate.set()
+        real_pool.shutdown(wait=True)
+    assert counts["written"] == 21 and "SLOW" in shipped
 
 
 def test_config_write_concurrency_must_be_positive():
@@ -680,16 +892,14 @@ def test_ship_chunk_records_took_on_full_path():
     assert stats[0][0] == 2 and stats[0][3] == 3    # (docs, bytes, rtt, took): took is index 3
 
 
-def test_ship_ndjson_lines_merges_stats_across_workers():
-    from databricks_es_connector.bulk import _ship_ndjson_lines
+def test_pipelined_shipper_merges_stats_across_sends():
     es = _FastFakeES()   # returns {"errors": False} on the probe; no took, so took_ms is None
     lines = [f"L{i}" for i in range(10)]
-    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     stats = []
-    _ship_ndjson_lines(es, lines, _cfg(write_concurrency=3, chunk_size=2), counts, [], stats=stats)
-    # write_concurrency=3 strides 10 lines into slices of 4/3/3, each chunked by 2 -> 2+2+2 = 6 sends;
-    # every line is shipped exactly once (docs sum to 10), and every send is recorded.
-    assert len(stats) == 6 and sum(s[0] for s in stats) == 10
+    _run_shipper(es, [lines], _cfg(write_concurrency=3, chunk_size=2), stats=stats)
+    # Per-send size is now chunk_size alone (decoupled from write_concurrency): 10 lines / chunk_size 2
+    # = 5 sends; every line shipped exactly once (docs sum to 10), and every send is recorded.
+    assert len(stats) == 5 and sum(s[0] for s in stats) == 10
     assert all(s[2] >= 0.0 for s in stats)          # rtt is index 2 in (docs, bytes, rtt, took)
     assert sum(s[1] for s in stats) == sum(len(x) for x in lines)   # bytes cover every line once
 
@@ -786,14 +996,12 @@ class _FastFakeES:
         self.closed = True
 
 
-def test_fast_path_under_fan_out_ships_each_line_once_via_probe():
-    # The fan-out (write_concurrency) composes with the fast path: every worker probes with
+def test_fast_path_under_pipeline_ships_each_line_once_via_probe():
+    # The pipeline (write_concurrency) composes with the fast path: every send probes with
     # filter_path="errors", every line ships exactly once, all counted written, no full re-ship.
-    from databricks_es_connector.bulk import _ship_ndjson_lines
     es = _FastFakeES()
     lines = [f"L{i}" for i in range(10)]
-    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
-    _ship_ndjson_lines(es, lines, _cfg(write_concurrency=3, chunk_size=2), counts, [])
+    counts, _ = _run_shipper(es, [lines], _cfg(write_concurrency=3, chunk_size=2))
     assert sorted(es.all_ops) == sorted(lines) and len(es.all_ops) == 10
     assert counts == {"written": 10, "deleted": 0, "ignored": 0, "errors": 0}
     assert all(fp == "errors" for _ops, fp in es.calls)   # every request was a minimal probe

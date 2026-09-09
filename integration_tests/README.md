@@ -7,7 +7,7 @@ structurally cannot.
 ## Why this exists
 
 `tests/` is fast, infra-free, and covers the pure-Python layer (`read_coerce`,
-`classify_bulk_result`, `_merge_partition_results`, the NDJSON shipper + `write_concurrency` fan-out,
+`classify_bulk_result`, `_merge_partition_results`, the NDJSON shipper + `write_concurrency` cross-batch pipeline,
 `EsConfig`, and the `make_foreach_batch` streaming glue) with hand-built inputs and a stubbed ES
 client. The write serializer `build_ndjson` (`to_json`) needs Spark, so it and these things can't be
 tested there and only manifest on a live serverless session:
@@ -46,7 +46,8 @@ Each fixture owns one concern:
   path), idempotent re-write via a deterministic `_id`, and a duplicate-id-within-one-input case
   proving the collapse (counts succeed, ES doc count is lower). Does not re-assert per-type transforms.
 - **`test_concurrency_roundtrip.py`**: live ES. Owns the **per-partition write-concurrency contract**:
-  with `write_concurrency > 1`, the threaded fan-out inside each partition writes every doc exactly
+  with `write_concurrency > 1`, the in-partition send pipeline (bounded in-flight, fed across Arrow
+  batches) writes every doc exactly
   once (ES `_count` == input), counts reconcile with `unaccounted == 0` and `overcounted == 0`,
   deterministic-`_id` re-write stays idempotent, and a rejected doc is still counted + sampled. The
   unit tier proves the merge/retry/fail-closed logic; this proves it over the live `mapInPandas` write.
