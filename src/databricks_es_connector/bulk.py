@@ -405,6 +405,16 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)
+            # Close the per-partition ES client so its keep-alive TCP connections (up to
+            # write_concurrency per node, to a possibly-distant host) are released promptly at task end,
+            # rather than left for GC to reap when the reused Python worker is torn down. The read path
+            # already closes its client; the write path did not, leaking a client per partition (one per
+            # task, so many per executor across waves) and adding avoidable connection-teardown work at
+            # stage end. Fail-soft: a close error must not fail an otherwise-successful partition.
+            try:
+                es.close()
+            except Exception:
+                pass
         partition_wall_ms = (_time.perf_counter() - _partition_t0) * 1000.0
         out = {
             "written": [counts["written"]], "deleted": [counts["deleted"]],
@@ -741,8 +751,21 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     from .spark_serialize import build_ndjson
     nd = build_ndjson(df, cfg)
     writer = make_ndjson_partition_writer(cfg)
+    # Split the driver-observed time into the Spark action (collect: the whole write job plus Spark's
+    # post-task result finalization) versus the pure-Python driver rollup (merge). Reported only under
+    # bulk_stats. If a run spends minutes AFTER the write stage's tasks all show complete, this pins
+    # whether that time is inside collect (Spark finalization / a straggler task the stage view already
+    # counted) or the driver rollup -- merge is O(partitions) pure Python and should be milliseconds, so
+    # a large merge_ms would itself be the finding.
+    import time as _t
+    _c0 = _t.perf_counter()
     rows = nd.mapInPandas(writer, summary_schema).collect()
+    _c1 = _t.perf_counter()
     result = _merge_partition_results(rows)
+    _c2 = _t.perf_counter()
+    if cfg.bulk_stats:
+        result["collect_ms"] = (_c1 - _c0) * 1000.0
+        result["merge_ms"] = (_c2 - _c1) * 1000.0
     if raise_on_error:
         reconcile_or_raise(result, index=cfg.index)
     return result

@@ -711,6 +711,18 @@ def test_writer_emits_per_partition_bulk_stats_columns(monkeypatch):
     assert float(row["send_busy_ms"]) >= 0.0 and float(row["partition_wall_ms"]) >= 0.0
 
 
+def test_writer_closes_es_client(monkeypatch):
+    # The per-partition client must be closed at task end so its keep-alive connections are released
+    # promptly rather than left for GC (the write path previously leaked one client per partition).
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    es = _FastFakeES()
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
+    writer = make_ndjson_partition_writer(_cfg(chunk_size=2))
+    list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b"]})])))
+    assert es.closed is True
+
+
 def test_writer_omits_stats_columns_when_off(monkeypatch):
     pd = pytest.importorskip("pandas")
     import elasticsearch
@@ -759,6 +771,7 @@ class _FastFakeES:
         self._lock = threading.Lock()
         self.calls = []          # (operations, filter_path)
         self.all_ops = []
+        self.closed = False
 
     def bulk(self, operations=None, filter_path=None, **kw):
         ops = list(operations)
@@ -768,6 +781,9 @@ class _FastFakeES:
         if filter_path and "errors" in filter_path:      # "errors" or "errors,took" (stats mode)
             return {"errors": False, "took": 1}
         return {"items": [{"index": {"status": 201}} for _ in ops], "took": 1}
+
+    def close(self):
+        self.closed = True
 
 
 def test_fast_path_under_fan_out_ships_each_line_once_via_probe():
