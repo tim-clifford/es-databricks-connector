@@ -126,6 +126,39 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     """
     import time as _t
 
+    # Fast path (GIL avoidance): when writes are idempotent (id_field set) and there are no deletes,
+    # a clean chunk needs only the top-level `errors` flag, not per-item detail. Ship with
+    # filter_path="errors" so Elasticsearch returns just {"errors": false} on success: the per-item
+    # response array is never sent or decoded, removing the O(chunk_size) Python decode + classify
+    # that runs holding the GIL and so serializes write_concurrency threads within a worker process.
+    # On ANY failure (errors true, or the flag missing -> fail closed) fall through to the full path
+    # below, which re-ships the SAME chunk without filter_path and runs the normal classify + 429
+    # retry. Re-shipping is correct ONLY because every op is an idempotent upsert (id_field set, no
+    # deletes): a doc that already succeeded on the probe is simply upserted again. Deletes are
+    # excluded because a delete-404 is IGNORED (not written), so `errors: false` would not justify
+    # counting the whole chunk as written; auto-id writes (id_field is None) are excluded because a
+    # re-ship would duplicate the docs the probe already wrote.
+    if cfg.id_field is not None and not cfg.has_deletes:
+        try:
+            resp = es.bulk(operations=list(lines), filter_path="errors")
+        except Exception as _e:  # noqa: BLE001
+            # Same fail-closed handling as the full path: a whole-request transport failure counts
+            # every line as an error rather than aborting the partition.
+            counts["errors"] += len(lines)
+            if len(error_samples) < ERROR_SAMPLE_CAP:
+                error_samples.append({"_id": None, "op_type": "bulk",
+                                      "status": None, "reason": f"{type(_e).__name__}: {_e}"[:300]})
+            return
+        # elasticsearch-py 8.x returns an ObjectApiResponse (supports resp["k"] / "k" in resp, no
+        # .get), so read the flag the same isinstance-guarded way the full path reads items below.
+        # An absent flag falls closed to True (re-ship full).
+        errors = (resp.get("errors", True) if isinstance(resp, dict)
+                  else resp["errors"] if "errors" in resp else True)
+        if errors is False:
+            counts["written"] += len(lines)
+            return
+        # errors true or the flag absent: re-ship in full below to get per-item detail and retry.
+
     pending = list(lines)
     attempt = 0
     while pending:

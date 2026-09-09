@@ -67,7 +67,7 @@ def test_iter_bulk_response_outcomes_empty_item_is_error_not_crash():
 def test_ship_chunk_empty_item_counts_error_not_crash():
     es = _FakeES([{"items": [{"index": {"status": 201}}, {}]}])   # one good, one empty
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
-    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, [])
     assert counts["written"] == 1 and counts["errors"] == 1        # no crash, empty -> error
 
 
@@ -83,7 +83,7 @@ def test_ship_chunk_tallies_mixed_outcomes():
     es = _FakeES([resp])
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     samples = []
-    _ship_ndjson_chunk(es, ["l1", "l2", "l3"], _cfg(), counts, samples)
+    _ship_ndjson_chunk(es, ["l1", "l2", "l3"], _cfg(id_field=None), counts, samples)
     assert counts == {"written": 1, "deleted": 0, "ignored": 1, "errors": 1}
     assert len(samples) == 1 and samples[0]["_id"] == "c" and "boom" in samples[0]["reason"]
     assert len(es.calls) == 1
@@ -96,7 +96,7 @@ def test_ship_chunk_retries_only_the_429_line_then_succeeds():
         {"items": [{"index": {"status": 201}}]},
     ])
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
-    _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(max_retries_per_doc=3), counts, [])
+    _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(id_field=None, max_retries_per_doc=3), counts, [])
     assert counts["written"] == 3 and counts["errors"] == 0
     assert es.calls[0] == ["a", "b", "c"]
     assert es.calls[1] == ["b"]          # only the retryable line was resent
@@ -107,7 +107,7 @@ def test_ship_chunk_429_becomes_error_after_max_retries():
     always_429 = {"items": [{"index": {"status": 429, "_id": "x"}}]}
     es = _FakeES([always_429, always_429, always_429])   # initial + 2 retries
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
-    _ship_ndjson_chunk(es, ["x"], _cfg(max_retries_per_doc=2), counts, [])
+    _ship_ndjson_chunk(es, ["x"], _cfg(id_field=None, max_retries_per_doc=2), counts, [])
     assert counts["errors"] == 1 and counts["written"] == 0
     assert len(es.calls) == 3            # 1 initial + 2 retries, then give up
 
@@ -123,7 +123,7 @@ def test_ndjson_writer_schema_and_counts(monkeypatch):
                       {"index": {"status": 400, "_id": "z", "error": {"reason": "no"}}}]}
     monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: _FakeES([resp]))
 
-    writer = make_ndjson_partition_writer(_cfg(chunk_size=500))
+    writer = make_ndjson_partition_writer(_cfg(id_field=None, chunk_size=500))
     out = list(writer(iter([pd.DataFrame({"_ndjson": ["l1", "l2", "l3"]})])))
     assert len(out) == 1
     row = out[0].iloc[0]
@@ -145,7 +145,7 @@ def test_ndjson_writer_chunks_by_chunk_size(monkeypatch):
                   {"items": [{"index": {"status": 201}}]}])
     monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
 
-    writer = make_ndjson_partition_writer(_cfg(chunk_size=2))
+    writer = make_ndjson_partition_writer(_cfg(id_field=None, chunk_size=2))
     out = list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b", "c", "d", "e"]})])))
     row = out[0].iloc[0]
     assert int(row["written"]) == 5 and int(row["total_input"]) == 5
@@ -161,7 +161,7 @@ def test_ndjson_writer_null_line_raises(monkeypatch):
 
     es = _FakeES([{"items": [{"index": {"status": 201}}]}])
     monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
-    writer = make_ndjson_partition_writer(_cfg(chunk_size=500))
+    writer = make_ndjson_partition_writer(_cfg(id_field=None, chunk_size=500))
     with pytest.raises(ValueError, match="null action line"):
         list(writer(iter([pd.DataFrame({"_ndjson": ["good", None]})])))
     with pytest.raises(ValueError, match="null action line"):
@@ -186,7 +186,7 @@ def test_ndjson_writer_reuses_one_pool_across_batches(monkeypatch):
     monkeypatch.setattr(cf, "ThreadPoolExecutor",
                         lambda *a, **k: pools_created.append(real_pool(*a, **k)) or pools_created[-1])
 
-    writer = make_ndjson_partition_writer(_cfg(write_concurrency=3, chunk_size=2))
+    writer = make_ndjson_partition_writer(_cfg(id_field=None, write_concurrency=3, chunk_size=2))
     batches = [pd.DataFrame({"_ndjson": [f"b0_{i}" for i in range(5)]}),
                pd.DataFrame({"_ndjson": [f"b1_{i}" for i in range(4)]}),
                pd.DataFrame({"_ndjson": [f"b2_{i}" for i in range(3)]})]
@@ -394,7 +394,7 @@ def test_ship_ndjson_lines_fans_all_lines_exactly_once():
     es = _ThreadSafeFakeES()
     lines = [f"L{i}" for i in range(10)]
     counts, samples = _zero_counts(), []
-    _ship_ndjson_lines(es, lines, _cfg(write_concurrency=3, chunk_size=2), counts, samples)
+    _ship_ndjson_lines(es, lines, _cfg(id_field=None, write_concurrency=3, chunk_size=2), counts, samples)
     # every line shipped exactly once across the workers -- no drops, no duplicates
     assert sorted(es.all_ops) == sorted(lines)
     assert len(es.all_ops) == 10
@@ -409,7 +409,7 @@ def test_ship_ndjson_lines_concurrency_matches_serial_tally():
     def run(wc):
         es = _ThreadSafeFakeES()
         counts, samples = _zero_counts(), []
-        _ship_ndjson_lines(es, lines, _cfg(write_concurrency=wc, chunk_size=2), counts, samples)
+        _ship_ndjson_lines(es, lines, _cfg(id_field=None, write_concurrency=wc, chunk_size=2), counts, samples)
         return counts, sorted(es.all_ops)
 
     serial_counts, serial_ops = run(1)
@@ -459,3 +459,194 @@ def test_ship_ndjson_lines_worker_exception_fails_closed(monkeypatch):
 def test_config_write_concurrency_must_be_positive():
     with pytest.raises(ValueError, match="write_concurrency must be >= 1"):
         EsConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", write_concurrency=0)
+
+
+# --- _ship_ndjson_chunk: the filter_path="errors" fast path (GIL avoidance) --------------------
+# On an idempotent (id_field set), delete-free write, a clean bulk needs only the top-level `errors`
+# flag, so the chunk is shipped with filter_path="errors" and the per-item response is never decoded
+# or classified in Python (the GIL-held cost that serialized write_concurrency threads). On ANY
+# failure the chunk is re-shipped with a FULL response and the existing classify + 429-retry runs;
+# re-shipping is safe only because every op is an idempotent upsert (id_field set, no deletes), so a
+# doc that already succeeded is simply upserted again. The gate is exactly id_field-set + no-deletes.
+
+class _RecordingES:
+    """Records each call's (operations, filter_path) and returns queued responses in order."""
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []          # list of (operations_list, filter_path)
+
+    def bulk(self, operations=None, filter_path=None, **kw):
+        self.calls.append((list(operations), filter_path))
+        return self._responses.pop(0)
+
+
+def test_fast_path_clean_bulk_requests_only_errors_and_counts_all_written():
+    # Happy path: ONE minimal request (filter_path="errors"), response carries no items, every line
+    # counted written without decoding/classifying a per-item array. No re-ship.
+    es = _RecordingES([{"errors": False}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(), counts, [])
+    assert counts == {"written": 3, "deleted": 0, "ignored": 0, "errors": 0}
+    assert es.calls == [(["a", "b", "c"], "errors")]      # minimal request, no full re-ship
+
+
+def test_fast_path_reissues_full_on_error_and_classifies_per_item():
+    # errors=True on the minimal probe -> re-ship FULL (no filter_path) -> existing per-item classify.
+    full = {"items": [{"index": {"status": 201, "_id": "a"}},
+                      {"index": {"status": 400, "_id": "b", "error": {"reason": "boom"}}}]}
+    es = _RecordingES([{"errors": True}, full])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, samples)
+    assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
+    assert samples and samples[0]["_id"] == "b" and "boom" in samples[0]["reason"]
+    assert es.calls[0] == (["a", "b"], "errors")          # probe first
+    assert es.calls[1] == (["a", "b"], None)              # then full re-ship for detail
+
+
+def test_fast_path_reissue_still_drives_429_retry():
+    # After the probe flags an error, the full re-ship must drive the normal per-doc 429 retry.
+    es = _RecordingES([
+        {"errors": True},
+        {"items": [{"index": {"status": 201}}, {"index": {"status": 429}}, {"index": {"status": 201}}]},
+        {"items": [{"index": {"status": 201}}]},
+    ])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(max_retries_per_doc=3), counts, [])
+    assert counts["written"] == 3 and counts["errors"] == 0
+    assert es.calls[1] == (["a", "b", "c"], None)         # full re-ship
+    assert es.calls[2] == (["b"], None)                   # only the 429 line retried
+
+
+def test_fast_path_missing_errors_key_fails_closed():
+    # A probe response without an `errors` key must NOT read as clean: treat as error and re-ship full.
+    es = _RecordingES([{}, {"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
+    assert counts["written"] == 2 and counts["errors"] == 0
+    assert len(es.calls) == 2 and es.calls[1] == (["a", "b"], None)
+
+
+def test_fast_path_disabled_without_id_field():
+    # No id_field -> ES auto-ids -> re-ship would DUPLICATE, so the fast path is off: one FULL request
+    # (no filter_path), classified per item, exactly as before.
+    es = _RecordingES([{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, [])
+    assert counts["written"] == 2
+    assert es.calls == [(["a", "b"], None)]               # full response, never filter_path="errors"
+
+
+def test_fast_path_disabled_with_deletes():
+    # With deletes, errors=False does NOT mean "all written" (some are deleted / delete-404 ignored),
+    # so the fast path must not apply: ship full and classify so deleted/ignored split out correctly.
+    from databricks_es_connector.config import EsWriteConfig
+    cfg = EsWriteConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
+                        require_existing_index=False, has_deletes=True, delete_flag_column="d")
+    es = _RecordingES([{"items": [{"index": {"status": 201}}, {"delete": {"status": 404}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], cfg, counts, [])
+    assert counts == {"written": 1, "deleted": 0, "ignored": 1, "errors": 0}
+    assert es.calls == [(["a", "b"], None)]
+
+
+class _NoGetResponse:
+    """Mimics elasticsearch-py 8.x's ObjectApiResponse: supports resp["k"] and "k" in resp, but has
+    NO .get method (a plain-dict assumption would AttributeError on a live cluster)."""
+    def __init__(self, body): self._body = dict(body)
+    def __getitem__(self, k): return self._body[k]
+    def __contains__(self, k): return k in self._body
+
+
+class _ObjResponseFakeES:
+    """Fake whose bulk() returns an ObjectApiResponse-like object (no .get), one per queued body."""
+    def __init__(self, bodies):
+        self._bodies = list(bodies)
+        self.calls = []
+    def bulk(self, operations=None, filter_path=None, **kw):
+        self.calls.append((list(operations), filter_path))
+        return _NoGetResponse(self._bodies.pop(0))
+
+
+def test_fast_path_reads_errors_from_objectapiresponse_without_get():
+    # Real ES 8.x returns an ObjectApiResponse (indexing + `in`, no .get). The clean-probe flag read
+    # must not assume a plain dict, or it AttributeErrors on the exact write this path targets.
+    es = _ObjResponseFakeES([{"errors": False}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
+    assert counts["written"] == 2 and es.calls == [(["a", "b"], "errors")]
+
+
+def test_fast_path_objectapiresponse_error_reships_and_classifies():
+    # Same non-dict response type on the error path: errors=True -> full re-ship -> per-item classify.
+    es = _ObjResponseFakeES([
+        {"errors": True},
+        {"items": [{"index": {"status": 201, "_id": "a"}},
+                   {"index": {"status": 400, "_id": "b", "error": {"reason": "boom"}}}]},
+    ])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, samples)
+    assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
+    assert samples and samples[0]["_id"] == "b"
+    assert es.calls[1] == (["a", "b"], None)
+
+
+def test_fast_path_probe_transport_error_counts_errors_not_crash():
+    # The minimal probe raising (transport failure) must count every line as an error, not crash.
+    class _RaisingES:
+        def __init__(self): self.calls = []
+        def bulk(self, operations=None, filter_path=None, **kw):
+            self.calls.append(filter_path)
+            raise RuntimeError("connection reset")
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(_RaisingES(), ["a", "b", "c"], _cfg(), counts, samples)
+    assert counts["errors"] == 3 and samples
+
+
+class _FastFakeES:
+    """Thread-safe fake for the fast path: filter_path='errors' returns {'errors': False} (probe),
+    a full call returns per-item 201s. Records the (ops, filter_path) of every call."""
+    def __init__(self):
+        import threading
+        self._lock = threading.Lock()
+        self.calls = []          # (operations, filter_path)
+        self.all_ops = []
+
+    def bulk(self, operations=None, filter_path=None, **kw):
+        ops = list(operations)
+        with self._lock:
+            self.calls.append((ops, filter_path))
+            self.all_ops.extend(ops)
+        if filter_path == "errors":
+            return {"errors": False}
+        return {"items": [{"index": {"status": 201}} for _ in ops]}
+
+
+def test_fast_path_under_fan_out_ships_each_line_once_via_probe():
+    # The fan-out (write_concurrency) composes with the fast path: every worker probes with
+    # filter_path="errors", every line ships exactly once, all counted written, no full re-ship.
+    from databricks_es_connector.bulk import _ship_ndjson_lines
+    es = _FastFakeES()
+    lines = [f"L{i}" for i in range(10)]
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_lines(es, lines, _cfg(write_concurrency=3, chunk_size=2), counts, [])
+    assert sorted(es.all_ops) == sorted(lines) and len(es.all_ops) == 10
+    assert counts == {"written": 10, "deleted": 0, "ignored": 0, "errors": 0}
+    assert all(fp == "errors" for _ops, fp in es.calls)   # every request was a minimal probe
+
+
+def test_fast_path_through_the_writer_counts_all_written(monkeypatch):
+    # End-to-end through make_ndjson_partition_writer: a clean idempotent batch is all written and
+    # the yielded summary schema is unchanged.
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    es = _FastFakeES()
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
+    writer = make_ndjson_partition_writer(_cfg(chunk_size=2))
+    out = list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b", "c", "d", "e"]})])))
+    row = out[0].iloc[0]
+    assert int(row["written"]) == 5 and int(row["total_input"]) == 5
+    assert int(row["errors"]) == 0
+    assert all(fp == "errors" for _ops, fp in es.calls)
