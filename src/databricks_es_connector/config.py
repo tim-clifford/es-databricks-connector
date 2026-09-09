@@ -130,10 +130,11 @@ class EsWriteConfig(EsConnection):
     # count. Raise it when the write is LATENCY-bound: executors sit idle waiting on each bulk's ES
     # round-trip (CPU and network both under-utilized) rather than CPU- or bandwidth-bound. Each
     # partition then keeps `write_concurrency` bulk requests in flight at once, filling that wait: the
-    # pre-built NDJSON lines are fanned across that many worker threads (bulk._ship_ndjson_lines), each
-    # shipping its strided slice with the SAME chunk_size and per-document 429 retry, so the error
-    # accounting is unchanged; only the number of concurrent in-flight requests grows. Costs one
-    # executor thread and up to one chunk of in-flight docs per unit. Total requests hitting ES at once
+    # pre-built NDJSON is shipped through a bounded pool (bulk._PipelinedShipper) that keeps that many
+    # sends in flight CONTINUOUSLY across Arrow batches, each a chunk_size send with the SAME
+    # per-document 429 retry, so the error accounting is unchanged; only the number of concurrent
+    # in-flight requests grows. Costs one executor thread and up to `write_concurrency` chunks of
+    # in-flight docs per partition (the shipper's backpressure bound). Total requests hitting ES at once
     # = (running partitions) * write_concurrency, so raise it gradually and watch for 429s (ES write
     # queue full) -- if they climb, the ES cluster, not the client, is the ceiling. The per-node HTTP
     # connection pool is sized to write_concurrency automatically (see client_kwargs), so callers do
@@ -230,7 +231,7 @@ class EsWriteConfig(EsConnection):
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.
 
         Each partition's ES client is shared by `write_concurrency` worker threads
-        (bulk._ship_ndjson_lines). elastic_transport's per-node pool defaults to ~10 connections, so a
+        (bulk._PipelinedShipper). elastic_transport's per-node pool defaults to ~10 connections, so a
         higher write_concurrency would silently cap the in-flight requests below the configured value;
         sizing the pool to the concurrency gives every worker its own connection. Left at the client
         default for write_concurrency == 1 (the serial path), so nothing changes there.

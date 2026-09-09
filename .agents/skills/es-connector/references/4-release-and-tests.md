@@ -9,8 +9,9 @@ them, it never re-implements them.
 
 **`tests/`, pure-Python, fast, no infra (`pytest`).** The inner loop. Covers `read_coerce` (the read
 inverse, against the stored form), config validation, `classify_bulk_result` / result merging, the
-NDJSON shipper + `write_concurrency` fan-out (`_ship_ndjson_chunk` / `_ship_ndjson_lines`, with a fake
-ES), the delete-flag boolean preflight, the pure `spark_serialize` helpers (`_payload_columns`,
+NDJSON shipper + `write_concurrency` cross-batch pipeline (`_ship_ndjson_chunk` / `_PipelinedShipper`,
+with a fake ES: bounded in-flight, cross-batch continuity, straggler tolerance, fail-closed on a
+worker exception), the delete-flag boolean preflight, the pure `spark_serialize` helpers (`_payload_columns`,
 `_type_has_float`, `_type_has_date_or_ntz`, `_epoch_type`), the streaming glue, and the PURE helpers in
 `spark_prep.py` (`_type_has_timestamp`, `_type_is_arrow_hostile`, etc.). The write serializer itself
 (`build_ndjson` / `to_json`) needs Spark, so the write<->read round-trip oracle is in the integration
