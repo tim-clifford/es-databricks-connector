@@ -5,11 +5,14 @@
 # MAGIC partition keeps `write_concurrency` `es.bulk(operations=...)` sends in flight CONTINUOUSLY
 # MAGIC across its Arrow batches (`bulk._PipelinedShipper`, no per-batch join), and that pipeline must
 # MAGIC not lose, duplicate, or mis-count a single document, keeping per-document error accounting and
-# MAGIC deterministic-`_id` idempotency intact. A small `arrow.maxRecordsPerBatch` forces MULTIPLE
-# MAGIC Arrow batches per partition, so the cross-batch continuity (the sends carrying over the batch
-# MAGIC boundary) is exercised live, not just single-batch partitions. The unit tier proves the
-# MAGIC merge/backpressure/straggler/fail-closed logic off-cluster (`tests/test_spark_serialize.py`);
-# MAGIC only this tier proves it over the real `mapInPandas` write to a live ES. Live ES + `es_poc` scope.
+# MAGIC deterministic-`_id` idempotency intact. Each partition holds far MORE rows than the default
+# MAGIC Arrow batch size (`spark.sql.execution.arrow.maxRecordsPerBatch`, ~10k), so mapInPandas hands
+# MAGIC the writer MULTIPLE Arrow batches per partition and the cross-batch continuity (sends carrying
+# MAGIC over the batch boundary) is exercised live, not just single-batch partitions. (We size the data
+# MAGIC rather than set the conf: serverless rejects modifying that conf at runtime.) The unit tier
+# MAGIC proves the merge/backpressure/straggler/fail-closed logic off-cluster
+# MAGIC (`tests/test_spark_serialize.py`); only this tier proves it over the real `mapInPandas` write to
+# MAGIC a live ES. Live ES + `es_poc` scope.
 
 # COMMAND ----------
 import json, requests, urllib3
@@ -19,7 +22,9 @@ from databricks_es_connector import EsConfig, bulk_write
 
 SCOPE = "es_poc"
 INDEX = "connector-integration-concurrency"     # throwaway; recreated + dropped by the fixture
-N = 5000                                         # enough rows that the fan-out spans many chunks
+N = 60000                                        # >> Arrow batch size, so each partition spans several
+                                                 # Arrow batches (exercises cross-batch pipelining)
+PARTITIONS = 3                                    # N/PARTITIONS (20k) rows per partition >> ~10k batch
 CONCURRENCY = 4
 ES_HOSTS = dbutils.secrets.get(SCOPE, "hosts")
 ES_AUTH = (dbutils.secrets.get(SCOPE, "username"), dbutils.secrets.get(SCOPE, "password"))
@@ -30,12 +35,11 @@ class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
     re-write, and still counts a rejected doc, all over the live threaded mapInPandas write."""
 
     def run_setup(self):
-        # Force MULTIPLE Arrow batches per partition so the pipeline feeds sends ACROSS batch
-        # boundaries (the cross-batch continuity the shipper adds), not one batch per partition. With
-        # N/4 rows per partition, a small maxRecordsPerBatch yields several batches each. chunk_size is
-        # also small so each partition issues many bulk sends (the pipeline spans many chunks).
-        self._prev_arrow_batch = spark.conf.get("spark.sql.execution.arrow.maxRecordsPerBatch", None)
-        spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", "200")
+        # chunk_size deliberately small so each partition issues MANY bulk sends (the pipeline spans
+        # many chunks); combined with the large per-partition row count (see the df below), sends are
+        # fed to the bounded in-flight pool ACROSS multiple Arrow batches -- the cross-batch continuity
+        # the shipper adds. We do NOT set arrow.maxRecordsPerBatch (serverless rejects modifying it at
+        # runtime); sizing the data above the default batch size achieves the same multi-batch shape.
         self.cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
                             index=INDEX, id_field="doc_id", http_compress=True,
                             write_concurrency=CONCURRENCY, chunk_size=100)
@@ -46,12 +50,13 @@ class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
         requests.put(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30,
                      headers={"Content-Type": "application/json"}, data=json.dumps(body))
 
-        # N unique rows across a few partitions, so mapInPandas runs several partitions AND each
-        # partition fans across CONCURRENCY workers. Unique doc_id => ES _count == N iff nothing was
-        # lost or duplicated by the concurrent merge.
+        # N unique rows across PARTITIONS partitions, so mapInPandas runs several partitions, each with
+        # ~N/PARTITIONS (20k) rows >> the ~10k Arrow batch => several Arrow batches per partition (the
+        # pipeline feeds sends across those batch boundaries) AND each partition ships concurrently.
+        # Unique doc_id => ES _count == N iff nothing was lost or duplicated by the concurrent merge.
         df = (spark.range(N)
                    .selectExpr("concat('d', id) AS doc_id", "CAST(id AS INT) AS n")
-                   .repartition(4))
+                   .repartition(PARTITIONS))
         self.res = bulk_write(df, self.cfg)
 
         # Re-write the SAME rows, still concurrent: deterministic _id => upsert, not duplicate.
@@ -71,11 +76,6 @@ class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
 
     def run_cleanup(self):
         requests.delete(f"{ES_HOSTS}/{INDEX}", auth=ES_AUTH, verify=False, timeout=30)
-        # Restore the session's Arrow batch size so this fixture does not leak its setting to others.
-        if self._prev_arrow_batch is None:
-            spark.conf.unset("spark.sql.execution.arrow.maxRecordsPerBatch")
-        else:
-            spark.conf.set("spark.sql.execution.arrow.maxRecordsPerBatch", self._prev_arrow_batch)
 
     # --- every doc written exactly once, counts correct ---
     def test_all_docs_written(self):
