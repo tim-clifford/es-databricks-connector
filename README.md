@@ -261,6 +261,12 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   count. The `errors` count is always exact; only the retained sample list is capped, so a batch
   that fails wholesale can't exhaust memory. If you need every failed row durably, capture them
   from your own pipeline, the connector does not persist them.
+- **`bulk_stats` is opt-in diagnostics, absent by default.** With `EsWriteConfig(bulk_stats=True)`,
+  the result carries an extra `bulk_stats` key: a list with one entry per write partition, each
+  `{n_sends, docs_sent, rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max}`. `rtt_ms` is the full
+  client-observed round trip per `_bulk`; `took_ms` is Elasticsearch's own reported service time, so
+  `rtt − took` is network/queue overhead and `docs_sent / n_sends` is the real docs-per-bulk. The key
+  is **absent** when `bulk_stats` is off, so the core result shape above is unchanged.
 - **Duplicate `id_field` values collapse, and reconciliation won't flag it.** If `id_field` is
   set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
   over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
@@ -480,6 +486,7 @@ per-document level, and `max_retries=N` sets both at once, see
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
 | `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses to retry. `429` is ES's write queue being full, the one reliably transient case. Adding `503` (a shard briefly unavailable, e.g. during relocation) is the main sensible extension: `retry_on_doc_status=(429, 503)`. Do **not** add deterministic statuses like `400` (malformed doc) or `409` (version conflict): the retry fails identically and only delays the real error. Empty with a non-zero `max_retries_per_doc` raises. |
 | `require_existing_index` | `bool` | `True` | No | Verify the index exists before writing. ES auto-creates a missing index, so a **typo'd index name** otherwise produces a brand-new dynamically-mapped index and a perfect-looking `written` count. One `indices.exists` call on the driver. Set `False` to allow auto-creation (e.g. with an index template). |
+| `bulk_stats` | `bool` | `False` | No | Diagnostics: collect per-`_bulk` send stats and return them under an extra `bulk_stats` key in the write result (see [The write result](#the-write-result-bulk_write-return-value)), one entry per write partition. Each carries `n_sends`, `docs_sent`, and the round-trip `rtt_ms_*` and ES-reported `took_ms_*` (mean/p50/p95/max). `rtt_ms − took_ms` is the network/queue overhead and `docs_sent / n_sends` is the real docs-per-bulk, so it answers whether a write is bound on ES service time, the network, or the client. On the happy path it adds `took` to the `filter_path`, so the cost is one small extra timing per request; **off by default** (zero overhead and the result key absent when unset). |
 
 #### Retries on a write: two layers
 
