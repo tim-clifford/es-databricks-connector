@@ -627,10 +627,12 @@ def test_percentile_linear_interpolation():
 
 def test_aggregate_bulk_stats_computes_send_and_latency_summary():
     from databricks_es_connector.bulk import _aggregate_bulk_stats
-    # (docs, rtt_ms, took_ms); one send has a None took (ES omitted it) -> excluded from took only.
-    agg = _aggregate_bulk_stats([(100, 10.0, 5.0), (100, 20.0, 15.0), (50, 30.0, None)])
+    # (docs, bytes, rtt_ms, took_ms); one send has a None took (ES omitted it) -> excluded from took only.
+    agg = _aggregate_bulk_stats([(100, 1000, 10.0, 5.0), (100, 2000, 20.0, 15.0), (50, 500, 30.0, None)])
     assert agg["n_sends"] == [3]
     assert agg["docs_sent"] == [250]           # retries would count again; here 3 distinct sends
+    assert agg["bytes_sent"] == [3500]         # 1000 + 2000 + 500 (uncompressed NDJSON)
+    assert agg["send_busy_ms"] == [60.0]       # 10 + 20 + 30 (summed round trip; vs wall => concurrency)
     assert agg["rtt_ms_mean"] == [20.0] and agg["rtt_ms_p50"] == [20.0]
     assert agg["rtt_ms_p95"] == [29.0] and agg["rtt_ms_max"] == [30.0]
     assert agg["took_ms_mean"] == [10.0]       # (5+15)/2, None excluded
@@ -641,6 +643,7 @@ def test_aggregate_bulk_stats_empty_partition_is_nulls_not_crash():
     from databricks_es_connector.bulk import _aggregate_bulk_stats
     agg = _aggregate_bulk_stats([])
     assert agg["n_sends"] == [0] and agg["docs_sent"] == [0]
+    assert agg["bytes_sent"] == [0] and agg["send_busy_ms"] == [0.0]
     assert agg["rtt_ms_mean"] == [None] and agg["rtt_ms_max"] == [None]
     assert agg["took_ms_p95"] == [None]
 
@@ -654,8 +657,9 @@ def test_ship_chunk_records_a_send_on_the_fast_path():
     assert counts["written"] == 2
     assert es.calls == [(["a", "b"], "errors,took")]    # took requested, items still omitted
     assert len(stats) == 1
-    docs, rtt_ms, took_ms = stats[0]
+    docs, byts, rtt_ms, took_ms = stats[0]
     assert docs == 2 and took_ms == 7 and rtt_ms >= 0.0
+    assert byts == 2          # sum of len("a") + len("b") = uncompressed NDJSON size
 
 
 def test_ship_chunk_no_stats_and_no_took_when_disabled():
@@ -673,7 +677,7 @@ def test_ship_chunk_records_took_on_full_path():
     stats = []
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, stats=stats, error_samples=[])
     assert counts["written"] == 2 and len(stats) == 1
-    assert stats[0][0] == 2 and stats[0][2] == 3
+    assert stats[0][0] == 2 and stats[0][3] == 3    # (docs, bytes, rtt, took): took is index 3
 
 
 def test_ship_ndjson_lines_merges_stats_across_workers():
@@ -686,7 +690,8 @@ def test_ship_ndjson_lines_merges_stats_across_workers():
     # write_concurrency=3 strides 10 lines into slices of 4/3/3, each chunked by 2 -> 2+2+2 = 6 sends;
     # every line is shipped exactly once (docs sum to 10), and every send is recorded.
     assert len(stats) == 6 and sum(s[0] for s in stats) == 10
-    assert all(s[1] >= 0.0 for s in stats)
+    assert all(s[2] >= 0.0 for s in stats)          # rtt is index 2 in (docs, bytes, rtt, took)
+    assert sum(s[1] for s in stats) == sum(len(x) for x in lines)   # bytes cover every line once
 
 
 def test_writer_emits_per_partition_bulk_stats_columns(monkeypatch):
@@ -698,8 +703,12 @@ def test_writer_emits_per_partition_bulk_stats_columns(monkeypatch):
     out = list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b", "c", "d", "e"]})])))
     row = out[0].iloc[0]
     assert "n_sends" in out[0].columns and "rtt_ms_p95" in out[0].columns
+    assert "bytes_sent" in out[0].columns and "send_busy_ms" in out[0].columns
+    assert "partition_wall_ms" in out[0].columns
     assert int(row["n_sends"]) == 3 and int(row["docs_sent"]) == 5   # chunks [2,2,1]
+    assert int(row["bytes_sent"]) == 5              # len("a".."e") = 5 single-char lines
     assert float(row["rtt_ms_max"]) >= 0.0
+    assert float(row["send_busy_ms"]) >= 0.0 and float(row["partition_wall_ms"]) >= 0.0
 
 
 def test_writer_omits_stats_columns_when_off(monkeypatch):
@@ -716,10 +725,12 @@ def test_merge_builds_per_partition_bulk_stats_list():
     rows = [
         {"written": 4, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
          "total_input": 4, "error_samples": "[]", "n_sends": 2, "docs_sent": 4,
+         "bytes_sent": 4000, "send_busy_ms": 24.0, "partition_wall_ms": 30.0,
          "rtt_ms_mean": 12.0, "rtt_ms_p50": 12.0, "rtt_ms_p95": 18.0, "rtt_ms_max": 20.0,
          "took_ms_mean": 4.0, "took_ms_p50": 4.0, "took_ms_p95": 6.0, "took_ms_max": 7.0},
         {"written": 6, "deleted": 0, "errors": 0, "ignored": 0, "coerced_nonfinite": 0,
          "total_input": 6, "error_samples": "[]", "n_sends": 3, "docs_sent": 6,
+         "bytes_sent": 6000, "send_busy_ms": 27.0, "partition_wall_ms": 30.0,
          "rtt_ms_mean": 9.0, "rtt_ms_p50": 9.0, "rtt_ms_p95": 11.0, "rtt_ms_max": 12.0,
          "took_ms_mean": 3.0, "took_ms_p50": 3.0, "took_ms_p95": 4.0, "took_ms_max": 5.0},
     ]
@@ -727,6 +738,8 @@ def test_merge_builds_per_partition_bulk_stats_list():
     assert result["written"] == 10
     assert "bulk_stats" in result and len(result["bulk_stats"]) == 2
     assert result["bulk_stats"][0]["n_sends"] == 2 and result["bulk_stats"][1]["rtt_ms_max"] == 12.0
+    assert result["bulk_stats"][0]["bytes_sent"] == 4000
+    assert result["bulk_stats"][1]["send_busy_ms"] == 27.0 and result["bulk_stats"][0]["partition_wall_ms"] == 30.0
 
 
 def test_merge_omits_bulk_stats_when_rows_lack_it():

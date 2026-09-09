@@ -130,17 +130,24 @@ def _percentile(sorted_vals, q):
 
 
 def _aggregate_bulk_stats(stats):
-    """Reduce a partition's (docs, rtt_ms, took_ms) send records to single-row summary columns.
+    """Reduce a partition's (docs, bytes, rtt_ms, took_ms) send records to single-row summary columns.
 
     `stats` is the list bulk_stats collects, one tuple per es.bulk send. Returns a {column: [value]}
     dict (single-row, for the mapInPandas summary DataFrame): send count, total docs sent (retries
-    included), and the client round-trip (rtt) vs ES-service (`took`) distributions. A per-send `took`
-    may be None if ES did not return it; those are excluded from the took aggregates only.
+    included), total uncompressed NDJSON bytes sent, the summed round-trip time (send_busy_ms), and the
+    client round-trip (rtt) vs ES-service (`took`) distributions. `bytes_sent / docs_sent` is the real
+    per-document size and `bytes_sent / n_sends` the per-request size; `send_busy_ms` divided by the
+    partition wall clock (added by the writer) gives the effective in-flight concurrency the partition
+    actually achieved. A per-send `took` may be None if ES did not return it; those are excluded from
+    the took aggregates only.
     """
     n_sends = len(stats)
     docs_sent = sum(s[0] for s in stats)
-    rtts = sorted(s[1] for s in stats)
-    tooks = sorted(s[2] for s in stats if s[2] is not None)
+    bytes_sent = sum(s[1] for s in stats)
+    rtts = sorted(s[2] for s in stats)
+    tooks = sorted(s[3] for s in stats if s[3] is not None)
+    send_busy_ms = sum(s[2] for s in stats)   # summed round-trip time across all sends; vs the
+                                              # partition wall clock => effective concurrency
 
     def _mean(xs):
         return float(sum(xs) / len(xs)) if xs else None
@@ -148,6 +155,8 @@ def _aggregate_bulk_stats(stats):
     return {
         "n_sends": [n_sends],
         "docs_sent": [docs_sent],
+        "bytes_sent": [bytes_sent],
+        "send_busy_ms": [float(send_busy_ms)],
         "rtt_ms_mean": [_mean(rtts)],
         "rtt_ms_p50": [_percentile(rtts, 50)],
         "rtt_ms_p95": [_percentile(rtts, 95)],
@@ -180,7 +189,13 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         _t0 = _t.perf_counter()
         resp = es.bulk(operations=ops, **kw)
         _rtt = (_t.perf_counter() - _t0) * 1000.0
-        stats.append((len(ops), _rtt, resp["took"] if "took" in resp else None))
+        # Uncompressed NDJSON size of this send: the summed length of the pre-built action lines.
+        # Character length, which equals byte length for ASCII/JSON and is a close lower bound
+        # otherwise; cheap (C-level len) and computed only when collecting. Lets a caller derive
+        # bytes/doc (the real document size, with NO extra ES query) and correlate rtt against payload
+        # size, i.e. tell a fixed per-request latency apart from a transfer/bandwidth-bound write.
+        _bytes = sum(len(op) for op in ops)
+        stats.append((len(ops), _bytes, _rtt, resp["took"] if "took" in resp else None))
         return resp
 
     # Fast path (GIL avoidance): when writes are idempotent (id_field set) and there are no deletes,
@@ -342,8 +357,15 @@ def make_ndjson_partition_writer(cfg: EsConfig):
     """
     def _write(iterator: "Iterator") -> "Iterator":
         import pandas as pd
+        import time as _time
         from elasticsearch import Elasticsearch
 
+        # Partition wall clock (bulk_stats only): spans the whole partition -- Arrow batch iteration,
+        # NDJSON handoff, and shipping (incl. the per-batch join and pool shutdown). Compared to the
+        # summed send time (send_busy_ms) it gives the effective in-flight concurrency the partition
+        # reached (busy/wall ~ 1 means sends ran serially; ~ write_concurrency means fully overlapped),
+        # and wall well above busy/concurrency exposes non-ship overhead or idle between batches.
+        _partition_t0 = _time.perf_counter()
         es = Elasticsearch(**cfg.client_kwargs())
         counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
         total_input = 0
@@ -383,6 +405,7 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         finally:
             if pool is not None:
                 pool.shutdown(wait=True)
+        partition_wall_ms = (_time.perf_counter() - _partition_t0) * 1000.0
         out = {
             "written": [counts["written"]], "deleted": [counts["deleted"]],
             "errors": [counts["errors"]], "ignored": [counts["ignored"]],
@@ -390,9 +413,12 @@ def make_ndjson_partition_writer(cfg: EsConfig):
             "error_samples": [json.dumps(error_samples)],
         }
         # Per-partition send aggregates (only when bulk_stats is on; columns must match the extended
-        # summary_schema in bulk_write).
+        # summary_schema in bulk_write). partition_wall_ms is added here (the writer owns the wall
+        # clock); everything else comes from the per-send records.
         if cfg.bulk_stats:
-            out.update(_aggregate_bulk_stats(stats))
+            agg = _aggregate_bulk_stats(stats)
+            agg["partition_wall_ms"] = [partition_wall_ms]
+            out.update(agg)
         yield pd.DataFrame(out)
 
     return _write
@@ -467,7 +493,8 @@ def _merge_partition_results(rows) -> dict:
     # Optional per-partition bulk-send aggregates: present only when the rows carry them (cfg.bulk_stats
     # was on). Kept OUT of the result otherwise, so the core key set is unchanged when off. One entry
     # per partition; the caller (e.g. an on_batch hook) rolls up or logs as it sees fit.
-    _STAT_KEYS = ("n_sends", "docs_sent", "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
+    _STAT_KEYS = ("n_sends", "docs_sent", "bytes_sent", "send_busy_ms", "partition_wall_ms",
+                  "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
                   "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max")
     bulk_stats = [{k: (r[k] if k in r else None) for k in _STAT_KEYS}
                   for r in rows if "n_sends" in r]
@@ -663,10 +690,16 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
         dead-letter log.
 
     When `cfg.bulk_stats=True`, the result additionally carries 'bulk_stats': one entry per partition,
-    each {n_sends, docs_sent, rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max}. `rtt_ms` is the
-    client-observed round trip per es.bulk send, `took_ms` is Elasticsearch's own service time, so
-    rtt_ms vs took_ms splits the round trip into network/queue vs ES processing. Absent (no key) when
-    bulk_stats is off, so the core result shape is unchanged. Diagnostic only; off by default.
+    each {n_sends, docs_sent, bytes_sent, send_busy_ms, partition_wall_ms,
+    rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max}. `rtt_ms` is the client-observed round trip per
+    es.bulk send, `took_ms` is Elasticsearch's own service time, so rtt_ms vs took_ms splits the round
+    trip into network/queue vs ES processing. `bytes_sent` is the uncompressed NDJSON size, so
+    bytes_sent/docs_sent is the real per-document size (no extra ES query) and bytes_sent/n_sends the
+    per-request size -- comparing rtt_ms against these tells a fixed per-request latency apart from a
+    transfer/bandwidth-bound write. `send_busy_ms` (summed round-trip time) over `partition_wall_ms`
+    (the partition wall clock) is the effective in-flight concurrency the partition actually reached
+    (~1 == serial, ~write_concurrency == fully overlapped). Absent (no key) when bulk_stats is off, so
+    the core result shape is unchanged. Diagnostic only; off by default.
 
     `raise_on_error=True` applies `reconcile_or_raise` to the result, raising EsWriteError when any
     document was rejected or any row went unaccounted for. It defaults to False here so a BATCH
@@ -694,8 +727,12 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     summary_schema = ("written long, deleted long, errors long, ignored long, "
                       "coerced_nonfinite long, total_input long, error_samples string")
     if cfg.bulk_stats:
-        # Extra per-partition columns the writer emits under bulk_stats; must match _aggregate_bulk_stats.
-        summary_schema += (", n_sends long, docs_sent long, "
+        # Extra per-partition columns the writer emits under bulk_stats; must match _aggregate_bulk_stats
+        # plus partition_wall_ms (added by the writer). bytes_sent is uncompressed NDJSON size;
+        # send_busy_ms is the summed round-trip time and partition_wall_ms the partition wall clock
+        # (their ratio is the effective in-flight concurrency).
+        summary_schema += (", n_sends long, docs_sent long, bytes_sent long, "
+                           "send_busy_ms double, partition_wall_ms double, "
                            "rtt_ms_mean double, rtt_ms_p50 double, rtt_ms_p95 double, rtt_ms_max double, "
                            "took_ms_mean double, took_ms_p50 double, took_ms_p95 double, took_ms_max double")
     # Build the whole `_bulk` action line in Catalyst (JVM) via build_ndjson, then ship the pre-built
