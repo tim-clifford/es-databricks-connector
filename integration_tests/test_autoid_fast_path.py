@@ -11,7 +11,10 @@
 # MAGIC    (new auto-ids) for per-item classification. ES therefore holds 2x the good docs while `written`
 # MAGIC    counts them once. This is the documented, accepted at-least-once tradeoff for auto-id, and it is
 # MAGIC    the behavior that DISTINGUISHES the new gate from the old one (the old full path classified
-# MAGIC    per-item without re-shipping, so it would hold the good docs only once).
+# MAGIC    per-item without re-shipping, so it would hold the good docs only once). The duplication is
+# MAGIC    SCOPED to a chunk that contains both a success and a failure -- good docs in a clean chunk (a
+# MAGIC    separate partition) are not duplicated -- so the case forces all rows into one chunk via
+# MAGIC    `repartition(1)`.
 # MAGIC
 # MAGIC Live ES + the `es_poc` scope required.
 
@@ -62,17 +65,21 @@ class TestAutoIdFastPath(NotebookTestFixture):
         err_cfg = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
                            index=ERR_INDEX, http_compress=True)
         _recreate(ERR_INDEX)
-        # Two good rows + one ES-rejected row, all one chunk. n is a STRING column (both rows cast to
-        # string so the UNION's common type is string; otherwise Spark coerces to BIGINT and the bad
-        # value fails to cast inside Spark before the connector runs). Under the integer mapping ES
-        # coerces "10"/"20" to ints (indexed) but rejects "not-an-int". The probe indexes the two good
-        # rows and flags errors:true; the re-ship indexes the two good rows AGAIN (fresh auto-ids) =>
-        # ES ends with 4 good docs, while written counts the good rows once (from the re-ship).
+        # Two good rows + one ES-rejected row, forced into ONE partition (repartition(1)) so all three
+        # land in a SINGLE bulk chunk. This is what makes the good rows share the chunk with the bad row
+        # -- the duplication is scoped to a chunk that contains both a success and a failure; good rows
+        # in a clean chunk (a separate partition) are NOT duplicated (that is the clean case above). n is
+        # a STRING column (both rows cast to string so the UNION's common type is string; otherwise Spark
+        # coerces to BIGINT and the bad value fails to cast inside Spark before the connector runs).
+        # Under the integer mapping ES coerces "10"/"20" to ints (indexed) but rejects "not-an-int". The
+        # probe indexes the two good rows and flags errors:true; the re-ship indexes the two good rows
+        # AGAIN (fresh auto-ids) => ES ends with 4 good docs, while written counts the good rows once
+        # (from the re-ship).
         mixed = spark.sql("""
             SELECT CAST('10' AS STRING) AS n UNION ALL
             SELECT CAST('20' AS STRING) UNION ALL
             SELECT CAST('not-an-int' AS STRING)
-        """)
+        """).repartition(1)
         self.res_err = bulk_write(mixed, err_cfg)
         self.err_count = _count(ERR_INDEX)
 
