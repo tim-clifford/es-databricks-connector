@@ -789,6 +789,26 @@ def test_fast_path_without_id_field_reships_full_on_error():
     assert es.calls[1] == (["a", "b"], None)              # then full re-ship for detail
 
 
+def test_fast_path_without_id_field_transient_429_reships_whole_chunk_then_retries_line():
+    # Documented regression (accepted): a single retryable 429 flips the probe's `errors` flag, so the
+    # WHOLE auto-id chunk re-ships -- re-sending (and thus duplicating in ES) the good docs too, not just
+    # the 429'd line -- and only then does the per-doc loop retry the 429'd line. The old auto-id path
+    # took the full path directly and retried only that line with no whole-chunk re-ship. The assertion
+    # that es.calls[1] carries ALL three lines (not just "b") is the duplication: "a" and "c" succeeded
+    # on the probe and are re-sent on the re-ship.
+    es = _RecordingES([
+        {"errors": True},                                                              # probe: a 429 is present
+        {"items": [{"index": {"status": 201}}, {"index": {"status": 429}}, {"index": {"status": 201}}]},
+        {"items": [{"index": {"status": 201}}]},                                       # retry of "b" succeeds
+    ])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(id_field=None, max_retries_per_doc=3), counts, [])
+    assert counts["written"] == 3 and counts["errors"] == 0
+    assert es.calls[0] == (["a", "b", "c"], "errors")     # probe
+    assert es.calls[1] == (["a", "b", "c"], None)         # whole chunk re-shipped (a + c duplicated)
+    assert es.calls[2] == (["b"], None)                   # only the 429'd line retried after that
+
+
 def test_fast_path_disabled_with_deletes():
     # With deletes, errors=False does NOT mean "all written" (some are deleted / delete-404 ignored),
     # so the fast path must not apply: ship full and classify so deleted/ignored split out correctly.
