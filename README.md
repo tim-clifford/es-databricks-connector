@@ -768,6 +768,7 @@ tests/                         # unit tests for the pure-Python layer (no Spark/
 integration_tests/             # live-Spark/ES tests run on Databricks serverless via dbx_test
   test_datatype_coverage.py    #   every Spark datatype + edge cases, round-tripped through ES
   test_bulk_write_roundtrip.py #   the bulk_write result contract (counts, total_input, error_samples)
+  test_autoid_fast_path.py     #   auto-id (no id_field) fast path: clean = no dup, error chunk re-ships (dup)
   test_concurrency_roundtrip.py #  write_concurrency>1: threaded per-partition write, no loss/dupe/miscount
   test_deletes_roundtrip.py    #   has_deletes routing live: delete-by-id, delete-404 no-op
   test_preflight_column_guards.py # a config field naming a missing column fails before any write

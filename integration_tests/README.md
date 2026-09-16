@@ -45,6 +45,12 @@ Each fixture owns one concern:
   deliberately-rejected doc (so the error path + `error_samples` are exercised, not just the clean
   path), idempotent re-write via a deterministic `_id`, and a duplicate-id-within-one-input case
   proving the collapse (counts succeed, ES doc count is lower). Does not re-assert per-type transforms.
+- **`test_autoid_fast_path.py`**: live ES. Owns the **auto-id (no `id_field`) fast-path contract**: a
+  clean chunk takes the `filter_path="errors"` fast path and lands each doc exactly once (ES `_count`
+  == input, no re-ship, no duplication); a chunk containing an ES-rejected doc re-ships the whole chunk,
+  so the good docs are indexed twice (ES `_count` == 2x the good rows) while `written` counts them once
+  and the rejected doc is counted + sampled. Proves the accepted at-least-once tradeoff and the behavior
+  that distinguishes the fast path from the old per-item full path on auto-id writes.
 - **`test_concurrency_roundtrip.py`**: live ES. Owns the **per-partition write-concurrency contract**:
   with `write_concurrency > 1`, the in-partition send pipeline (bounded in-flight, fed across Arrow
   batches) writes every doc exactly
