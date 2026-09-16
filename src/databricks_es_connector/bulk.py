@@ -129,17 +129,77 @@ def _percentile(sorted_vals, q):
     return float(sorted_vals[lo])
 
 
+class _GilWaitProbe:
+    """Background gauge that measures GIL-acquisition latency for the write worker process, so a slow
+    es.bulk round trip can be attributed to a genuine socket/ES wait versus the worker being unable to
+    re-acquire the GIL to read the response (client-side starvation that looks exactly like ES latency).
+
+    How it isolates the GIL wait: a daemon thread sleeps a fixed short interval in a loop. `sleep`
+    releases the GIL and the OS wakes the thread on time, but to CONTINUE it must re-acquire the GIL.
+    When other threads (the write_concurrency workers doing per-item classify, or the transport
+    deserializing a response) hold the GIL, that re-acquire is delayed, and the EXCESS of measured
+    elapsed over the sleep interval is exactly that delay. It needs no per-send hooks and is independent
+    of any one send, so it reads the process-wide GIL pressure that a per-send timer cannot see (a
+    send's own off-CPU time conflates socket wait and GIL wait; this separates them). Overhead is
+    trivial (a short sleep loop plus a subtraction) and it runs ONLY under bulk_stats.
+
+    Reading it: gil_wait_ms near zero while rtt_ms is high => the round trips are genuinely
+    socket/network/ES bound, and timeout/retry tuning is the lever. gil_wait_ms comparable to rtt_ms =>
+    the interpreter is GIL-saturated and a high rtt is inflated by starvation; lower write_concurrency
+    or shrink the per-response Python work (the fast path already does this on the happy path), because
+    retrying a timeout just re-enters the same contention.
+    """
+
+    _INTERVAL_S = 0.005   # 5 ms: ~200 wakeups/s, fine-grained against a multi-hundred-ms rtt, cheap.
+
+    def __init__(self):
+        import threading
+        self._stop = threading.Event()
+        self._lags_ms: list = []   # per-wakeup EXCESS over the interval (ms): runnable-but-no-GIL time
+        self._thread = threading.Thread(target=self._run, name="es-gil-wait-probe", daemon=True)
+
+    def _run(self):
+        import time as _t
+        interval = self._INTERVAL_S
+        wait = self._stop.wait
+        append = self._lags_ms.append
+        perf = _t.perf_counter
+        while True:
+            _t0 = perf()
+            # wait() releases the GIL for the timeout, then must re-acquire it to return. A True return
+            # means stop() fired: exit WITHOUT recording (its short elapsed is not a real GIL stall).
+            if wait(interval):
+                return
+            lag = (perf() - _t0 - interval) * 1000.0
+            if lag > 0.0:   # only positive excess is GIL/scheduler stall; clock jitter can go slightly -
+                append(lag)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self) -> list:
+        """Signal the probe to exit, join it, and return the collected lag samples (ms)."""
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        return self._lags_ms
+
+
 def _aggregate_bulk_stats(stats):
-    """Reduce a partition's (docs, bytes, rtt_ms, took_ms) send records to single-row summary columns.
+    """Reduce a partition's (docs, bytes, rtt_ms, took_ms, cpu_ms) send records to single-row summary
+    columns.
 
     `stats` is the list bulk_stats collects, one tuple per es.bulk send. Returns a {column: [value]}
     dict (single-row, for the mapInPandas summary DataFrame): send count, total docs sent (retries
-    included), total uncompressed NDJSON bytes sent, the summed round-trip time (send_busy_ms), and the
-    client round-trip (rtt) vs ES-service (`took`) distributions. `bytes_sent / docs_sent` is the real
-    per-document size and `bytes_sent / n_sends` the per-request size; `send_busy_ms` divided by the
-    partition wall clock (added by the writer) gives the effective in-flight concurrency the partition
-    actually achieved. A per-send `took` may be None if ES did not return it; those are excluded from
-    the took aggregates only.
+    included), total uncompressed NDJSON bytes sent, the summed round-trip time (send_busy_ms), the
+    summed worker-thread CPU time (send_cpu_ms), and the client round-trip (rtt) vs ES-service (`took`)
+    distributions. `bytes_sent / docs_sent` is the real per-document size and `bytes_sent / n_sends` the
+    per-request size; `send_busy_ms` divided by the partition wall clock (added by the writer) gives the
+    effective in-flight concurrency the partition actually achieved. `send_cpu_ms` is the CPU the worker
+    threads actually burned inside es.bulk (transport serialize/deserialize), so `send_busy_ms -
+    send_cpu_ms` is the off-CPU portion of the sends (socket wait plus any GIL stall); pair it with the
+    gil_wait_ms columns (from _GilWaitProbe) to split that off-CPU time into socket versus GIL. A per-send
+    `took` may be None if ES did not return it; those are excluded from the took aggregates only.
     """
     n_sends = len(stats)
     docs_sent = sum(s[0] for s in stats)
@@ -148,6 +208,8 @@ def _aggregate_bulk_stats(stats):
     tooks = sorted(s[3] for s in stats if s[3] is not None)
     send_busy_ms = sum(s[2] for s in stats)   # summed round-trip time across all sends; vs the
                                               # partition wall clock => effective concurrency
+    send_cpu_ms = sum(s[4] for s in stats)    # summed worker-thread CPU inside es.bulk; vs send_busy_ms
+                                              # => the fraction of send time that was CPU, not waiting
 
     def _mean(xs):
         return float(sum(xs) / len(xs)) if xs else None
@@ -157,6 +219,7 @@ def _aggregate_bulk_stats(stats):
         "docs_sent": [docs_sent],
         "bytes_sent": [bytes_sent],
         "send_busy_ms": [float(send_busy_ms)],
+        "send_cpu_ms": [float(send_cpu_ms)],
         "rtt_ms_mean": [_mean(rtts)],
         "rtt_ms_p50": [_percentile(rtts, 50)],
         "rtt_ms_p95": [_percentile(rtts, 95)],
@@ -165,6 +228,26 @@ def _aggregate_bulk_stats(stats):
         "took_ms_p50": [_percentile(tooks, 50)],
         "took_ms_p95": [_percentile(tooks, 95)],
         "took_ms_max": [float(tooks[-1]) if tooks else None],
+    }
+
+
+def _aggregate_gil_wait(lags_ms):
+    """Reduce the _GilWaitProbe lag samples (ms) to single-row summary columns.
+
+    Each sample is one probe wakeup's EXCESS over its sleep interval, i.e. how long the probe was
+    runnable but could not re-acquire the GIL. `gil_wait_ms_total` is the summed stall over the
+    partition (compare against partition_wall_ms for the share of wall time under GIL contention);
+    the p50/p95/max show the stall distribution, so a few large spikes (one long GIL-held classify)
+    read differently from steady low-grade contention. `gil_wait_samples` is the wakeup count the
+    percentiles are over. All None/0 when the probe saw no contention (e.g. write_concurrency == 1).
+    """
+    lags = sorted(lags_ms)
+    return {
+        "gil_wait_ms_total": [float(sum(lags))],
+        "gil_wait_ms_p50": [_percentile(lags, 50)],
+        "gil_wait_ms_p95": [_percentile(lags, 95)],
+        "gil_wait_ms_max": [float(lags[-1]) if lags else None],
+        "gil_wait_samples": [len(lags)],
     }
 
 
@@ -182,20 +265,29 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
 
     def _send(ops, filter_path=None):
         # One es.bulk send. When `stats` is collecting, time the client round trip and record
-        # (docs, rtt_ms, took_ms) for this send; otherwise zero overhead (no perf_counter, no took).
+        # (docs, bytes, rtt_ms, took_ms, cpu_ms) for this send; otherwise zero overhead (no timers).
         kw = {"filter_path": filter_path} if filter_path else {}
         if stats is None:
             return es.bulk(operations=ops, **kw)
+        _cpu0 = _t.thread_time()
         _t0 = _t.perf_counter()
         resp = es.bulk(operations=ops, **kw)
         _rtt = (_t.perf_counter() - _t0) * 1000.0
+        # thread_time is THIS worker thread's own CPU (user+system). It does NOT advance while the
+        # thread is blocked on the socket (GIL released during the round trip) OR parked waiting to
+        # re-acquire the GIL, so cpu_ms is just the CPU the transport burned serializing this request
+        # and deserializing its response. rtt_ms - cpu_ms is therefore the off-CPU part of the send
+        # (socket/network wait plus any GIL-acquisition stall); a tiny cpu_ms beside a large rtt_ms is
+        # the expected I/O-bound shape. The _GilWaitProbe is what splits that off-CPU part into socket
+        # wait versus GIL starvation, which a per-send timer alone cannot separate.
+        _cpu = (_t.thread_time() - _cpu0) * 1000.0
         # Uncompressed NDJSON size of this send: the summed length of the pre-built action lines.
         # Character length, which equals byte length for ASCII/JSON and is a close lower bound
         # otherwise; cheap (C-level len) and computed only when collecting. Lets a caller derive
         # bytes/doc (the real document size, with NO extra ES query) and correlate rtt against payload
         # size, i.e. tell a fixed per-request latency apart from a transfer/bandwidth-bound write.
         _bytes = sum(len(op) for op in ops)
-        stats.append((len(ops), _bytes, _rtt, resp["took"] if "took" in resp else None))
+        stats.append((len(ops), _bytes, _rtt, resp["took"] if "took" in resp else None, _cpu))
         return resp
 
     # Fast path (GIL avoidance): on any delete-free write, a clean chunk needs only the top-level
@@ -420,6 +512,11 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         # and wall well above busy/concurrency exposes non-ship overhead or idle between batches. This
         # ratio is the metric the pipelining change targets: it should rise toward write_concurrency.
         _partition_t0 = _time.perf_counter()
+        # GIL-acquisition-latency gauge for this worker process (bulk_stats only). Started before any
+        # send so its samples span the same window as partition_wall_ms; stopped in the finally. It
+        # attributes a slow rtt to a real socket/ES wait versus the worker being starved of the GIL.
+        gil_probe = _GilWaitProbe().start() if cfg.bulk_stats else None
+        gil_lags: list = []
         es = Elasticsearch(**cfg.client_kwargs())
         counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
         total_input = 0
@@ -470,6 +567,10 @@ def make_ndjson_partition_writer(cfg: EsConfig):
             if shipper is not None:
                 shipper.close()
         finally:
+            # Stop the GIL probe first, before pool shutdown, so its samples cover only the ship
+            # window (workers were already joined by shipper.close()/serial loop in the try body).
+            if gil_probe is not None:
+                gil_lags = gil_probe.stop()
             if pool is not None:
                 pool.shutdown(wait=True)
             # Close the per-partition ES client so its keep-alive TCP connections (up to
@@ -495,6 +596,7 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         if cfg.bulk_stats:
             agg = _aggregate_bulk_stats(stats)
             agg["partition_wall_ms"] = [partition_wall_ms]
+            agg.update(_aggregate_gil_wait(gil_lags))
             out.update(agg)
         yield pd.DataFrame(out)
 
@@ -570,9 +672,12 @@ def _merge_partition_results(rows) -> dict:
     # Optional per-partition bulk-send aggregates: present only when the rows carry them (cfg.bulk_stats
     # was on). Kept OUT of the result otherwise, so the core key set is unchanged when off. One entry
     # per partition; the caller (e.g. an on_batch hook) rolls up or logs as it sees fit.
-    _STAT_KEYS = ("n_sends", "docs_sent", "bytes_sent", "send_busy_ms", "partition_wall_ms",
+    _STAT_KEYS = ("n_sends", "docs_sent", "bytes_sent", "send_busy_ms", "send_cpu_ms",
+                  "partition_wall_ms",
                   "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
-                  "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max")
+                  "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max",
+                  "gil_wait_ms_total", "gil_wait_ms_p50", "gil_wait_ms_p95", "gil_wait_ms_max",
+                  "gil_wait_samples")
     bulk_stats = [{k: (r[k] if k in r else None) for k in _STAT_KEYS}
                   for r in rows if "n_sends" in r]
     if bulk_stats:
@@ -767,16 +872,27 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
         dead-letter log.
 
     When `cfg.bulk_stats=True`, the result additionally carries 'bulk_stats': one entry per partition,
-    each {n_sends, docs_sent, bytes_sent, send_busy_ms, partition_wall_ms,
-    rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max}. `rtt_ms` is the client-observed round trip per
+    each {n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms,
+    rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max,
+    gil_wait_ms_total/p50/p95/max, gil_wait_samples}. `rtt_ms` is the client-observed round trip per
     es.bulk send, `took_ms` is Elasticsearch's own service time, so rtt_ms vs took_ms splits the round
     trip into network/queue vs ES processing. `bytes_sent` is the uncompressed NDJSON size, so
     bytes_sent/docs_sent is the real per-document size (no extra ES query) and bytes_sent/n_sends the
     per-request size -- comparing rtt_ms against these tells a fixed per-request latency apart from a
     transfer/bandwidth-bound write. `send_busy_ms` (summed round-trip time) over `partition_wall_ms`
     (the partition wall clock) is the effective in-flight concurrency the partition actually reached
-    (~1 == serial, ~write_concurrency == fully overlapped). Absent (no key) when bulk_stats is off, so
-    the core result shape is unchanged. Diagnostic only; off by default.
+    (~1 == serial, ~write_concurrency == fully overlapped).
+
+    `send_cpu_ms` and the gil_wait_ms columns diagnose WHY a round trip is slow -- whether it is a real
+    socket/ES wait or the worker being starved of the GIL (client-side, but indistinguishable from ES
+    latency in rtt_ms alone). `send_cpu_ms` is the CPU the worker threads burned inside es.bulk, so
+    `send_busy_ms - send_cpu_ms` is the off-CPU send time (socket wait plus GIL stall). `gil_wait_ms`
+    comes from a background probe that measures how long a runnable thread waited to re-acquire the GIL:
+    near zero while rtt_ms is high means the round trips are genuinely socket/network/ES bound (tune
+    timeouts/retries), while a gil_wait_ms_total that is a large share of partition_wall_ms means the
+    interpreter is GIL-saturated and a high rtt is inflated by starvation (lower write_concurrency or
+    reduce per-response Python work; retrying a timeout just re-enters the same contention). Absent (no
+    key) when bulk_stats is off, so the core result shape is unchanged. Diagnostic only; off by default.
 
     `raise_on_error=True` applies `reconcile_or_raise` to the result, raising EsWriteError when any
     document was rejected or any row went unaccounted for. It defaults to False here so a BATCH
@@ -809,9 +925,11 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
         # send_busy_ms is the summed round-trip time and partition_wall_ms the partition wall clock
         # (their ratio is the effective in-flight concurrency).
         summary_schema += (", n_sends long, docs_sent long, bytes_sent long, "
-                           "send_busy_ms double, partition_wall_ms double, "
+                           "send_busy_ms double, send_cpu_ms double, partition_wall_ms double, "
                            "rtt_ms_mean double, rtt_ms_p50 double, rtt_ms_p95 double, rtt_ms_max double, "
-                           "took_ms_mean double, took_ms_p50 double, took_ms_p95 double, took_ms_max double")
+                           "took_ms_mean double, took_ms_p50 double, took_ms_p95 double, took_ms_max double, "
+                           "gil_wait_ms_total double, gil_wait_ms_p50 double, gil_wait_ms_p95 double, "
+                           "gil_wait_ms_max double, gil_wait_samples long")
     # Build the whole `_bulk` action line in Catalyst (JVM) via build_ndjson, then ship the pre-built
     # NDJSON with no per-row Python shaping/serialization (make_ndjson_partition_writer, fanned across
     # write_concurrency worker threads). This is the only write path.
