@@ -209,9 +209,13 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     # differs by id mode: with id_field set a re-shipped doc is an idempotent upsert (same _id,
     # overwritten in place); with auto-generated ids the re-ship RE-CREATES the docs the probe already
     # wrote, so they are DUPLICATED. That duplication is deliberately accepted -- an auto-id write is
-    # already at-least-once (a Spark/stream retry re-creates rows the same way), and the re-ship happens
-    # only on a chunk that actually contained a failure. The written count is taken from the re-ship, so
-    # reconciliation stays consistent (the duplicates are extra copies in ES, not a miscount).
+    # already at-least-once (a Spark/stream retry re-creates rows the same way), and the re-ship fires
+    # only when the probe does NOT positively confirm a clean chunk: a real failure (errors true) or,
+    # rarely, a response that omits the top-level `errors` flag (which fails closed to a re-ship, so a
+    # genuinely clean auto-id chunk can be duplicated in that edge case -- ES always returns the flag,
+    # but a proxy/malformed response might not; failing closed and re-verifying is the safe choice). The
+    # written count is taken from the re-ship, so reconciliation stays consistent (the duplicates are
+    # extra copies in ES, not a miscount).
     # Deletes are the one exclusion: a delete-404 is IGNORED (not written), so `errors: false` would not
     # justify counting the whole chunk as written -- delete-bearing writes always take the full classify
     # path below.
