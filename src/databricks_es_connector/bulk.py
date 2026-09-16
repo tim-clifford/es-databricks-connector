@@ -198,19 +198,24 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         stats.append((len(ops), _bytes, _rtt, resp["took"] if "took" in resp else None))
         return resp
 
-    # Fast path (GIL avoidance): when writes are idempotent (id_field set) and there are no deletes,
-    # a clean chunk needs only the top-level `errors` flag, not per-item detail. Ship with
-    # filter_path="errors" so Elasticsearch returns just {"errors": false} on success: the per-item
-    # response array is never sent or decoded, removing the O(chunk_size) Python decode + classify
-    # that runs holding the GIL and so serializes write_concurrency threads within a worker process.
+    # Fast path (GIL avoidance): on any delete-free write, a clean chunk needs only the top-level
+    # `errors` flag, not per-item detail. Ship with filter_path="errors" so Elasticsearch returns just
+    # {"errors": false} on success: the per-item response array is never sent or decoded, removing the
+    # O(chunk_size) Python decode + classify that runs holding the GIL and so serializes
+    # write_concurrency threads within a worker process.
     # On ANY failure (errors true, or the flag missing -> fail closed) fall through to the full path
     # below, which re-ships the SAME chunk without filter_path and runs the normal classify + 429
-    # retry. Re-shipping is correct ONLY because every op is an idempotent upsert (id_field set, no
-    # deletes): a doc that already succeeded on the probe is simply upserted again. Deletes are
-    # excluded because a delete-404 is IGNORED (not written), so `errors: false` would not justify
-    # counting the whole chunk as written; auto-id writes (id_field is None) are excluded because a
-    # re-ship would duplicate the docs the probe already wrote.
-    if cfg.id_field is not None and not cfg.has_deletes:
+    # retry. Re-shipping the whole chunk is correct for every index/upsert (delete-free) write, but
+    # differs by id mode: with id_field set a re-shipped doc is an idempotent upsert (same _id,
+    # overwritten in place); with auto-generated ids the re-ship RE-CREATES the docs the probe already
+    # wrote, so they are DUPLICATED. That duplication is deliberately accepted -- an auto-id write is
+    # already at-least-once (a Spark/stream retry re-creates rows the same way), and the re-ship happens
+    # only on a chunk that actually contained a failure. The written count is taken from the re-ship, so
+    # reconciliation stays consistent (the duplicates are extra copies in ES, not a miscount).
+    # Deletes are the one exclusion: a delete-404 is IGNORED (not written), so `errors: false` would not
+    # justify counting the whole chunk as written -- delete-bearing writes always take the full classify
+    # path below.
+    if not cfg.has_deletes:
         try:
             # `took` (ES service time) is only needed when collecting stats; requesting it still
             # omits the per-item array, so the GIL win is preserved.

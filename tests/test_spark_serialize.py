@@ -67,7 +67,10 @@ def test_iter_bulk_response_outcomes_empty_item_is_error_not_crash():
 
 
 def test_ship_chunk_empty_item_counts_error_not_crash():
-    es = _FakeES([{"items": [{"index": {"status": 201}}, {}]}])   # one good, one empty
+    # id_field=None takes the fast path; a probe error re-ships full, and the empty item must fail that
+    # doc closed (ERROR) on the re-ship, not crash.
+    es = _FakeES([{"errors": True},
+                  {"items": [{"index": {"status": 201}}, {}]}])   # one good, one empty
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, [])
     assert counts["written"] == 1 and counts["errors"] == 1        # no crash, empty -> error
@@ -82,36 +85,40 @@ def test_ship_chunk_tallies_mixed_outcomes():
         {"index":  {"status": 400, "_id": "c",
                     "error": {"type": "mapper_parsing_exception", "reason": "boom"}}},
     ]}
-    es = _FakeES([resp])
+    # id_field=None fast path: probe error -> full re-ship -> per-item classify (mixed outcomes).
+    es = _FakeES([{"errors": True}, resp])
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     samples = []
     _ship_ndjson_chunk(es, ["l1", "l2", "l3"], _cfg(id_field=None), counts, samples)
     assert counts == {"written": 1, "deleted": 0, "ignored": 1, "errors": 1}
     assert len(samples) == 1 and samples[0]["_id"] == "c" and "boom" in samples[0]["reason"]
-    assert len(es.calls) == 1
+    assert len(es.calls) == 2          # probe + full re-ship
 
 
 def test_ship_chunk_retries_only_the_429_line_then_succeeds():
-    # First call: line 2 is 429 (retryable). Retry must resend ONLY line 2, which then succeeds.
+    # id_field=None fast path: probe error -> full re-ship, on which line 2 is 429 (retryable). The
+    # retry must resend ONLY line 2, which then succeeds.
     es = _FakeES([
+        {"errors": True},
         {"items": [{"index": {"status": 201}}, {"index": {"status": 429}}, {"index": {"status": 201}}]},
         {"items": [{"index": {"status": 201}}]},
     ])
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(id_field=None, max_retries_per_doc=3), counts, [])
     assert counts["written"] == 3 and counts["errors"] == 0
-    assert es.calls[0] == ["a", "b", "c"]
-    assert es.calls[1] == ["b"]          # only the retryable line was resent
+    assert es.calls[1] == ["a", "b", "c"]    # full re-ship (es.calls[0] is the probe)
+    assert es.calls[2] == ["b"]              # only the retryable line was resent
 
 
 def test_ship_chunk_429_becomes_error_after_max_retries():
     # A 429 that never clears is counted as an error once retries are exhausted (loud, not lost).
+    # id_field=None fast path: probe error -> full re-ship, then the per-doc 429 retry loop.
     always_429 = {"items": [{"index": {"status": 429, "_id": "x"}}]}
-    es = _FakeES([always_429, always_429, always_429])   # initial + 2 retries
+    es = _FakeES([{"errors": True}, always_429, always_429, always_429])   # probe + initial + 2 retries
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["x"], _cfg(id_field=None, max_retries_per_doc=2), counts, [])
     assert counts["errors"] == 1 and counts["written"] == 0
-    assert len(es.calls) == 3            # 1 initial + 2 retries, then give up
+    assert len(es.calls) == 4            # probe + 1 initial re-ship + 2 retries, then give up
 
 
 # --- make_ndjson_partition_writer -----------------------------------------------------------
@@ -123,7 +130,8 @@ def test_ndjson_writer_schema_and_counts(monkeypatch):
 
     resp = {"items": [{"index": {"status": 201}}, {"index": {"status": 201}},
                       {"index": {"status": 400, "_id": "z", "error": {"reason": "no"}}}]}
-    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: _FakeES([resp]))
+    # id_field=None fast path: the probe flags errors (one 400) and the chunk re-ships full for detail.
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: _FakeES([{"errors": True}, resp]))
 
     writer = make_ndjson_partition_writer(_cfg(id_field=None, chunk_size=500))
     out = list(writer(iter([pd.DataFrame({"_ndjson": ["l1", "l2", "l3"]})])))
@@ -140,11 +148,8 @@ def test_ndjson_writer_chunks_by_chunk_size(monkeypatch):
     pd = pytest.importorskip("pandas")
     import elasticsearch
 
-    ok1 = lambda: {"items": [{"index": {"status": 201}}]}
-    # 5 rows, chunk_size=2 -> chunks of [2,2,1] -> 3 bulk calls.
-    es = _FakeES([{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]},
-                  {"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]},
-                  {"items": [{"index": {"status": 201}}]}])
+    # 5 rows, chunk_size=2 -> chunks of [2,2,1] -> 3 clean fast-path probes (no re-ship).
+    es = _FakeES([{"errors": False}, {"errors": False}, {"errors": False}])
     monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
 
     writer = make_ndjson_partition_writer(_cfg(id_field=None, chunk_size=2))
@@ -211,7 +216,9 @@ def test_ndjson_writer_reconciles_under_concurrency_with_errors_across_batches(m
     from databricks_es_connector.bulk import _merge_partition_results
 
     class _SelectiveThreadSafeES:
-        """400s any op line containing 'bad', 201s the rest. Thread-safe; closeable."""
+        """400s any op line containing 'bad', 201s the rest. Thread-safe; closeable. Fast-path aware:
+        a clean chunk's probe returns {"errors": False} (counted written, no re-ship); a chunk with a
+        'bad' op flags errors on the probe and is re-shipped full for per-item classification."""
         def __init__(self):
             self._lock = threading.Lock()
             self.all_ops = []
@@ -219,7 +226,14 @@ def test_ndjson_writer_reconciles_under_concurrency_with_errors_across_batches(m
 
         def bulk(self, operations=None, filter_path=None, **kw):
             ops = list(operations)
-            with self._lock:
+            has_bad = any("bad" in op for op in ops)
+            if filter_path and "errors" in filter_path:
+                if not has_bad:                      # clean chunk: shipped once via the probe
+                    with self._lock:
+                        self.all_ops.extend(ops)
+                    return {"errors": False}
+                return {"errors": True}              # bad present: fall through to the full re-ship
+            with self._lock:                         # full re-ship: classify per item
                 self.all_ops.extend(ops)
             return {"items": [{"index": {"status": 400, "_id": op, "error": {"reason": "boom"}}}
                               if "bad" in op else {"index": {"status": 201}} for op in ops]}
@@ -229,8 +243,9 @@ def test_ndjson_writer_reconciles_under_concurrency_with_errors_across_batches(m
 
     es = _SelectiveThreadSafeES()
     monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: es)
-    # id_field=None -> full classify path (a 'bad' row is a 400 error). 3 batches, each mixing good and
-    # bad rows, chunk_size=2 so sends straddle batch boundaries under write_concurrency=3.
+    # Auto-id (id_field=None) takes the fast path: clean chunks counted via the probe, chunks with a
+    # 'bad' row re-shipped full and classified (the 'bad' row is a 400 error). 3 batches, each mixing
+    # good and bad rows, chunk_size=2 so sends straddle batch boundaries under write_concurrency=3.
     writer = make_ndjson_partition_writer(_cfg(id_field=None, write_concurrency=3, chunk_size=2))
     batches = [pd.DataFrame({"_ndjson": ["ok0", "ok1", "bad0", "ok2", "ok3"]}),
                pd.DataFrame({"_ndjson": ["ok4", "bad1", "ok5"]}),
@@ -436,18 +451,23 @@ def test_preflight_accepts_boolean_delete_flag():
 # end-to-end proof is integration test_concurrency_roundtrip.
 
 class _ThreadSafeFakeES:
-    """Returns 201 for every operation and records what it shipped. Thread-safe for fan-out tests."""
+    """Models a clean ES on the fast path: a filter_path="errors" probe returns {"errors": False}
+    (so the chunk is counted written with no re-ship) and a full call returns per-item 201s. Records
+    what it shipped, once per line (a clean probe IS the real send; only the response is trimmed).
+    Thread-safe for fan-out tests."""
     def __init__(self):
         import threading
         self._lock = threading.Lock()
         self.chunks = []       # each es.bulk() call's operations list
         self.all_ops = []      # every op line shipped, flattened
 
-    def bulk(self, operations=None, **kw):
+    def bulk(self, operations=None, filter_path=None, **kw):
         ops = list(operations)
         with self._lock:
             self.chunks.append(ops)
             self.all_ops.extend(ops)
+        if filter_path and "errors" in filter_path:      # clean probe: no per-item array, no re-ship
+            return {"errors": False}
         return {"items": [{"index": {"status": 201}} for _ in ops]}
 
 
@@ -674,12 +694,13 @@ def test_config_write_concurrency_must_be_positive():
 
 
 # --- _ship_ndjson_chunk: the filter_path="errors" fast path (GIL avoidance) --------------------
-# On an idempotent (id_field set), delete-free write, a clean bulk needs only the top-level `errors`
-# flag, so the chunk is shipped with filter_path="errors" and the per-item response is never decoded
-# or classified in Python (the GIL-held cost that serialized write_concurrency threads). On ANY
-# failure the chunk is re-shipped with a FULL response and the existing classify + 429-retry runs;
-# re-shipping is safe only because every op is an idempotent upsert (id_field set, no deletes), so a
-# doc that already succeeded is simply upserted again. The gate is exactly id_field-set + no-deletes.
+# On any delete-free write, a clean bulk needs only the top-level `errors` flag, so the chunk is
+# shipped with filter_path="errors" and the per-item response is never decoded or classified in Python
+# (the GIL-held cost that serialized write_concurrency threads). On ANY failure the chunk is re-shipped
+# with a FULL response and the existing classify + 429-retry runs. The re-ship is an idempotent upsert
+# when id_field is set; with auto-generated ids it re-creates (DUPLICATES) the probe's writes, which is
+# accepted since an auto-id write is already at-least-once. The gate is exactly no-deletes (a delete-404
+# is IGNORED, so `errors: false` cannot be read as "all written"; delete writes take the full path).
 
 class _RecordingES:
     """Records each call's (operations, filter_path) and returns queued responses in order."""
@@ -739,14 +760,33 @@ def test_fast_path_missing_errors_key_fails_closed():
     assert len(es.calls) == 2 and es.calls[1] == (["a", "b"], None)
 
 
-def test_fast_path_disabled_without_id_field():
-    # No id_field -> ES auto-ids -> re-ship would DUPLICATE, so the fast path is off: one FULL request
-    # (no filter_path), classified per item, exactly as before.
-    es = _RecordingES([{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}])
+def test_fast_path_applies_without_id_field():
+    # Auto-id (no id_field) is delete-free, so it takes the fast path too: a clean chunk is ONE minimal
+    # probe (filter_path="errors"), every line counted written, no per-item decode and no re-ship. (The
+    # error branch may re-ship and duplicate the probe's writes; that is tested separately and accepted
+    # -- an auto-id write is already at-least-once.)
+    es = _RecordingES([{"errors": False}])
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, [])
-    assert counts["written"] == 2
-    assert es.calls == [(["a", "b"], None)]               # full response, never filter_path="errors"
+    assert counts == {"written": 2, "deleted": 0, "ignored": 0, "errors": 0}
+    assert es.calls == [(["a", "b"], "errors")]           # minimal probe, no full re-ship
+
+
+def test_fast_path_without_id_field_reships_full_on_error():
+    # Auto-id error branch: errors=True on the probe -> re-ship FULL (no filter_path) for per-item
+    # detail, exactly like the id_field path. The re-ship DUPLICATES the docs the probe already wrote
+    # (ES assigns fresh ids), which is accepted for auto-id (already at-least-once); the written count
+    # reflects the re-ship so reconciliation stays consistent.
+    full = {"items": [{"index": {"status": 201, "_id": "auto1"}},
+                      {"index": {"status": 400, "_id": "auto2", "error": {"reason": "boom"}}}]}
+    es = _RecordingES([{"errors": True}, full])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, samples)
+    assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
+    assert samples and "boom" in samples[0]["reason"]
+    assert es.calls[0] == (["a", "b"], "errors")          # probe first
+    assert es.calls[1] == (["a", "b"], None)              # then full re-ship for detail
 
 
 def test_fast_path_disabled_with_deletes():
@@ -883,13 +923,18 @@ def test_ship_chunk_no_stats_and_no_took_when_disabled():
 
 
 def test_ship_chunk_records_took_on_full_path():
-    # Full path (id_field=None) records the send too, reading took from the full response.
-    es = _RecordingES([{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}], "took": 3}])
+    # The full (re-ship) path records its send too, reading took from the full response. Reached here
+    # via a probe error (id_field=None): both the probe and the re-ship are recorded, and the re-ship
+    # (the full response) carries took=3.
+    es = _RecordingES([
+        {"errors": True},                          # probe: no took -> None recorded
+        {"items": [{"index": {"status": 201}}, {"index": {"status": 201}}], "took": 3},
+    ])
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     stats = []
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, stats=stats, error_samples=[])
-    assert counts["written"] == 2 and len(stats) == 1
-    assert stats[0][0] == 2 and stats[0][3] == 3    # (docs, bytes, rtt, took): took is index 3
+    assert counts["written"] == 2 and len(stats) == 2
+    assert stats[-1][0] == 2 and stats[-1][3] == 3    # re-ship send: (docs, bytes, rtt, took), took idx 3
 
 
 def test_pipelined_shipper_merges_stats_across_sends():
