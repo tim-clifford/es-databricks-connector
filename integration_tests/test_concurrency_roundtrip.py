@@ -61,6 +61,27 @@ class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
 
         # Re-write the SAME rows, still concurrent: deterministic _id => upsert, not duplicate.
         self.res_idem = bulk_write(df, self.cfg)
+
+        # Same concurrent write again with bulk_stats on, to prove the socket-vs-GIL diagnostics work
+        # over the REAL mapInPandas write (idempotent, so ES still holds exactly N). This is the only
+        # tier that can prove three things the unit tests structurally cannot: the extra bulk_stats
+        # summary columns (send_cpu_ms + the gil_wait_ms_* set) round-trip through the real mapInPandas
+        # summary_schema without a schema mismatch failing the write; time.thread_time() works on the
+        # serverless executor; and the background _GilWaitProbe thread starts and joins cleanly inside
+        # the partition closure without breaking or hanging it. write_concurrency=4 is the contended
+        # shape the probe exists to measure.
+        cfg_stats = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False,
+                             index=INDEX, id_field="doc_id", http_compress=True,
+                             write_concurrency=CONCURRENCY, chunk_size=100, bulk_stats=True)
+        self.res_stats = bulk_write(df, cfg_stats)
+        # Surface the observed per-partition numbers in the driver log for eyeballing (I/O-bound vs
+        # GIL-bound): a large gil_wait_ms beside a large rtt is starvation, near-zero is a real wait.
+        for i, p in enumerate(self.res_stats.get("bulk_stats") or []):
+            print(f"GIL_PROBE part{i}: send_cpu_ms={p.get('send_cpu_ms')} "
+                  f"gil_wait_ms_total={p.get('gil_wait_ms_total')} "
+                  f"gil_wait_samples={p.get('gil_wait_samples')} "
+                  f"rtt_ms_max={p.get('rtt_ms_max')} took_ms_max={p.get('took_ms_max')}")
+
         requests.post(f"{ES_HOSTS}/{INDEX}/_refresh", auth=ES_AUTH, verify=False, timeout=30)
         self.es_count = requests.get(
             f"{ES_HOSTS}/{INDEX}/_count", auth=ES_AUTH, verify=False, timeout=30).json()["count"]
@@ -99,6 +120,31 @@ class TestWriteConcurrencyRoundtrip(NotebookTestFixture):
     def test_idempotent_rewrite_under_concurrency(self):
         assert self.res_idem["written"] == N, self.res_idem
         assert self.es_count == N, self.es_count   # second concurrent write upserted, no duplicates
+
+    # --- socket-vs-GIL diagnostics survive the real mapInPandas write ---
+    def test_bulk_stats_gil_and_cpu_round_trip_live(self):
+        # The bulk_stats write must be as correct as the plain one (the probe/extra columns change
+        # nothing about what is written), and it must carry the new diagnostic fields per partition.
+        r = self.res_stats
+        assert r["written"] == N and r["errors"] == 0, r
+        parts = r.get("bulk_stats")
+        assert isinstance(parts, list) and parts, r          # summary columns round-tripped
+        assert len(parts) == PARTITIONS, parts
+        for p in parts:
+            # Every new field must be present (a missing one means the summary_schema and the writer's
+            # emitted columns disagreed, which would otherwise fail the write on serverless).
+            for k in ("send_cpu_ms", "gil_wait_ms_total", "gil_wait_ms_p50",
+                      "gil_wait_ms_p95", "gil_wait_ms_max", "gil_wait_samples"):
+                assert k in p, (k, p)
+            # thread_time() works on the executor: a real, non-negative CPU figure (never None/error).
+            assert isinstance(p["send_cpu_ms"], (int, float)) and p["send_cpu_ms"] >= 0.0, p
+            # The probe started and joined cleanly: it reports an integer sample count and a
+            # non-negative total stall (0 is valid -- an I/O-bound write simply saw no GIL contention).
+            assert isinstance(p["gil_wait_samples"], int) and p["gil_wait_samples"] >= 0, p
+            assert isinstance(p["gil_wait_ms_total"], (int, float)) and p["gil_wait_ms_total"] >= 0.0, p
+            # send_cpu_ms is worker CPU spent inside es.bulk; it cannot exceed the summed round trip.
+            if isinstance(p.get("send_busy_ms"), (int, float)):
+                assert p["send_cpu_ms"] <= p["send_busy_ms"] + 1e-6, p
 
     # --- error accounting survives the thread merge ---
     def test_rejected_doc_still_counted_under_concurrency(self):

@@ -877,11 +877,13 @@ def test_fast_path_probe_transport_error_counts_errors_not_crash():
     assert counts["errors"] == 3 and samples
 
 
-# --- bulk_stats: per-partition send aggregates (docs/send, rtt vs ES took) ---------------------
-# Off by default and zero-overhead. When on, each es.bulk send is timed and (docs, rtt_ms, took_ms)
-# recorded; the writer aggregates per partition and _merge_partition_results surfaces one entry per
-# partition under result["bulk_stats"]. `took` is requested via filter_path so it is available
-# without the per-item array (the GIL win is preserved).
+# --- bulk_stats: per-partition send aggregates (docs/send, rtt vs ES took, socket-vs-GIL wait) ---
+# Off by default and zero-overhead. When on, each es.bulk send is timed and (docs, bytes, rtt_ms,
+# took_ms, cpu_ms) recorded, and a background _GilWaitProbe samples GIL-acquisition latency; the writer
+# aggregates per partition and _merge_partition_results surfaces one entry per partition under
+# result["bulk_stats"]. `took` is requested via filter_path so it is available without the per-item
+# array (the GIL win is preserved). cpu_ms (worker CPU inside es.bulk) and the gil_wait_ms columns
+# together split a slow rtt into a real socket/ES wait versus the worker being starved of the GIL.
 
 def test_config_bulk_stats_default_off():
     assert _cfg().bulk_stats is False
@@ -899,12 +901,16 @@ def test_percentile_linear_interpolation():
 
 def test_aggregate_bulk_stats_computes_send_and_latency_summary():
     from databricks_es_connector.bulk import _aggregate_bulk_stats
-    # (docs, bytes, rtt_ms, took_ms); one send has a None took (ES omitted it) -> excluded from took only.
-    agg = _aggregate_bulk_stats([(100, 1000, 10.0, 5.0), (100, 2000, 20.0, 15.0), (50, 500, 30.0, None)])
+    # (docs, bytes, rtt_ms, took_ms, cpu_ms); one send has a None took (ES omitted it) -> excluded
+    # from the took aggregates only. cpu_ms is the worker CPU burned inside es.bulk for that send.
+    agg = _aggregate_bulk_stats([(100, 1000, 10.0, 5.0, 1.0),
+                                 (100, 2000, 20.0, 15.0, 2.0),
+                                 (50, 500, 30.0, None, 3.0)])
     assert agg["n_sends"] == [3]
     assert agg["docs_sent"] == [250]           # retries would count again; here 3 distinct sends
     assert agg["bytes_sent"] == [3500]         # 1000 + 2000 + 500 (uncompressed NDJSON)
     assert agg["send_busy_ms"] == [60.0]       # 10 + 20 + 30 (summed round trip; vs wall => concurrency)
+    assert agg["send_cpu_ms"] == [6.0]         # 1 + 2 + 3 (summed worker CPU inside es.bulk)
     assert agg["rtt_ms_mean"] == [20.0] and agg["rtt_ms_p50"] == [20.0]
     assert agg["rtt_ms_p95"] == [29.0] and agg["rtt_ms_max"] == [30.0]
     assert agg["took_ms_mean"] == [10.0]       # (5+15)/2, None excluded
@@ -916,8 +922,70 @@ def test_aggregate_bulk_stats_empty_partition_is_nulls_not_crash():
     agg = _aggregate_bulk_stats([])
     assert agg["n_sends"] == [0] and agg["docs_sent"] == [0]
     assert agg["bytes_sent"] == [0] and agg["send_busy_ms"] == [0.0]
+    assert agg["send_cpu_ms"] == [0.0]
     assert agg["rtt_ms_mean"] == [None] and agg["rtt_ms_max"] == [None]
     assert agg["took_ms_p95"] == [None]
+
+
+def test_aggregate_gil_wait_summary_and_empty():
+    from databricks_es_connector.bulk import _aggregate_gil_wait
+    agg = _aggregate_gil_wait([10.0, 20.0, 30.0])
+    assert agg["gil_wait_ms_total"] == [60.0]
+    assert agg["gil_wait_ms_p50"] == [20.0] and agg["gil_wait_ms_p95"] == [29.0]
+    assert agg["gil_wait_ms_max"] == [30.0] and agg["gil_wait_samples"] == [3]
+    # No contention observed (e.g. write_concurrency == 1): total/count zero, percentiles null, no crash.
+    empty = _aggregate_gil_wait([])
+    assert empty["gil_wait_ms_total"] == [0.0] and empty["gil_wait_samples"] == [0]
+    assert empty["gil_wait_ms_p95"] == [None] and empty["gil_wait_ms_max"] == [None]
+
+
+def test_gil_wait_probe_fires_under_contention():
+    # A monitor you have not watched fire is not a monitor: prove the probe actually RECORDS a stall
+    # when the GIL is held. Raise the interpreter's thread-switch interval so a pure-Python busy loop on
+    # this thread keeps the GIL for the whole burn without ever yielding; the probe thread then cannot
+    # re-acquire the GIL to finish a wakeup, and the excess it records must reflect that long stall.
+    import sys
+    import time
+    from databricks_es_connector.bulk import _GilWaitProbe
+    old_interval = sys.getswitchinterval()
+    probe = _GilWaitProbe().start()
+    time.sleep(0.02)   # let the probe reach its wait() loop before we stop yielding the GIL
+    sys.setswitchinterval(1.0)   # >> the burn, so the busy loop never voluntarily drops the GIL
+    try:
+        deadline = time.perf_counter() + 0.3
+        x = 0
+        while time.perf_counter() < deadline:   # pure-Python, GIL-holding; perf_counter does not yield it
+            x += 1
+    finally:
+        sys.setswitchinterval(old_interval)
+    time.sleep(0.05)   # release the GIL so the probe can record the stall it accumulated during the burn
+    lags = probe.stop()
+    assert lags, "probe recorded no GIL-wait samples at all"
+    assert max(lags) > 80.0, f"expected a large stall from the ~0.3s GIL burn, got max {max(lags)}ms"
+
+
+def test_gil_wait_probe_stop_returns_independent_snapshot():
+    # stop() must return a STABLE snapshot, not the live list: if the daemon outlived a timed-out join
+    # (the exception-path hazard), the aggregate would otherwise sort/sum a list still being appended to.
+    # A post-stop mutation of the probe's internal list must NOT change what stop() already returned.
+    from databricks_es_connector.bulk import _GilWaitProbe
+    probe = _GilWaitProbe().start()
+    snap = probe.stop()
+    assert isinstance(snap, list)
+    probe._lags_ms.append(999.0)          # simulate a straggler daemon appending after the join
+    assert 999.0 not in snap              # the returned snapshot is decoupled from the live list
+
+
+def test_gil_wait_probe_quiet_when_idle():
+    # With no thread hogging the GIL (the main thread is blocked in sleep, which RELEASES the GIL), the
+    # probe wakes on time and records at most minor scheduler jitter -- never a large stall. This is the
+    # write_concurrency==1 / uncontended shape, where gil_wait must read ~0.
+    import time
+    from databricks_es_connector.bulk import _GilWaitProbe
+    probe = _GilWaitProbe().start()
+    time.sleep(0.2)
+    lags = probe.stop()
+    assert not lags or max(lags) < 40.0, f"unexpected large GIL stall while idle: max {max(lags)}ms"
 
 
 def test_ship_chunk_records_a_send_on_the_fast_path():
@@ -929,9 +997,10 @@ def test_ship_chunk_records_a_send_on_the_fast_path():
     assert counts["written"] == 2
     assert es.calls == [(["a", "b"], "errors,took")]    # took requested, items still omitted
     assert len(stats) == 1
-    docs, byts, rtt_ms, took_ms = stats[0]
+    docs, byts, rtt_ms, took_ms, cpu_ms = stats[0]
     assert docs == 2 and took_ms == 7 and rtt_ms >= 0.0
     assert byts == 2          # sum of len("a") + len("b") = uncompressed NDJSON size
+    assert cpu_ms >= 0.0      # worker-thread CPU inside es.bulk (thread_time delta), never negative
 
 
 def test_ship_chunk_no_stats_and_no_took_when_disabled():
@@ -954,7 +1023,8 @@ def test_ship_chunk_records_took_on_full_path():
     stats = []
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, stats=stats, error_samples=[])
     assert counts["written"] == 2 and len(stats) == 2
-    assert stats[-1][0] == 2 and stats[-1][3] == 3    # re-ship send: (docs, bytes, rtt, took), took idx 3
+    # re-ship send is (docs, bytes, rtt, took, cpu): took at idx 3, cpu at idx 4.
+    assert stats[-1][0] == 2 and stats[-1][3] == 3 and stats[-1][4] >= 0.0
 
 
 def test_pipelined_shipper_merges_stats_across_sends():
@@ -980,10 +1050,16 @@ def test_writer_emits_per_partition_bulk_stats_columns(monkeypatch):
     assert "n_sends" in out[0].columns and "rtt_ms_p95" in out[0].columns
     assert "bytes_sent" in out[0].columns and "send_busy_ms" in out[0].columns
     assert "partition_wall_ms" in out[0].columns
+    # The socket-vs-GIL diagnostic columns must be emitted too.
+    assert "send_cpu_ms" in out[0].columns
+    assert {"gil_wait_ms_total", "gil_wait_ms_p95", "gil_wait_ms_max",
+            "gil_wait_samples"} <= set(out[0].columns)
     assert int(row["n_sends"]) == 3 and int(row["docs_sent"]) == 5   # chunks [2,2,1]
     assert int(row["bytes_sent"]) == 5              # len("a".."e") = 5 single-char lines
     assert float(row["rtt_ms_max"]) >= 0.0
     assert float(row["send_busy_ms"]) >= 0.0 and float(row["partition_wall_ms"]) >= 0.0
+    assert float(row["send_cpu_ms"]) >= 0.0
+    assert float(row["gil_wait_ms_total"]) >= 0.0 and int(row["gil_wait_samples"]) >= 0
 
 
 def test_writer_closes_es_client(monkeypatch):
