@@ -179,10 +179,17 @@ class _GilWaitProbe:
         return self
 
     def stop(self) -> list:
-        """Signal the probe to exit, join it, and return the collected lag samples (ms)."""
+        """Signal the probe to exit and join it, returning a STABLE snapshot of the lag samples (ms).
+
+        The snapshot (`list(...)`) is taken under the GIL, so it is internally consistent even in the
+        unlikely case the join times out and the daemon has not yet observed the stop Event: the
+        aggregate never sorts/sums a list another thread is concurrently appending to. Callers join the
+        worker pool BEFORE calling this (see make_ndjson_partition_writer), so by here the producer is the
+        only other live thread and the probe, unblocked for the GIL, exits within one interval. The
+        thread is a daemon with the Event set, so it cannot outlive the process even if the join lapses."""
         self._stop.set()
-        self._thread.join(timeout=1.0)
-        return self._lags_ms
+        self._thread.join(timeout=2.0)
+        return list(self._lags_ms)
 
 
 def _aggregate_bulk_stats(stats):
@@ -567,12 +574,17 @@ def make_ndjson_partition_writer(cfg: EsConfig):
             if shipper is not None:
                 shipper.close()
         finally:
-            # Stop the GIL probe first, before pool shutdown, so its samples cover only the ship
-            # window (workers were already joined by shipper.close()/serial loop in the try body).
-            if gil_probe is not None:
-                gil_lags = gil_probe.stop()
+            # Join the worker pool FIRST, then stop the probe. On the SUCCESS path shipper.close()
+            # already joined every worker in the try body; but on the EXCEPTION path (the null-line
+            # ValueError above, or shipper.feed/close raising) close() never ran, so pool workers can
+            # still be in flight -- and holding the GIL -- right here. Stopping the probe before they are
+            # joined could time out its join (it cannot re-acquire the GIL to see the stop Event), leak
+            # the daemon, and race its lag list. pool.shutdown(wait=True) joins them and frees the GIL, so
+            # the probe then stops promptly; its samples still cover the whole real ship window either way.
             if pool is not None:
                 pool.shutdown(wait=True)
+            if gil_probe is not None:
+                gil_lags = gil_probe.stop()
             # Close the per-partition ES client so its keep-alive TCP connections (up to
             # write_concurrency per node, to a possibly-distant host) are released promptly at task end,
             # rather than left for GC to reap when the reused Python worker is torn down. The read path

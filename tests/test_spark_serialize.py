@@ -964,6 +964,18 @@ def test_gil_wait_probe_fires_under_contention():
     assert max(lags) > 80.0, f"expected a large stall from the ~0.3s GIL burn, got max {max(lags)}ms"
 
 
+def test_gil_wait_probe_stop_returns_independent_snapshot():
+    # stop() must return a STABLE snapshot, not the live list: if the daemon outlived a timed-out join
+    # (the exception-path hazard), the aggregate would otherwise sort/sum a list still being appended to.
+    # A post-stop mutation of the probe's internal list must NOT change what stop() already returned.
+    from databricks_es_connector.bulk import _GilWaitProbe
+    probe = _GilWaitProbe().start()
+    snap = probe.stop()
+    assert isinstance(snap, list)
+    probe._lags_ms.append(999.0)          # simulate a straggler daemon appending after the join
+    assert 999.0 not in snap              # the returned snapshot is decoupled from the live list
+
+
 def test_gil_wait_probe_quiet_when_idle():
     # With no thread hogging the GIL (the main thread is blocked in sleep, which RELEASES the GIL), the
     # probe wakes on time and records at most minor scheduler jitter -- never a large stall. This is the
