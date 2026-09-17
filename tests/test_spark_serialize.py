@@ -1161,3 +1161,150 @@ def test_fast_path_through_the_writer_counts_all_written(monkeypatch):
     assert int(row["written"]) == 5 and int(row["total_input"]) == 5
     assert int(row["errors"]) == 0
     assert all(fp == "errors" for _ops, fp in es.calls)
+
+
+# =====================================================================================
+# retry_transport_timeout: connector-owned whole-request timeout retry
+#
+# With cfg.retry_transport_timeout on, the write client is built with retry_on_timeout=False (so the
+# transport stops re-sending timed-out bulks silently) and _ship_ndjson_chunk re-sends a timed-out
+# chunk -- ConnectionTimeout ONLY -- up to transport_max_retries times with the same bounded
+# exponential backoff the per-doc loop uses, then falls closed into errors exactly as before. Off by
+# default: a timeout is counted as errors on its first surfaced attempt (today's behavior; the
+# transport owns its own retries). A timed-out re-send re-applies the chunk (idempotent with id_field;
+# a duplicate with auto-ids, accepted at-least-once).
+# =====================================================================================
+
+from elasticsearch import ConnectionTimeout, ConnectionError as _EsConnectionError
+
+
+class _TimeoutThenOkES:
+    """Raises ConnectionTimeout on the first `fail_times` bulk() calls, then returns `ok_response`."""
+    def __init__(self, fail_times, ok_response):
+        self.fail_times = fail_times
+        self.ok_response = ok_response
+        self.calls = 0
+
+    def bulk(self, operations=None, filter_path=None, **kw):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise ConnectionTimeout("read timed out")
+        return self.ok_response
+
+
+class _AlwaysTimeoutES:
+    def __init__(self):
+        self.calls = 0
+
+    def bulk(self, operations=None, filter_path=None, **kw):
+        self.calls += 1
+        raise ConnectionTimeout("read timed out")
+
+
+@pytest.fixture
+def _no_backoff(monkeypatch):
+    # The backoff sleeps are negligible next to a real request_timeout, but must not slow the suite.
+    import time
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+
+
+def test_config_retry_transport_timeout_off_by_default():
+    assert _cfg().retry_transport_timeout is False
+    # Default keeps the transport's own timeout retry, so existing callers are unaffected.
+    assert _cfg().client_kwargs()["retry_on_timeout"] is True
+
+
+def test_retry_transport_timeout_disables_the_transport_timeout_retry():
+    # On => the connector owns it, so the client must NOT also re-send timeouts (no stacking layers).
+    assert _cfg(retry_transport_timeout=True).client_kwargs()["retry_on_timeout"] is False
+    # It overrides an explicit retry_on_timeout=True: the higher-level switch wins, never silent stacking.
+    both = _cfg(retry_transport_timeout=True, retry_on_timeout=True)
+    assert both.client_kwargs()["retry_on_timeout"] is False
+
+
+def test_timeout_not_retried_when_knob_off():
+    # Guard: knob off (default) => a ConnectionTimeout is counted as errors on its first surfaced
+    # attempt, NOT re-sent by the connector. Pins that the feature is genuinely opt-in.
+    es = _AlwaysTimeoutES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, samples)
+    assert es.calls == 1
+    assert counts["errors"] == 2 and counts["written"] == 0
+    assert "ConnectionTimeout" in samples[0]["reason"]
+
+
+def test_timeout_retried_then_succeeds_when_knob_on(_no_backoff):
+    # A ConnectionTimeout re-sends the whole chunk; a later clean response writes every line and the
+    # chunk is NOT an error.
+    es = _TimeoutThenOkES(fail_times=2, ok_response={"errors": False})
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b", "c"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3),
+                       counts, [])
+    assert es.calls == 3                        # 1 initial + 2 retries, then success
+    assert counts == {"written": 3, "deleted": 0, "ignored": 0, "errors": 0}
+
+
+def test_timeout_exhausts_budget_then_fails_closed(_no_backoff):
+    # After transport_max_retries connector retries all time out, fall closed into errors (surfaced via
+    # reconcile), rather than retrying forever or aborting the partition.
+    es = _AlwaysTimeoutES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=2),
+                       counts, samples)
+    assert es.calls == 3                        # 1 initial + 2 retries, all timed out
+    assert counts["errors"] == 2 and counts["written"] == 0
+    assert "ConnectionTimeout" in samples[0]["reason"]
+
+
+def test_timeout_retry_backoff_is_bounded_exponential(monkeypatch):
+    # The backoff between connector retries is the same bounded exponential the per-doc loop uses:
+    # min(2**attempt, 30) for attempts 1, 2, 3 => 2, 4, 8. No unbounded or absent backoff.
+    slept = []
+    import time
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    es = _AlwaysTimeoutES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3),
+                       counts, [])
+    assert slept == [2, 4, 8]
+    assert es.calls == 4                         # 1 initial + 3 retries before the budget is spent
+
+
+def test_timeout_retry_covers_the_full_path_too(_no_backoff):
+    # The retry wraps BOTH the fast-path probe send and the full-path send. A delete-bearing write
+    # skips the fast path and goes straight to the full path, so a timeout there is retried the same.
+    es = _TimeoutThenOkES(fail_times=1, ok_response={"items": [{"delete": {"status": 200}}]})
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    cfg = _cfg(retry_transport_timeout=True, transport_max_retries=2,
+               has_deletes=True, delete_flag_column="d")
+    _ship_ndjson_chunk(es, ["header-only-delete-line"], cfg, counts, [])
+    assert es.calls == 2                          # 1 timeout + 1 success on the full path
+    assert counts["deleted"] == 1 and counts["errors"] == 0
+
+
+def test_non_timeout_transport_error_is_not_retried_even_when_knob_on(_no_backoff):
+    # Allow-list, not deny-list: only ConnectionTimeout is retried. A sibling ConnectionError (which
+    # the transport already retries and then surfaces) still fails closed on its first surfaced attempt,
+    # so a persistent non-timeout failure can't spin in the connector.
+    class _RaisingES:
+        def __init__(self):
+            self.calls = 0
+
+        def bulk(self, operations=None, filter_path=None, **kw):
+            self.calls += 1
+            raise _EsConnectionError("connection reset")
+
+    es = _RaisingES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3),
+                       counts, samples)
+    assert es.calls == 1                          # NOT retried by the connector
+    assert counts["errors"] == 2 and counts["written"] == 0
+    assert "ConnectionError" in samples[0]["reason"]

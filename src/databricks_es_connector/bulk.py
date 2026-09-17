@@ -297,6 +297,39 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         stats.append((len(ops), _bytes, _rtt, resp["took"] if "took" in resp else None, _cpu))
         return resp
 
+    # Whole-request timeout retry, owned by the connector when cfg.retry_transport_timeout is on (the
+    # write client is then built with retry_on_timeout=False, so the transport no longer re-sends a
+    # timed-out bulk itself -- see EsWriteConfig.client_kwargs). On a ConnectionTimeout ONLY, re-send the
+    # same chunk with exponential backoff up to cfg.transport_max_retries times; every OTHER exception
+    # propagates on its first attempt to the caller's fail-closed handling below (auth, RequestError,
+    # ConnectionError, serialization -- none of which a re-send would fix). A timed-out send is an UNKNOWN
+    # outcome, so the re-send re-applies the chunk (idempotent with id_field; a duplicate with auto-ids,
+    # accepted at-least-once), matching the fast-path reship. The retry runs here in connector code with
+    # backoff and a bounded budget, rather than the transport's hidden, immediate re-sends; the final
+    # successful send is recorded in bulk_stats as usual (a timed-out attempt raises before _send records,
+    # so its cost is not itself a stats row -- a possible future refinement). When the knob is off,
+    # _timeout_excs is the empty tuple, `except ()` catches nothing, and this is a zero-behavior
+    # pass-through to _send (today's path unchanged).
+    if cfg.retry_transport_timeout:
+        from elasticsearch import ConnectionTimeout
+        _timeout_excs = (ConnectionTimeout,)
+    else:
+        _timeout_excs = ()
+
+    def _send_retrying(ops, filter_path=None):
+        attempt = 0
+        while True:
+            try:
+                return _send(ops, filter_path=filter_path)
+            except _timeout_excs:
+                # Unreachable when the knob is off (_timeout_excs is empty). Exhausting the budget
+                # re-raises the ConnectionTimeout to the fail-closed except block below, so the terminal
+                # behavior (count the chunk as errors, surface via reconcile) is exactly as before.
+                if attempt >= cfg.transport_max_retries:
+                    raise
+                attempt += 1
+                _t.sleep(min(2 ** attempt, 30))
+
     # Fast path (GIL avoidance): on any delete-free write, a clean chunk needs only the top-level
     # `errors` flag, not per-item detail. Ship with filter_path="errors" so Elasticsearch returns just
     # {"errors": false} on success: the per-item response array is never sent or decoded, removing the
@@ -329,7 +362,7 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         try:
             # `took` (ES service time) is only needed when collecting stats; requesting it still
             # omits the per-item array, so the GIL win is preserved.
-            resp = _send(list(lines), filter_path=("errors,took" if stats is not None else "errors"))
+            resp = _send_retrying(list(lines), filter_path=("errors,took" if stats is not None else "errors"))
         except Exception as _e:  # noqa: BLE001
             # Same fail-closed handling as the full path: a whole-request transport failure counts
             # every line as an error rather than aborting the partition.
@@ -352,7 +385,7 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     attempt = 0
     while pending:
         try:
-            resp = _send(pending)
+            resp = _send_retrying(pending)
         except Exception as _e:  # noqa: BLE001
             # A whole-request transport failure (persistent 429/503, dropped connection) survived the
             # client's transport_max_retries. Record it rather than letting it abort the partition:
