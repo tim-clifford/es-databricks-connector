@@ -519,30 +519,35 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         # and wall well above busy/concurrency exposes non-ship overhead or idle between batches. This
         # ratio is the metric the pipelining change targets: it should rise toward write_concurrency.
         _partition_t0 = _time.perf_counter()
-        # GIL-acquisition-latency gauge for this worker process (bulk_stats only). Started before any
-        # send so its samples span the same window as partition_wall_ms; stopped in the finally. It
-        # attributes a slow rtt to a real socket/ES wait versus the worker being starved of the GIL.
-        gil_probe = _GilWaitProbe().start() if cfg.bulk_stats else None
+        # Everything that must be torn down (the GIL probe daemon, the ES client, the worker pool) is
+        # constructed INSIDE the try below, not here, so a failure in any constructor still hits the
+        # finally and nothing leaks. These are the handles the finally closes over; each is guarded there.
+        gil_probe = None
         gil_lags: list = []
-        es = Elasticsearch(**cfg.client_kwargs())
+        es = None
+        pool = None
+        shipper = None
         counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
         total_input = 0
         error_samples = []
         # Per-send timing records for the whole partition, aggregated to fixed-size summary columns
         # below. None (the default) when bulk_stats is off, so the hot path pays nothing.
         stats = [] if cfg.bulk_stats else None
-        # One thread pool + shipper for the whole PARTITION, not one per Arrow batch. mapInPandas hands
-        # a partition to this closure as a stream of ~maxRecordsPerBatch-row batches; the shipper feeds
-        # every batch's sends into one bounded in-flight pool WITHOUT draining between batches, so the
-        # ES round-trip wait is filled continuously and thread spin-up is paid once. write_concurrency
-        # <= 1 stays threadless (pool = shipper = None) and ships serially below.
-        pool = None
-        shipper = None
-        if cfg.write_concurrency > 1:
-            from concurrent.futures import ThreadPoolExecutor
-            pool = ThreadPoolExecutor(max_workers=cfg.write_concurrency)
-            shipper = _PipelinedShipper(es, cfg, pool, counts, error_samples, stats=stats)
         try:
+            # GIL-acquisition-latency gauge for this worker process (bulk_stats only). Started before any
+            # send so its samples span the ship window; stopped in the finally. It attributes a slow rtt
+            # to a real socket/ES wait versus the worker being starved of the GIL.
+            gil_probe = _GilWaitProbe().start() if cfg.bulk_stats else None
+            es = Elasticsearch(**cfg.client_kwargs())
+            # One thread pool + shipper for the whole PARTITION, not one per Arrow batch. mapInPandas
+            # hands a partition to this closure as a stream of ~maxRecordsPerBatch-row batches; the
+            # shipper feeds every batch's sends into one bounded in-flight pool WITHOUT draining between
+            # batches, so the ES round-trip wait is filled continuously and thread spin-up is paid once.
+            # write_concurrency <= 1 stays threadless (pool = shipper = None) and ships serially below.
+            if cfg.write_concurrency > 1:
+                from concurrent.futures import ThreadPoolExecutor
+                pool = ThreadPoolExecutor(max_workers=cfg.write_concurrency)
+                shipper = _PipelinedShipper(es, cfg, pool, counts, error_samples, stats=stats)
             for pdf in iterator:
                 col = pdf["_ndjson"]
                 total_input += len(col)
@@ -590,11 +595,13 @@ def make_ndjson_partition_writer(cfg: EsConfig):
             # rather than left for GC to reap when the reused Python worker is torn down. The read path
             # already closes its client; the write path did not, leaking a client per partition (one per
             # task, so many per executor across waves) and adding avoidable connection-teardown work at
-            # stage end. Fail-soft: a close error must not fail an otherwise-successful partition.
-            try:
-                es.close()
-            except Exception:
-                pass
+            # stage end. Fail-soft: a close error must not fail an otherwise-successful partition, and
+            # es may be None if its own construction raised (the finally still runs then).
+            if es is not None:
+                try:
+                    es.close()
+                except Exception:
+                    pass
         partition_wall_ms = (_time.perf_counter() - _partition_t0) * 1000.0
         out = {
             "written": [counts["written"]], "deleted": [counts["deleted"]],
