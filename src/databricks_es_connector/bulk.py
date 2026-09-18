@@ -193,49 +193,68 @@ class _GilWaitProbe:
 
 
 def _aggregate_bulk_stats(stats):
-    """Reduce a partition's (docs, bytes, rtt_ms, took_ms, cpu_ms) send records to single-row summary
-    columns.
+    """Reduce a partition's per-send records to single-row summary columns.
 
-    `stats` is the list bulk_stats collects, one tuple per es.bulk send. Returns a {column: [value]}
-    dict (single-row, for the mapInPandas summary DataFrame): send count, total docs sent (retries
-    included), total uncompressed NDJSON bytes sent, the summed round-trip time (send_busy_ms), the
-    summed worker-thread CPU time (send_cpu_ms), and the client round-trip (rtt) vs ES-service (`took`)
-    distributions. `bytes_sent / docs_sent` is the real per-document size and `bytes_sent / n_sends` the
-    per-request size; `send_busy_ms` divided by the partition wall clock (added by the writer) gives the
-    effective in-flight concurrency the partition actually achieved. `send_cpu_ms` is the CPU the worker
-    threads actually burned inside es.bulk (transport serialize/deserialize), so `send_busy_ms -
-    send_cpu_ms` is the off-CPU portion of the sends (socket wait plus any GIL stall); pair it with the
-    gil_wait_ms columns (from _GilWaitProbe) to split that off-CPU time into socket versus GIL. A per-send
-    `took` may be None if ES did not return it; those are excluded from the took aggregates only.
+    `stats` is the list bulk_stats collects, one tuple per es.bulk send:
+    `(docs, bytes, rtt_ms, took_ms, cpu_ms, http_ms, outcome)`, where `outcome` is "ok" (a returned
+    response), "timeout" (raised ConnectionTimeout) or "error" (any other raised transport failure). A
+    failed send has `took_ms`/`http_ms` None. The SUCCESSFUL sends drive the throughput and latency
+    columns; the failed sends are summarized separately so their wall cost is visible rather than lost.
+
+    Successful-send columns: `n_sends` (successful sends), `docs_sent` (retries included), `bytes_sent`
+    (uncompressed NDJSON), `send_busy_ms` (summed round-trip time; over the partition wall clock =>
+    effective in-flight concurrency), `send_cpu_ms` (worker CPU inside es.bulk), and the round-trip
+    distributions. Three nested timings split the round trip: `rtt_ms` (full es.bulk wall) >= `http_ms`
+    (elastic_transport node HTTP wall: request gzip + network + ES + response read) >= `took_ms` (ES
+    service). So `rtt - http` is the client layer above the node (response decode + dispatch + GIL --
+    what the fast path avoids), `http - took` is compression + network transit, and `took` is ES itself.
+    `send_busy_ms - send_cpu_ms` is the off-CPU send time; pair it with the gil_wait_ms columns to split
+    that into socket versus GIL. `took_ms`/`http_ms` that are None are excluded from those aggregates only.
+
+    Failed-send columns: `timeout_sends` / `timeout_wait_ms` and `error_sends` / `error_wait_ms` count
+    those attempts and sum their wall time, so total time in es.bulk = `send_busy_ms + timeout_wait_ms +
+    error_wait_ms`. `timeout_wait_ms` is the cost of connector-owned timeout retries (retry_transport_timeout).
     """
-    n_sends = len(stats)
-    docs_sent = sum(s[0] for s in stats)
-    bytes_sent = sum(s[1] for s in stats)
-    rtts = sorted(s[2] for s in stats)
-    tooks = sorted(s[3] for s in stats if s[3] is not None)
-    send_busy_ms = sum(s[2] for s in stats)   # summed round-trip time across all sends; vs the
-                                              # partition wall clock => effective concurrency
-    send_cpu_ms = sum(s[4] for s in stats)    # summed worker-thread CPU inside es.bulk; vs send_busy_ms
+    ok = [s for s in stats if s[6] == "ok"]
+    timeouts = [s for s in stats if s[6] == "timeout"]
+    errors = [s for s in stats if s[6] == "error"]
+
+    docs_sent = sum(s[0] for s in ok)
+    bytes_sent = sum(s[1] for s in ok)
+    rtts = sorted(s[2] for s in ok)
+    tooks = sorted(s[3] for s in ok if s[3] is not None)
+    https = sorted(s[5] for s in ok if s[5] is not None)
+    send_busy_ms = sum(s[2] for s in ok)      # summed successful round-trip time; vs the partition
+                                              # wall clock => effective concurrency
+    send_cpu_ms = sum(s[4] for s in ok)       # summed worker-thread CPU inside es.bulk; vs send_busy_ms
                                               # => the fraction of send time that was CPU, not waiting
 
     def _mean(xs):
         return float(sum(xs) / len(xs)) if xs else None
 
-    return {
-        "n_sends": [n_sends],
+    def _dist(prefix, xs):
+        return {
+            f"{prefix}_mean": [_mean(xs)],
+            f"{prefix}_p50": [_percentile(xs, 50)],
+            f"{prefix}_p95": [_percentile(xs, 95)],
+            f"{prefix}_max": [float(xs[-1]) if xs else None],
+        }
+
+    out = {
+        "n_sends": [len(ok)],
         "docs_sent": [docs_sent],
         "bytes_sent": [bytes_sent],
         "send_busy_ms": [float(send_busy_ms)],
         "send_cpu_ms": [float(send_cpu_ms)],
-        "rtt_ms_mean": [_mean(rtts)],
-        "rtt_ms_p50": [_percentile(rtts, 50)],
-        "rtt_ms_p95": [_percentile(rtts, 95)],
-        "rtt_ms_max": [float(rtts[-1]) if rtts else None],
-        "took_ms_mean": [_mean(tooks)],
-        "took_ms_p50": [_percentile(tooks, 50)],
-        "took_ms_p95": [_percentile(tooks, 95)],
-        "took_ms_max": [float(tooks[-1]) if tooks else None],
+        "timeout_sends": [len(timeouts)],
+        "timeout_wait_ms": [float(sum(s[2] for s in timeouts))],
+        "error_sends": [len(errors)],
+        "error_wait_ms": [float(sum(s[2] for s in errors))],
     }
+    out.update(_dist("rtt_ms", rtts))
+    out.update(_dist("http_ms", https))
+    out.update(_dist("took_ms", tooks))
+    return out
 
 
 def _aggregate_gil_wait(lags_ms):
@@ -270,15 +289,35 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     """
     import time as _t
 
+    # ConnectionTimeout is needed to CLASSIFY a timed-out send in bulk_stats (below) and, when the
+    # connector owns timeout retries, to decide what _send_retrying re-sends. Resolve it once here (a
+    # cheap cached import) only when either path needs it. _timeout_excs is the retry allow-list:
+    # ConnectionTimeout ONLY, and the empty tuple when the knob is off so `except ()` catches nothing.
+    _ConnectionTimeout = None
+    if cfg.bulk_stats or cfg.retry_transport_timeout:
+        from elasticsearch import ConnectionTimeout as _ConnectionTimeout
+    _timeout_excs = (_ConnectionTimeout,) if cfg.retry_transport_timeout else ()
+
     def _send(ops, filter_path=None):
-        # One es.bulk send. When `stats` is collecting, time the client round trip and record
-        # (docs, bytes, rtt_ms, took_ms, cpu_ms) for this send; otherwise zero overhead (no timers).
+        # One es.bulk send. When `stats` is collecting, time the round trip and record a per-send tuple
+        # (docs, bytes, rtt_ms, took_ms, cpu_ms, http_ms, outcome); otherwise zero overhead (no timers).
+        # A FAILED send is recorded too (took_ms/http_ms None, outcome "timeout" or "error") so its wall
+        # cost -- e.g. a chunk that burned request_timeout before raising ConnectionTimeout -- is VISIBLE
+        # in bulk_stats rather than vanishing; the exception is then re-raised to the caller unchanged.
         kw = {"filter_path": filter_path} if filter_path else {}
         if stats is None:
             return es.bulk(operations=ops, **kw)
         _cpu0 = _t.thread_time()
         _t0 = _t.perf_counter()
-        resp = es.bulk(operations=ops, **kw)
+        try:
+            resp = es.bulk(operations=ops, **kw)
+        except Exception as _e:  # noqa: BLE001  -- record the failed attempt's cost, then re-raise
+            _rtt = (_t.perf_counter() - _t0) * 1000.0
+            _cpu = (_t.thread_time() - _cpu0) * 1000.0
+            _outcome = ("timeout" if (_ConnectionTimeout is not None
+                                      and isinstance(_e, _ConnectionTimeout)) else "error")
+            stats.append((len(ops), sum(len(op) for op in ops), _rtt, None, _cpu, None, _outcome))
+            raise
         _rtt = (_t.perf_counter() - _t0) * 1000.0
         # thread_time is THIS worker thread's own CPU (user+system). It does NOT advance while the
         # thread is blocked on the socket (GIL released during the round trip) OR parked waiting to
@@ -288,13 +327,21 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         # the expected I/O-bound shape. The _GilWaitProbe is what splits that off-CPU part into socket
         # wait versus GIL starvation, which a per-send timer alone cannot separate.
         _cpu = (_t.thread_time() - _cpu0) * 1000.0
+        # http_ms is elastic_transport's node-level HTTP wall (resp.meta.duration): request gzip +
+        # upload + ES service + response download + full body read, timed just around the socket call.
+        # It sits BETWEEN rtt and took, so rtt_ms - http_ms isolates the elasticsearch-py client layer
+        # above the node (response JSON decode + dispatch + GIL park -- exactly what the fast path
+        # avoids), and http_ms - took_ms isolates request compression + network transit. None if the
+        # response carries no meta.
+        _meta = getattr(resp, "meta", None)
+        _http = (_meta.duration * 1000.0) if (_meta is not None and getattr(_meta, "duration", None) is not None) else None
         # Uncompressed NDJSON size of this send: the summed length of the pre-built action lines.
         # Character length, which equals byte length for ASCII/JSON and is a close lower bound
         # otherwise; cheap (C-level len) and computed only when collecting. Lets a caller derive
         # bytes/doc (the real document size, with NO extra ES query) and correlate rtt against payload
         # size, i.e. tell a fixed per-request latency apart from a transfer/bandwidth-bound write.
         _bytes = sum(len(op) for op in ops)
-        stats.append((len(ops), _bytes, _rtt, resp["took"] if "took" in resp else None, _cpu))
+        stats.append((len(ops), _bytes, _rtt, resp["took"] if "took" in resp else None, _cpu, _http, "ok"))
         return resp
 
     # Whole-request timeout retry, owned by the connector when cfg.retry_transport_timeout is on (the
@@ -305,17 +352,10 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     # ConnectionError, serialization -- none of which a re-send would fix). A timed-out send is an UNKNOWN
     # outcome, so the re-send re-applies the chunk (idempotent with id_field; a duplicate with auto-ids,
     # accepted at-least-once), matching the fast-path reship. The retry runs here in connector code with
-    # backoff and a bounded budget, rather than the transport's hidden, immediate re-sends; the final
-    # successful send is recorded in bulk_stats as usual (a timed-out attempt raises before _send records,
-    # so its cost is not itself a stats row -- a possible future refinement). When the knob is off,
-    # _timeout_excs is the empty tuple, `except ()` catches nothing, and this is a zero-behavior
-    # pass-through to _send (today's path unchanged).
-    if cfg.retry_transport_timeout:
-        from elasticsearch import ConnectionTimeout
-        _timeout_excs = (ConnectionTimeout,)
-    else:
-        _timeout_excs = ()
-
+    # backoff and a bounded budget, rather than the transport's hidden, immediate re-sends, and every
+    # attempt (each failed one included) is recorded in bulk_stats by _send, so the retry's wall cost is
+    # visible. When the knob is off, _timeout_excs (resolved at the top of this function) is the empty
+    # tuple, `except ()` catches nothing, and this is a zero-behavior pass-through to _send.
     def _send_retrying(ops, filter_path=None):
         attempt = 0
         while True:
@@ -726,7 +766,9 @@ def _merge_partition_results(rows) -> dict:
     # per partition; the caller (e.g. an on_batch hook) rolls up or logs as it sees fit.
     _STAT_KEYS = ("n_sends", "docs_sent", "bytes_sent", "send_busy_ms", "send_cpu_ms",
                   "partition_wall_ms",
+                  "timeout_sends", "timeout_wait_ms", "error_sends", "error_wait_ms",
                   "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
+                  "http_ms_mean", "http_ms_p50", "http_ms_p95", "http_ms_max",
                   "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max",
                   "gil_wait_ms_total", "gil_wait_ms_p50", "gil_wait_ms_p95", "gil_wait_ms_max",
                   "gil_wait_samples")
@@ -925,15 +967,25 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
 
     When `cfg.bulk_stats=True`, the result additionally carries 'bulk_stats': one entry per partition,
     each {n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms,
-    rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max,
-    gil_wait_ms_total/p50/p95/max, gil_wait_samples}. `rtt_ms` is the client-observed round trip per
-    es.bulk send, `took_ms` is Elasticsearch's own service time, so rtt_ms vs took_ms splits the round
-    trip into network/queue vs ES processing. `bytes_sent` is the uncompressed NDJSON size, so
+    timeout_sends, timeout_wait_ms, error_sends, error_wait_ms,
+    rtt_ms_mean/p50/p95/max, http_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max,
+    gil_wait_ms_total/p50/p95/max, gil_wait_samples}. The round trip splits into three NESTED timings,
+    rtt_ms >= http_ms >= took_ms: `rtt_ms` is the full es.bulk wall the client observes; `http_ms` is
+    elastic_transport's node-level HTTP wall (request gzip + network + ES + response read); `took_ms` is
+    Elasticsearch's own service time. So `rtt_ms - http_ms` is the client layer above the node (response
+    JSON decode + dispatch + GIL park -- what the fast path avoids), `http_ms - took_ms` is compression +
+    network transit, and `took_ms` is ES. `bytes_sent` is the uncompressed NDJSON size, so
     bytes_sent/docs_sent is the real per-document size (no extra ES query) and bytes_sent/n_sends the
-    per-request size -- comparing rtt_ms against these tells a fixed per-request latency apart from a
-    transfer/bandwidth-bound write. `send_busy_ms` (summed round-trip time) over `partition_wall_ms`
+    per-request size. `send_busy_ms` (summed successful round-trip time) over `partition_wall_ms`
     (the partition wall clock) is the effective in-flight concurrency the partition actually reached
-    (~1 == serial, ~write_concurrency == fully overlapped).
+    (~1 == serial, ~write_concurrency == fully overlapped). All of the above are over SUCCESSFUL sends.
+
+    `timeout_sends`/`timeout_wait_ms` and `error_sends`/`error_wait_ms` cover the sends that RAISED
+    (a ConnectionTimeout, or any other transport error): their count and summed wall time, so total time
+    spent in es.bulk = send_busy_ms + timeout_wait_ms + error_wait_ms and none of it is hidden.
+    `timeout_wait_ms` is the wall cost of connector-owned timeout retries (see `retry_transport_timeout`):
+    a non-zero value with a low final error count means retries are landing the data; a large value with
+    errors still nonzero means timeouts are outliving the budget.
 
     `send_cpu_ms` and the gil_wait_ms columns diagnose WHY a round trip is slow -- whether it is a real
     socket/ES wait or the worker being starved of the GIL (client-side, but indistinguishable from ES
@@ -978,7 +1030,9 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
         # (their ratio is the effective in-flight concurrency).
         summary_schema += (", n_sends long, docs_sent long, bytes_sent long, "
                            "send_busy_ms double, send_cpu_ms double, partition_wall_ms double, "
+                           "timeout_sends long, timeout_wait_ms double, error_sends long, error_wait_ms double, "
                            "rtt_ms_mean double, rtt_ms_p50 double, rtt_ms_p95 double, rtt_ms_max double, "
+                           "http_ms_mean double, http_ms_p50 double, http_ms_p95 double, http_ms_max double, "
                            "took_ms_mean double, took_ms_p50 double, took_ms_p95 double, took_ms_max double, "
                            "gil_wait_ms_total double, gil_wait_ms_p50 double, gil_wait_ms_p95 double, "
                            "gil_wait_ms_max double, gil_wait_samples long")

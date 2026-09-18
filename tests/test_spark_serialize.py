@@ -901,11 +901,11 @@ def test_percentile_linear_interpolation():
 
 def test_aggregate_bulk_stats_computes_send_and_latency_summary():
     from databricks_es_connector.bulk import _aggregate_bulk_stats
-    # (docs, bytes, rtt_ms, took_ms, cpu_ms); one send has a None took (ES omitted it) -> excluded
-    # from the took aggregates only. cpu_ms is the worker CPU burned inside es.bulk for that send.
-    agg = _aggregate_bulk_stats([(100, 1000, 10.0, 5.0, 1.0),
-                                 (100, 2000, 20.0, 15.0, 2.0),
-                                 (50, 500, 30.0, None, 3.0)])
+    # (docs, bytes, rtt_ms, took_ms, cpu_ms, http_ms, outcome). All three succeeded ("ok"); one has a
+    # None took (ES omitted it) -> excluded from the took aggregates only. Nested: rtt >= http >= took.
+    agg = _aggregate_bulk_stats([(100, 1000, 10.0, 5.0, 1.0, 8.0, "ok"),
+                                 (100, 2000, 20.0, 15.0, 2.0, 18.0, "ok"),
+                                 (50, 500, 30.0, None, 3.0, 28.0, "ok")])
     assert agg["n_sends"] == [3]
     assert agg["docs_sent"] == [250]           # retries would count again; here 3 distinct sends
     assert agg["bytes_sent"] == [3500]         # 1000 + 2000 + 500 (uncompressed NDJSON)
@@ -913,8 +913,29 @@ def test_aggregate_bulk_stats_computes_send_and_latency_summary():
     assert agg["send_cpu_ms"] == [6.0]         # 1 + 2 + 3 (summed worker CPU inside es.bulk)
     assert agg["rtt_ms_mean"] == [20.0] and agg["rtt_ms_p50"] == [20.0]
     assert agg["rtt_ms_p95"] == [29.0] and agg["rtt_ms_max"] == [30.0]
+    assert agg["http_ms_mean"] == [18.0] and agg["http_ms_max"] == [28.0]   # node HTTP wall (rtt>=http>=took)
     assert agg["took_ms_mean"] == [10.0]       # (5+15)/2, None excluded
     assert agg["took_ms_p50"] == [10.0] and agg["took_ms_max"] == [15.0]
+    assert agg["timeout_sends"] == [0] and agg["timeout_wait_ms"] == [0.0]  # no failed sends here
+    assert agg["error_sends"] == [0] and agg["error_wait_ms"] == [0.0]
+
+
+def test_aggregate_bulk_stats_splits_ok_timeout_and_error_sends():
+    # Failed sends (took/http None) are summarized SEPARATELY so their wall cost is visible; the ok
+    # sends alone drive docs/rtt/http/took. total es.bulk time = send_busy + timeout_wait + error_wait.
+    from databricks_es_connector.bulk import _aggregate_bulk_stats
+    agg = _aggregate_bulk_stats([
+        (100, 1000, 12.0, 5.0, 1.0, 10.0, "ok"),
+        (100, 1000, 300000.0, None, 0.0, None, "timeout"),   # two ~300s timed-out attempts
+        (100, 1000, 300000.0, None, 0.0, None, "timeout"),
+        (50, 500, 40.0, None, 0.0, None, "error"),           # a non-timeout transport failure
+    ])
+    assert agg["n_sends"] == [1]                 # only the successful send
+    assert agg["docs_sent"] == [100] and agg["bytes_sent"] == [1000]
+    assert agg["send_busy_ms"] == [12.0]         # ok rtt only
+    assert agg["rtt_ms_max"] == [12.0]           # timed-out attempts are NOT in the rtt distribution
+    assert agg["timeout_sends"] == [2] and agg["timeout_wait_ms"] == [600000.0]
+    assert agg["error_sends"] == [1] and agg["error_wait_ms"] == [40.0]
 
 
 def test_aggregate_bulk_stats_empty_partition_is_nulls_not_crash():
@@ -924,7 +945,10 @@ def test_aggregate_bulk_stats_empty_partition_is_nulls_not_crash():
     assert agg["bytes_sent"] == [0] and agg["send_busy_ms"] == [0.0]
     assert agg["send_cpu_ms"] == [0.0]
     assert agg["rtt_ms_mean"] == [None] and agg["rtt_ms_max"] == [None]
+    assert agg["http_ms_mean"] == [None] and agg["http_ms_max"] == [None]
     assert agg["took_ms_p95"] == [None]
+    assert agg["timeout_sends"] == [0] and agg["timeout_wait_ms"] == [0.0]
+    assert agg["error_sends"] == [0] and agg["error_wait_ms"] == [0.0]
 
 
 def test_aggregate_gil_wait_summary_and_empty():
@@ -997,10 +1021,11 @@ def test_ship_chunk_records_a_send_on_the_fast_path():
     assert counts["written"] == 2
     assert es.calls == [(["a", "b"], "errors,took")]    # took requested, items still omitted
     assert len(stats) == 1
-    docs, byts, rtt_ms, took_ms, cpu_ms = stats[0]
+    docs, byts, rtt_ms, took_ms, cpu_ms, http_ms, outcome = stats[0]
     assert docs == 2 and took_ms == 7 and rtt_ms >= 0.0
     assert byts == 2          # sum of len("a") + len("b") = uncompressed NDJSON size
     assert cpu_ms >= 0.0      # worker-thread CPU inside es.bulk (thread_time delta), never negative
+    assert outcome == "ok"    # a returned response; a raised send would be "timeout"/"error"
 
 
 def test_ship_chunk_no_stats_and_no_took_when_disabled():
@@ -1023,8 +1048,8 @@ def test_ship_chunk_records_took_on_full_path():
     stats = []
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, stats=stats, error_samples=[])
     assert counts["written"] == 2 and len(stats) == 2
-    # re-ship send is (docs, bytes, rtt, took, cpu): took at idx 3, cpu at idx 4.
-    assert stats[-1][0] == 2 and stats[-1][3] == 3 and stats[-1][4] >= 0.0
+    # re-ship send is (docs, bytes, rtt, took, cpu, http, outcome): took at idx 3, cpu at idx 4.
+    assert stats[-1][0] == 2 and stats[-1][3] == 3 and stats[-1][4] >= 0.0 and stats[-1][6] == "ok"
 
 
 def test_pipelined_shipper_merges_stats_across_sends():
@@ -1308,3 +1333,42 @@ def test_non_timeout_transport_error_is_not_retried_even_when_knob_on(_no_backof
     assert es.calls == 1                          # NOT retried by the connector
     assert counts["errors"] == 2 and counts["written"] == 0
     assert "ConnectionError" in samples[0]["reason"]
+
+
+def test_ship_chunk_records_timeout_attempts_in_stats(_no_backoff):
+    # End-to-end: with bulk_stats collecting and retry_transport_timeout on, each timed-out attempt is
+    # recorded (outcome "timeout") and the final success as "ok", so the retry's wall cost is visible
+    # in bulk_stats rather than vanishing inside a hidden transport retry.
+    from databricks_es_connector.bulk import _aggregate_bulk_stats
+    es = _TimeoutThenOkES(fail_times=2, ok_response={"errors": False})
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    stats = []
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3,
+                            bulk_stats=True),
+                       counts, [], stats=stats)
+    assert [s[6] for s in stats] == ["timeout", "timeout", "ok"]
+    assert counts["written"] == 2
+    agg = _aggregate_bulk_stats(stats)
+    assert agg["timeout_sends"] == [2] and agg["n_sends"] == [1]
+    assert agg["timeout_wait_ms"][0] > 0
+
+
+def test_ship_chunk_records_http_ms_from_response_meta():
+    # http_ms is read from resp.meta.duration (elastic_transport node HTTP wall) on a successful send,
+    # sitting between rtt and took. A response with no .meta records http_ms None (no crash).
+    from elastic_transport import ObjectApiResponse, ApiResponseMeta, HttpHeaders
+    meta = ApiResponseMeta(status=200, http_version="1.1", headers=HttpHeaders({}),
+                           duration=0.25, node=None)   # 250 ms node HTTP wall
+
+    class _MetaES:
+        def bulk(self, operations=None, filter_path=None, **kw):
+            return ObjectApiResponse(body={"errors": False, "took": 40}, meta=meta)
+
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    stats = []
+    _ship_ndjson_chunk(_MetaES(), ["a"], _cfg(id_field=None, bulk_stats=True), counts, [], stats=stats)
+    assert len(stats) == 1
+    docs, _bytes, rtt, took, _cpu, http, outcome = stats[0]
+    assert outcome == "ok" and took == 40 and http == 250.0     # took_ms=40 (ES), http_ms=250 (node)
+    assert rtt >= 0.0                                           # real timer around the (instant) mock

@@ -263,18 +263,26 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   from your own pipeline, the connector does not persist them.
 - **`bulk_stats` is opt-in diagnostics, absent by default.** With `EsWriteConfig(bulk_stats=True)`,
   the result carries an extra `bulk_stats` key: a list with one entry per write partition, each
-  `{n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms,
-  rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max, gil_wait_ms_total/p50/p95/max, gil_wait_samples}`.
-  `rtt_ms` is the full client-observed round trip per `_bulk`; `took_ms` is Elasticsearch's own reported
-  service time, so `rtt − took` is network/queue overhead and `docs_sent / n_sends` is the real
-  docs-per-bulk. `send_cpu_ms` and `gil_wait_ms_*` diagnose WHY a round trip is slow: `send_cpu_ms` is
+  `{n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms, timeout_sends,
+  timeout_wait_ms, error_sends, error_wait_ms, rtt_ms_mean/p50/p95/max, http_ms_mean/p50/p95/max,
+  took_ms_mean/p50/p95/max, gil_wait_ms_total/p50/p95/max, gil_wait_samples}`.
+  The round trip splits into three **nested** timings, `rtt_ms ≥ http_ms ≥ took_ms`: `rtt_ms` is the full
+  client-observed `_bulk` wall; `http_ms` is `elastic_transport`'s node-level HTTP wall (request gzip +
+  network + ES + response read); `took_ms` is Elasticsearch's own service time. So `rtt − http` is the
+  client layer above the node (response decode + dispatch + GIL, what the fast path avoids), `http − took`
+  is compression + network transit, and `took` is ES itself; `docs_sent / n_sends` is the real docs-per-bulk.
+  `send_cpu_ms` and `gil_wait_ms_*` diagnose WHY a round trip is slow: `send_cpu_ms` is
   the CPU each worker actually burned inside `_bulk`, so `send_busy_ms − send_cpu_ms` is the off-CPU send
   time, and `gil_wait_ms_*` (from a background probe measuring how long a runnable thread waited to
   re-acquire the GIL) says whether that off-CPU time is a genuine socket/ES wait (`gil_wait_ms` near
   zero while `rtt_ms` is high) or client-side GIL starvation (`gil_wait_ms_total` a large share of
   `partition_wall_ms`, meaning a high `write_concurrency` is contending on the interpreter rather than
-  overlapping I/O). The key is **absent** when `bulk_stats` is off, so the core result shape above is
-  unchanged.
+  overlapping I/O). All of those are over **successful** sends; the sends that **raised** are summarized
+  by `timeout_sends`/`timeout_wait_ms` (a `ConnectionTimeout`, e.g. the wall cost of
+  [`retry_transport_timeout`](#write-behavior-eswriteconfig) re-sends) and `error_sends`/`error_wait_ms`
+  (any other transport error), so total time in `_bulk` = `send_busy_ms + timeout_wait_ms + error_wait_ms`
+  and none of it is hidden. The key is **absent** when `bulk_stats` is off, so the core result shape above
+  is unchanged.
 - **Duplicate `id_field` values collapse, and reconciliation won't flag it.** If `id_field` is
   set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
   over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
@@ -495,7 +503,7 @@ per-document level, and `max_retries=N` sets both at once, see
 | `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses to retry. `429` is ES's write queue being full, the one reliably transient case. Adding `503` (a shard briefly unavailable, e.g. during relocation) is the main sensible extension: `retry_on_doc_status=(429, 503)`. Do **not** add deterministic statuses like `400` (malformed doc) or `409` (version conflict): the retry fails identically and only delays the real error. Empty with a non-zero `max_retries_per_doc` raises. |
 | `retry_transport_timeout` | `bool` | `False` | No | Opt in to have the **connector** retry a whole-request **timeout** rather than the transport. A bulk exceeding `request_timeout` raises `ConnectionTimeout`; by default `elasticsearch-py` re-sends the whole request up to `transport_max_retries` times immediately and invisibly, and a surfaced timeout then fails the write, so a latency-bound stream falls behind on Spark's re-run. `True` builds the write client with `retry_on_timeout=False` (so the two layers don't stack) and re-sends a timed-out chunk — only on `ConnectionTimeout` — up to `transport_max_retries` times with bounded exponential backoff, in connector code, before falling closed into errors as before. `request_timeout` is **not** shortened. A timed-out re-send re-applies the chunk: idempotent with `id_field`, a **duplicate** with auto-generated ids (at-least-once, accepted). See [Retries on a write](#retries-on-a-write-two-layers). |
 | `require_existing_index` | `bool` | `True` | No | Verify the index exists before writing. ES auto-creates a missing index, so a **typo'd index name** otherwise produces a brand-new dynamically-mapped index and a perfect-looking `written` count. One `indices.exists` call on the driver. Set `False` to allow auto-creation (e.g. with an index template). |
-| `bulk_stats` | `bool` | `False` | No | Diagnostics: collect per-`_bulk` send stats and return them under an extra `bulk_stats` key in the write result (see [The write result](#the-write-result-bulk_write-return-value)), one entry per write partition. Each carries `n_sends`, `docs_sent`, `bytes_sent`, `send_busy_ms`, `send_cpu_ms`, `partition_wall_ms`, the round-trip `rtt_ms_*` and ES-reported `took_ms_*` (mean/p50/p95/max), and `gil_wait_ms_*` + `gil_wait_samples`. `rtt_ms − took_ms` is the network/queue overhead and `docs_sent / n_sends` is the real docs-per-bulk, so it answers whether a write is bound on ES service time, the network, or the client. `send_cpu_ms` plus the `gil_wait_ms_*` probe separate a slow round trip that is a genuine socket/ES wait from one inflated by GIL starvation under a high `write_concurrency` (see [The write result](#the-write-result-bulk_write-return-value)). On the happy path it adds `took` to the `filter_path`, so the cost is one small extra timing per request plus a lightweight background probe thread; **off by default** (zero overhead and the result key absent when unset). |
+| `bulk_stats` | `bool` | `False` | No | Diagnostics: collect per-`_bulk` send stats and return them under an extra `bulk_stats` key in the write result (see [The write result](#the-write-result-bulk_write-return-value)), one entry per write partition. Each carries `n_sends`, `docs_sent`, `bytes_sent`, `send_busy_ms`, `send_cpu_ms`, `partition_wall_ms`, the failed-send counters `timeout_sends`/`timeout_wait_ms` and `error_sends`/`error_wait_ms`, the three nested round-trip distributions `rtt_ms_* ≥ http_ms_* ≥ took_ms_*` (mean/p50/p95/max), and `gil_wait_ms_*` + `gil_wait_samples`. `rtt − http` is the client layer above the node, `http − took` is compression + network, and `took` is ES service, so it answers whether a write is bound on ES, the network, client-side decode/GIL, or timeout retries. `send_cpu_ms` plus the `gil_wait_ms_*` probe separate a slow round trip that is a genuine socket/ES wait from one inflated by GIL starvation under a high `write_concurrency` (see [The write result](#the-write-result-bulk_write-return-value)). On the happy path it adds `took` to the `filter_path`, so the cost is one small extra timing per request plus a lightweight background probe thread; **off by default** (zero overhead and the result key absent when unset). |
 
 #### Retries on a write: two layers
 
