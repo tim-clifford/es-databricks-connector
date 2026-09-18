@@ -27,6 +27,11 @@ def _cfg(**kw):
     return EsConfig(**base)
 
 
+# The full-path (round-2 reship + per-doc retry) filter_path the connector now uses to trim the ES
+# response to just what it reads (mirrors bulk._ship_ndjson_chunk's _full_filter_path, no-stats form).
+_FULL_FP = "items.*.status,items.*.error,items.*._id"
+
+
 class _FakeES:
     """Returns queued canned responses, one per bulk() call. Records the lines it was asked to send."""
     def __init__(self, responses):
@@ -555,7 +560,7 @@ def test_pipelined_shipper_worker_exception_fails_closed(monkeypatch):
     # counts them, so force a raw raise to exercise the re-raise guard itself.
     from databricks_es_connector import bulk as bulk_mod
 
-    def _boom(es, chunk, cfg, counts, samples, stats=None):
+    def _boom(es, chunk, cfg, counts, samples, stats=None, diag=None):
         raise RuntimeError("worker died mid-ship")
 
     monkeypatch.setattr(bulk_mod, "_ship_ndjson_chunk", _boom)
@@ -734,7 +739,7 @@ def test_fast_path_reissues_full_on_error_and_classifies_per_item():
     assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
     assert samples and samples[0]["_id"] == "b" and "boom" in samples[0]["reason"]
     assert es.calls[0] == (["a", "b"], "errors")          # probe first
-    assert es.calls[1] == (["a", "b"], None)              # then full re-ship for detail
+    assert es.calls[1] == (["a", "b"], _FULL_FP)              # then full re-ship for detail
 
 
 def test_fast_path_reissue_still_drives_429_retry():
@@ -747,8 +752,8 @@ def test_fast_path_reissue_still_drives_429_retry():
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(max_retries_per_doc=3), counts, [])
     assert counts["written"] == 3 and counts["errors"] == 0
-    assert es.calls[1] == (["a", "b", "c"], None)         # full re-ship
-    assert es.calls[2] == (["b"], None)                   # only the 429 line retried
+    assert es.calls[1] == (["a", "b", "c"], _FULL_FP)         # full re-ship
+    assert es.calls[2] == (["b"], _FULL_FP)                   # only the 429 line retried
 
 
 def test_fast_path_missing_errors_key_fails_closed():
@@ -757,7 +762,7 @@ def test_fast_path_missing_errors_key_fails_closed():
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
     assert counts["written"] == 2 and counts["errors"] == 0
-    assert len(es.calls) == 2 and es.calls[1] == (["a", "b"], None)
+    assert len(es.calls) == 2 and es.calls[1] == (["a", "b"], _FULL_FP)
 
 
 def test_fast_path_applies_without_id_field():
@@ -786,7 +791,7 @@ def test_fast_path_without_id_field_reships_full_on_error():
     assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
     assert samples and "boom" in samples[0]["reason"]
     assert es.calls[0] == (["a", "b"], "errors")          # probe first
-    assert es.calls[1] == (["a", "b"], None)              # then full re-ship for detail
+    assert es.calls[1] == (["a", "b"], _FULL_FP)              # then full re-ship for detail
 
 
 def test_fast_path_without_id_field_transient_429_reships_whole_chunk_then_retries_line():
@@ -805,8 +810,8 @@ def test_fast_path_without_id_field_transient_429_reships_whole_chunk_then_retri
     _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(id_field=None, max_retries_per_doc=3), counts, [])
     assert counts["written"] == 3 and counts["errors"] == 0
     assert es.calls[0] == (["a", "b", "c"], "errors")     # probe
-    assert es.calls[1] == (["a", "b", "c"], None)         # whole chunk re-shipped (a + c duplicated)
-    assert es.calls[2] == (["b"], None)                   # only the 429'd line retried after that
+    assert es.calls[1] == (["a", "b", "c"], _FULL_FP)         # whole chunk re-shipped (a + c duplicated)
+    assert es.calls[2] == (["b"], _FULL_FP)                   # only the 429'd line retried after that
 
 
 def test_fast_path_disabled_with_deletes():
@@ -819,7 +824,7 @@ def test_fast_path_disabled_with_deletes():
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b"], cfg, counts, [])
     assert counts == {"written": 1, "deleted": 0, "ignored": 1, "errors": 0}
-    assert es.calls == [(["a", "b"], None)]
+    assert es.calls == [(["a", "b"], _FULL_FP)]
 
 
 class _NoGetResponse:
@@ -861,7 +866,7 @@ def test_fast_path_objectapiresponse_error_reships_and_classifies():
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, samples)
     assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
     assert samples and samples[0]["_id"] == "b"
-    assert es.calls[1] == (["a", "b"], None)
+    assert es.calls[1] == (["a", "b"], _FULL_FP)
 
 
 def test_fast_path_probe_transport_error_counts_errors_not_crash():
@@ -1372,3 +1377,94 @@ def test_ship_chunk_records_http_ms_from_response_meta():
     docs, _bytes, rtt, took, _cpu, http, outcome = stats[0]
     assert outcome == "ok" and took == 40 and http == 250.0     # took_ms=40 (ES), http_ms=250 (node)
     assert rtt >= 0.0                                           # real timer around the (instant) mock
+
+
+# =====================================================================================
+# Full-path diagnostics: docs_retried (429 retry volume) + fixed reject buckets, and the trimmed
+# full-path filter_path. All bulk_stats-only and full-path-only (zero on a clean chunk).
+# =====================================================================================
+
+def test_diag_counts_docs_retried_and_reject_buckets(_no_backoff):
+    from databricks_es_connector.bulk import _new_diag
+    # id_field=None fast path: probe errors=True -> full reship carrying 201 / 429(retry->201) / 400 / 409.
+    es = _RecordingES([
+        {"errors": True},
+        {"items": [{"index": {"status": 201}},
+                   {"index": {"status": 429}},
+                   {"index": {"status": 400, "_id": "d3", "error": {"reason": "map"}}},
+                   {"index": {"status": 409, "_id": "d4", "error": {"reason": "conflict"}}}]},
+        {"items": [{"index": {"status": 201}}]},          # retry of the 429'd line succeeds
+    ])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a", "b", "c", "d"],
+                       _cfg(id_field=None, max_retries_per_doc=3), counts, [], diag=diag)
+    assert diag["docs_retried"] == 1          # one 429'd line re-sent
+    assert diag["rejected_429"] == 1          # the 429, counted before the retry
+    assert diag["rejected_4xx_other"] == 1    # the 400
+    assert diag["rejected_409"] == 1          # the 409
+    assert diag["rejected_5xx"] == 0
+    assert counts == {"written": 2, "deleted": 0, "ignored": 0, "errors": 2}
+
+
+def test_diag_zero_on_a_clean_fast_path():
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"errors": False}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, [], diag=diag)
+    assert counts["written"] == 2
+    assert diag == _new_diag()                 # all zero: a clean chunk never touches the full path
+    assert es.calls == [(["a", "b"], "errors")]   # only the probe, no full reship
+
+
+def test_diag_5xx_bucket_and_delete_404_not_counted(_no_backoff):
+    # 503 -> rejected_5xx; a delete-404 is an expected no-op (IGNORED) and must NOT count as a rejection.
+    from databricks_es_connector.bulk import _new_diag
+    from databricks_es_connector.config import EsWriteConfig
+    cfg = EsWriteConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
+                        require_existing_index=False, has_deletes=True, delete_flag_column="d")
+    es = _RecordingES([{"items": [{"delete": {"status": 404}},
+                                  {"index": {"status": 503, "_id": "x", "error": {"reason": "unavail"}}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["del", "idx"], cfg, counts, [], diag=diag)
+    assert diag["rejected_5xx"] == 1
+    assert diag["rejected_429"] == 0 and diag["rejected_4xx_other"] == 0 and diag["rejected_409"] == 0
+    assert diag["docs_retried"] == 0           # 503 is not retryable by default (retry_on_doc_status=(429,))
+    assert counts["ignored"] == 1 and counts["errors"] == 1   # delete-404 ignored; 503 an error
+
+
+def test_full_path_uses_trimmed_filter_path_with_and_without_stats():
+    # The full-path reship trims the ES response; the probe stays "errors"-only. Without stats the
+    # trim omits took; with stats it prepends took.
+    es = _RecordingES([{"errors": True},
+                       {"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}])
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), {"written": 0, "deleted": 0, "ignored": 0,
+                                                             "errors": 0}, [])
+    assert es.calls[0][1] == "errors"                                        # probe unchanged
+    assert es.calls[1][1] == "items.*.status,items.*.error,items.*._id"      # trimmed, no took
+
+    es2 = _RecordingES([{"errors": True, "took": 1},
+                        {"items": [{"index": {"status": 201}}, {"index": {"status": 201}}], "took": 2}])
+    _ship_ndjson_chunk(es2, ["a", "b"], _cfg(id_field=None), {"written": 0, "deleted": 0, "ignored": 0,
+                                                              "errors": 0}, [], stats=[])
+    assert es2.calls[0][1] == "errors,took"                                          # probe (stats)
+    assert es2.calls[1][1] == "took,items.*.status,items.*.error,items.*._id"        # trimmed + took
+
+
+def test_ndjson_writer_bulk_stats_surfaces_diag_columns(monkeypatch, _no_backoff):
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    responses = [{"errors": True},
+                 {"items": [{"index": {"status": 429}},
+                            {"index": {"status": 400, "_id": "z", "error": {"reason": "bad"}}}], "took": 2},
+                 {"items": [{"index": {"status": 201}}], "took": 1}]      # retry of the 429'd line
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: _RecordingES(responses))
+    writer = make_ndjson_partition_writer(
+        _cfg(id_field=None, chunk_size=500, bulk_stats=True, max_retries_per_doc=3))
+    row = list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b"]})])))[0].iloc[0]
+    assert int(row["docs_retried"]) == 1
+    assert int(row["rejected_429"]) == 1
+    assert int(row["rejected_4xx_other"]) == 1
+    assert int(row["rejected_409"]) == 0 and int(row["rejected_5xx"]) == 0

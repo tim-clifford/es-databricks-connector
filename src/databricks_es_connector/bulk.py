@@ -277,7 +277,39 @@ def _aggregate_gil_wait(lags_ms):
     }
 
 
-def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: list, stats=None) -> None:
+def _reject_bucket(status: int) -> str:
+    """Map a non-2xx per-item status to one of the fixed bulk_stats reject buckets.
+
+    Fixed buckets (not an open histogram) so they fit the single-row mapInPandas summary schema:
+    429 (ES write queue full -> transient backpressure worth retrying), 409 (version conflict), other
+    4xx (permanent, e.g. 400 mapper_parsing), and 5xx (server-side). The split is what tells transient
+    backpressure you can retry apart from permanent rejections you cannot. Delete-404 no-ops are
+    excluded by the caller (they are IGNORED, not a rejection)."""
+    if status == 429:
+        return "rejected_429"
+    if status == 409:
+        return "rejected_409"
+    if 400 <= status < 500:
+        return "rejected_4xx_other"
+    return "rejected_5xx"
+
+
+# The per-partition full-path diagnostics keys (bulk_stats only). MUST match _new_diag()'s keys, the
+# summary_schema bulk_stats columns, and _merge_partition_results._STAT_KEYS.
+_DIAG_KEYS = ("docs_retried", "rejected_429", "rejected_409", "rejected_4xx_other", "rejected_5xx")
+
+
+def _new_diag() -> dict:
+    """Per-partition full-path diagnostics accumulator (bulk_stats only). ZERO on the happy path: it is
+    touched only on the full (errors=True) classify path, so a clean chunk never reaches it. `docs_retried`
+    counts docs re-sent because of a retryable per-item status (429); `rejected_*` count non-2xx, non-
+    ignored item responses by status bucket, tallied on every occurrence so a 429 that later succeeds on
+    retry is still visible as backpressure."""
+    return {k: 0 for k in _DIAG_KEYS}
+
+
+def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: list, stats=None,
+                       diag=None) -> None:
     """Ship one chunk of pre-built NDJSON action lines and tally the outcomes into `counts`.
 
     `lines` is a list where each element is ONE row's action ("header\\nsource"), so es.bulk returns
@@ -421,11 +453,22 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
             return
         # errors true or the flag absent: re-ship in full below to get per-item detail and retry.
 
+    # Full path: re-ship for per-item detail + the per-doc 429 retry. Trim the response with filter_path
+    # so ES returns only status + error (+ _id) per item -- exactly the fields the connector reads -- and
+    # drops the rest of the item metadata (_index/_version/_seq_no/_primary_term/result/_shards). Verified
+    # live: the items array is transparent to filter_path, so the op_type key takes a SINGLE wildcard
+    # (items.*.status, NOT items.*.*.status, which matches nothing and drops the whole array). `took` only
+    # when collecting stats. This shrinks the round-2+ response ES sends back; the fast-path probe is
+    # untouched, so a clean chunk still returns before any of this.
+    # No top-level `errors` here: the full path reads `items` directly and never consults the flag, and
+    # omitting it keeps the full-path filter_path unambiguous vs the probe's "errors".
+    _full_filter_path = ("took,items.*.status,items.*.error,items.*._id" if stats is not None
+                         else "items.*.status,items.*.error,items.*._id")
     pending = list(lines)
     attempt = 0
     while pending:
         try:
-            resp = _send_retrying(pending)
+            resp = _send_retrying(pending, filter_path=_full_filter_path)
         except Exception as _e:  # noqa: BLE001
             # A whole-request transport failure (persistent 429/503, dropped connection) survived the
             # client's transport_max_retries. Record it rather than letting it abort the partition:
@@ -440,6 +483,12 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
         retry_lines = []
         for idx, (op_type, body, ok, outcome) in enumerate(iter_bulk_response_outcomes(items)):
             status = int(body.get("status", 500) or 500)
+            # Reject-bucket accounting (bulk_stats only, full path only): count every non-2xx item that is
+            # a real rejection -- EXCLUDING an IGNORED delete-404 no-op -- by status bucket, BEFORE the
+            # retry decision, so a 429 that later succeeds on retry is still counted as backpressure. A
+            # trivial dict increment on a chunk already decoding items; clean chunks never reach it.
+            if diag is not None and not ok and outcome != IGNORED:
+                diag[_reject_bucket(status)] += 1
             if (not ok and status in cfg.retry_on_doc_status
                     and attempt < cfg.max_retries_per_doc):
                 retry_lines.append(pending[idx])
@@ -454,6 +503,8 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
                 counts["errors"] += 1
                 if len(error_samples) < ERROR_SAMPLE_CAP:
                     error_samples.append(_extract_error_sample(op_type, body))
+        if diag is not None and retry_lines:
+            diag["docs_retried"] += len(retry_lines)   # docs re-sent this round due to a retryable 429
         if not retry_lines:
             return
         attempt += 1
@@ -506,13 +557,14 @@ class _PipelinedShipper:
     """
 
     def __init__(self, es, cfg: EsConfig, pool, counts: dict, error_samples: list, stats=None,
-                 max_inflight=None):
+                 diag=None, max_inflight=None):
         self._es = es
         self._cfg = cfg
         self._pool = pool
         self._counts = counts               # SHARED totals; mutated only on the producer thread
         self._error_samples = error_samples
         self._stats = stats                 # SHARED send-record list (bulk_stats on) or None
+        self._diag = diag                   # SHARED full-path diagnostics dict (bulk_stats on) or None
         self._pending = set()               # outstanding futures, bounded by _max_inflight
         # Keep at most this many sends outstanding. == write_concurrency: the pool can run them all
         # concurrently (no queuing) and memory stays at a few chunks. A larger value would only add
@@ -526,10 +578,12 @@ class _PipelinedShipper:
         local_counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
         local_samples: list = []
         local_stats = [] if self._stats is not None else None
-        _ship_ndjson_chunk(self._es, chunk, self._cfg, local_counts, local_samples, stats=local_stats)
-        return local_counts, local_samples, local_stats
+        local_diag = _new_diag() if self._diag is not None else None
+        _ship_ndjson_chunk(self._es, chunk, self._cfg, local_counts, local_samples,
+                           stats=local_stats, diag=local_diag)
+        return local_counts, local_samples, local_stats, local_diag
 
-    def _merge(self, local_counts, local_samples, local_stats):
+    def _merge(self, local_counts, local_samples, local_stats, local_diag):
         """Fold one completed task's partial into the shared totals. Producer thread only."""
         for k in self._counts:
             self._counts[k] += local_counts[k]
@@ -540,6 +594,10 @@ class _PipelinedShipper:
         # writer), so keep every send record.
         if self._stats is not None and local_stats:
             self._stats.extend(local_stats)
+        # Full-path diagnostics: sum the per-task partials (fixed key set), like counts.
+        if self._diag is not None and local_diag is not None:
+            for k in self._diag:
+                self._diag[k] += local_diag[k]
 
     def _drain_one(self):
         """Wait for at least one outstanding send to finish and merge every send that completed. A
@@ -606,6 +664,9 @@ def make_ndjson_partition_writer(cfg: EsConfig):
         # Per-send timing records for the whole partition, aggregated to fixed-size summary columns
         # below. None (the default) when bulk_stats is off, so the hot path pays nothing.
         stats = [] if cfg.bulk_stats else None
+        # Per-partition full-path diagnostics (429 retry volume + reject buckets). None off bulk_stats
+        # and only touched on the errors=True full path, so clean chunks never pay for it.
+        diag = _new_diag() if cfg.bulk_stats else None
         try:
             # GIL-acquisition-latency gauge for this worker process (bulk_stats only). Started before any
             # send so its samples span the ship window; stopped in the finally. It attributes a slow rtt
@@ -620,7 +681,7 @@ def make_ndjson_partition_writer(cfg: EsConfig):
             if cfg.write_concurrency > 1:
                 from concurrent.futures import ThreadPoolExecutor
                 pool = ThreadPoolExecutor(max_workers=cfg.write_concurrency)
-                shipper = _PipelinedShipper(es, cfg, pool, counts, error_samples, stats=stats)
+                shipper = _PipelinedShipper(es, cfg, pool, counts, error_samples, stats=stats, diag=diag)
             for pdf in iterator:
                 col = pdf["_ndjson"]
                 total_input += len(col)
@@ -645,7 +706,7 @@ def make_ndjson_partition_writer(cfg: EsConfig):
                     else:
                         for i in range(0, len(lines), cfg.chunk_size):
                             _ship_ndjson_chunk(es, lines[i:i + cfg.chunk_size], cfg, counts,
-                                               error_samples, stats=stats)
+                                               error_samples, stats=stats, diag=diag)
             # Join all outstanding sends and merge them BEFORE the summary is built. Re-raises the first
             # worker exception, so a dead worker fails the partition rather than yielding a clean count.
             # Inside the try: a raise here must skip the yield and hit the finally teardown.
@@ -689,6 +750,9 @@ def make_ndjson_partition_writer(cfg: EsConfig):
             agg = _aggregate_bulk_stats(stats)
             agg["partition_wall_ms"] = [partition_wall_ms]
             agg.update(_aggregate_gil_wait(gil_lags))
+            # Full-path diagnostics (429 retry volume + reject buckets), summed over the partition.
+            for k in _DIAG_KEYS:
+                agg[k] = [diag[k]]
             out.update(agg)
         yield pd.DataFrame(out)
 
@@ -767,6 +831,7 @@ def _merge_partition_results(rows) -> dict:
     _STAT_KEYS = ("n_sends", "docs_sent", "bytes_sent", "send_busy_ms", "send_cpu_ms",
                   "partition_wall_ms",
                   "timeout_sends", "timeout_wait_ms", "error_sends", "error_wait_ms",
+                  "docs_retried", "rejected_429", "rejected_409", "rejected_4xx_other", "rejected_5xx",
                   "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
                   "http_ms_mean", "http_ms_p50", "http_ms_p95", "http_ms_max",
                   "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max",
@@ -968,6 +1033,7 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     When `cfg.bulk_stats=True`, the result additionally carries 'bulk_stats': one entry per partition,
     each {n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms,
     timeout_sends, timeout_wait_ms, error_sends, error_wait_ms,
+    docs_retried, rejected_429, rejected_409, rejected_4xx_other, rejected_5xx,
     rtt_ms_mean/p50/p95/max, http_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max,
     gil_wait_ms_total/p50/p95/max, gil_wait_samples}. The round trip splits into three NESTED timings,
     rtt_ms >= http_ms >= took_ms: `rtt_ms` is the full es.bulk wall the client observes; `http_ms` is
@@ -988,6 +1054,14 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     errors still nonzero means timeouts are outliving the budget. Note `n_sends` counts only SUCCESSFUL
     sends, so it can be 0 while `timeout_sends`/`error_sends` are non-zero (a partition whose every send
     failed): a consumer computing per-send ratios (e.g. `docs_sent / n_sends`) must guard a zero `n_sends`.
+
+    `docs_retried` is the number of documents re-sent because Elasticsearch rejected them with a
+    retryable per-item status (429; the whole-request timeout analog is `timeout_sends`). `rejected_429`
+    / `rejected_409` / `rejected_4xx_other` / `rejected_5xx` bucket every non-2xx, non-ignored item
+    response by status, counted on every occurrence -- so a 429 that later succeeds on retry still shows
+    as backpressure -- which distinguishes transient pushback you can retry (429/503) from permanent
+    rejections you cannot (400/409). All of these are populated only on the full (errors) path, so a
+    clean chunk contributes nothing to them.
 
     `send_cpu_ms` and the gil_wait_ms columns diagnose WHY a round trip is slow -- whether it is a real
     socket/ES wait or the worker being starved of the GIL (client-side, but indistinguishable from ES
@@ -1033,6 +1107,8 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
         summary_schema += (", n_sends long, docs_sent long, bytes_sent long, "
                            "send_busy_ms double, send_cpu_ms double, partition_wall_ms double, "
                            "timeout_sends long, timeout_wait_ms double, error_sends long, error_wait_ms double, "
+                           "docs_retried long, rejected_429 long, rejected_409 long, "
+                           "rejected_4xx_other long, rejected_5xx long, "
                            "rtt_ms_mean double, rtt_ms_p50 double, rtt_ms_p95 double, rtt_ms_max double, "
                            "http_ms_mean double, http_ms_p50 double, http_ms_p95 double, http_ms_max double, "
                            "took_ms_mean double, took_ms_p50 double, took_ms_p95 double, took_ms_max double, "
