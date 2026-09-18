@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.9.6)
+# Production Readiness / Known Limitations (0.9.7)
 
 `databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
 bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -54,8 +54,10 @@ Hardening still needed before production for SIEM/audit data:
   hook runs before the raise, which is the seam for this).
 - **Backpressure / concurrency cap.** `mapInPandas` opens one ES client per Spark partition; a
   large Databricks cluster can overrun a modest ES cluster (429s). Per-document retries with
-  exponential backoff (`max_retries_per_doc`, default 3) absorb a transient 429, and a batch that still
-  fails after retries fails the stream. That mitigates the symptom; a **coordinated** throttle
+  exponential backoff (`max_retries_per_doc`, default 3) absorb a transient 429, and a whole-request
+  timeout can likewise be absorbed inside the connector (re-send with backoff) by opting into
+  `retry_transport_timeout` instead of failing the batch; a batch that still fails after retries fails
+  the stream. That mitigates the symptom; a **coordinated** throttle
   (bounding total concurrent writers across executors) is **not built**.
 - **Index templates + ILM / data streams.** The connector writes to a single target index.
   Time-series SIEM data wants an index template + ILM (rollover, retention, tiers) or data streams.
@@ -69,9 +71,12 @@ Hardening still needed before production for SIEM/audit data:
   `make_foreach_batch` raises `EsWriteError` by default (`on_error="raise"`), failing the batch so
   Spark retries it and the offset holds; with `id_field` set that retry is an idempotent upsert.
   Operators who opt into `on_error="log"`/`"ignore"` are accepting **unretried loss** and need external
-  alerting on the `errors`/`unaccounted` counts. Triage note: `ConnectionError`/`ConnectionTimeout`/
-  `SerializationError` are not `ApiError` subclasses, so transport failures propagate and are retried
-  by Spark regardless of policy; the policy governs per-document rejections.
+  alerting on the `errors`/`unaccounted` counts. Triage note: a whole-request transport failure
+  (`ConnectionError`/`ConnectionTimeout`/`SerializationError`, none `ApiError` subclasses) is caught per
+  chunk and counted as `errors` (with a sample), the same as a per-document rejection, so `on_error`
+  governs it too: the default raises and Spark retries the batch, while `log`/`ignore` advance past it.
+  A `ConnectionTimeout` can additionally be re-sent inside the connector first by setting
+  `retry_transport_timeout=True` (whole-chunk re-send with backoff) before it ever counts as an error.
 - **Streaming freshness expectations.** On serverless only `availableNow`/`Once` triggers work, so
   end-to-end latency is job-cadence (≈30s to 2min), not seconds. If a SIEM needs near-real-time, use a
   classic job cluster with `processingTime`, or a Kafka bridge. Set this expectation explicitly.

@@ -27,6 +27,11 @@ def _cfg(**kw):
     return EsConfig(**base)
 
 
+# The full-path (round-2 reship + per-doc retry) filter_path the connector now uses to trim the ES
+# response to just what it reads (mirrors bulk._ship_ndjson_chunk's _full_filter_path, no-stats form).
+_FULL_FP = "items.*.status,items.*.error,items.*._id"
+
+
 class _FakeES:
     """Returns queued canned responses, one per bulk() call. Records the lines it was asked to send."""
     def __init__(self, responses):
@@ -555,7 +560,7 @@ def test_pipelined_shipper_worker_exception_fails_closed(monkeypatch):
     # counts them, so force a raw raise to exercise the re-raise guard itself.
     from databricks_es_connector import bulk as bulk_mod
 
-    def _boom(es, chunk, cfg, counts, samples, stats=None):
+    def _boom(es, chunk, cfg, counts, samples, stats=None, diag=None):
         raise RuntimeError("worker died mid-ship")
 
     monkeypatch.setattr(bulk_mod, "_ship_ndjson_chunk", _boom)
@@ -734,7 +739,7 @@ def test_fast_path_reissues_full_on_error_and_classifies_per_item():
     assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
     assert samples and samples[0]["_id"] == "b" and "boom" in samples[0]["reason"]
     assert es.calls[0] == (["a", "b"], "errors")          # probe first
-    assert es.calls[1] == (["a", "b"], None)              # then full re-ship for detail
+    assert es.calls[1] == (["a", "b"], _FULL_FP)              # then full re-ship for detail
 
 
 def test_fast_path_reissue_still_drives_429_retry():
@@ -747,8 +752,8 @@ def test_fast_path_reissue_still_drives_429_retry():
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(max_retries_per_doc=3), counts, [])
     assert counts["written"] == 3 and counts["errors"] == 0
-    assert es.calls[1] == (["a", "b", "c"], None)         # full re-ship
-    assert es.calls[2] == (["b"], None)                   # only the 429 line retried
+    assert es.calls[1] == (["a", "b", "c"], _FULL_FP)         # full re-ship
+    assert es.calls[2] == (["b"], _FULL_FP)                   # only the 429 line retried
 
 
 def test_fast_path_missing_errors_key_fails_closed():
@@ -757,7 +762,7 @@ def test_fast_path_missing_errors_key_fails_closed():
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, [])
     assert counts["written"] == 2 and counts["errors"] == 0
-    assert len(es.calls) == 2 and es.calls[1] == (["a", "b"], None)
+    assert len(es.calls) == 2 and es.calls[1] == (["a", "b"], _FULL_FP)
 
 
 def test_fast_path_applies_without_id_field():
@@ -786,7 +791,7 @@ def test_fast_path_without_id_field_reships_full_on_error():
     assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
     assert samples and "boom" in samples[0]["reason"]
     assert es.calls[0] == (["a", "b"], "errors")          # probe first
-    assert es.calls[1] == (["a", "b"], None)              # then full re-ship for detail
+    assert es.calls[1] == (["a", "b"], _FULL_FP)              # then full re-ship for detail
 
 
 def test_fast_path_without_id_field_transient_429_reships_whole_chunk_then_retries_line():
@@ -805,8 +810,8 @@ def test_fast_path_without_id_field_transient_429_reships_whole_chunk_then_retri
     _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(id_field=None, max_retries_per_doc=3), counts, [])
     assert counts["written"] == 3 and counts["errors"] == 0
     assert es.calls[0] == (["a", "b", "c"], "errors")     # probe
-    assert es.calls[1] == (["a", "b", "c"], None)         # whole chunk re-shipped (a + c duplicated)
-    assert es.calls[2] == (["b"], None)                   # only the 429'd line retried after that
+    assert es.calls[1] == (["a", "b", "c"], _FULL_FP)         # whole chunk re-shipped (a + c duplicated)
+    assert es.calls[2] == (["b"], _FULL_FP)                   # only the 429'd line retried after that
 
 
 def test_fast_path_disabled_with_deletes():
@@ -819,7 +824,7 @@ def test_fast_path_disabled_with_deletes():
     counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
     _ship_ndjson_chunk(es, ["a", "b"], cfg, counts, [])
     assert counts == {"written": 1, "deleted": 0, "ignored": 1, "errors": 0}
-    assert es.calls == [(["a", "b"], None)]
+    assert es.calls == [(["a", "b"], _FULL_FP)]
 
 
 class _NoGetResponse:
@@ -861,7 +866,7 @@ def test_fast_path_objectapiresponse_error_reships_and_classifies():
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(), counts, samples)
     assert counts == {"written": 1, "deleted": 0, "ignored": 0, "errors": 1}
     assert samples and samples[0]["_id"] == "b"
-    assert es.calls[1] == (["a", "b"], None)
+    assert es.calls[1] == (["a", "b"], _FULL_FP)
 
 
 def test_fast_path_probe_transport_error_counts_errors_not_crash():
@@ -901,11 +906,11 @@ def test_percentile_linear_interpolation():
 
 def test_aggregate_bulk_stats_computes_send_and_latency_summary():
     from databricks_es_connector.bulk import _aggregate_bulk_stats
-    # (docs, bytes, rtt_ms, took_ms, cpu_ms); one send has a None took (ES omitted it) -> excluded
-    # from the took aggregates only. cpu_ms is the worker CPU burned inside es.bulk for that send.
-    agg = _aggregate_bulk_stats([(100, 1000, 10.0, 5.0, 1.0),
-                                 (100, 2000, 20.0, 15.0, 2.0),
-                                 (50, 500, 30.0, None, 3.0)])
+    # (docs, bytes, rtt_ms, took_ms, cpu_ms, http_ms, outcome). All three succeeded ("ok"); one has a
+    # None took (ES omitted it) -> excluded from the took aggregates only. Nested: rtt >= http >= took.
+    agg = _aggregate_bulk_stats([(100, 1000, 10.0, 5.0, 1.0, 8.0, "ok"),
+                                 (100, 2000, 20.0, 15.0, 2.0, 18.0, "ok"),
+                                 (50, 500, 30.0, None, 3.0, 28.0, "ok")])
     assert agg["n_sends"] == [3]
     assert agg["docs_sent"] == [250]           # retries would count again; here 3 distinct sends
     assert agg["bytes_sent"] == [3500]         # 1000 + 2000 + 500 (uncompressed NDJSON)
@@ -913,8 +918,29 @@ def test_aggregate_bulk_stats_computes_send_and_latency_summary():
     assert agg["send_cpu_ms"] == [6.0]         # 1 + 2 + 3 (summed worker CPU inside es.bulk)
     assert agg["rtt_ms_mean"] == [20.0] and agg["rtt_ms_p50"] == [20.0]
     assert agg["rtt_ms_p95"] == [29.0] and agg["rtt_ms_max"] == [30.0]
+    assert agg["http_ms_mean"] == [18.0] and agg["http_ms_max"] == [28.0]   # node HTTP wall (rtt>=http>=took)
     assert agg["took_ms_mean"] == [10.0]       # (5+15)/2, None excluded
     assert agg["took_ms_p50"] == [10.0] and agg["took_ms_max"] == [15.0]
+    assert agg["timeout_sends"] == [0] and agg["timeout_wait_ms"] == [0.0]  # no failed sends here
+    assert agg["error_sends"] == [0] and agg["error_wait_ms"] == [0.0]
+
+
+def test_aggregate_bulk_stats_splits_ok_timeout_and_error_sends():
+    # Failed sends (took/http None) are summarized SEPARATELY so their wall cost is visible; the ok
+    # sends alone drive docs/rtt/http/took. total es.bulk time = send_busy + timeout_wait + error_wait.
+    from databricks_es_connector.bulk import _aggregate_bulk_stats
+    agg = _aggregate_bulk_stats([
+        (100, 1000, 12.0, 5.0, 1.0, 10.0, "ok"),
+        (100, 1000, 300000.0, None, 0.0, None, "timeout"),   # two ~300s timed-out attempts
+        (100, 1000, 300000.0, None, 0.0, None, "timeout"),
+        (50, 500, 40.0, None, 0.0, None, "error"),           # a non-timeout transport failure
+    ])
+    assert agg["n_sends"] == [1]                 # only the successful send
+    assert agg["docs_sent"] == [100] and agg["bytes_sent"] == [1000]
+    assert agg["send_busy_ms"] == [12.0]         # ok rtt only
+    assert agg["rtt_ms_max"] == [12.0]           # timed-out attempts are NOT in the rtt distribution
+    assert agg["timeout_sends"] == [2] and agg["timeout_wait_ms"] == [600000.0]
+    assert agg["error_sends"] == [1] and agg["error_wait_ms"] == [40.0]
 
 
 def test_aggregate_bulk_stats_empty_partition_is_nulls_not_crash():
@@ -924,7 +950,10 @@ def test_aggregate_bulk_stats_empty_partition_is_nulls_not_crash():
     assert agg["bytes_sent"] == [0] and agg["send_busy_ms"] == [0.0]
     assert agg["send_cpu_ms"] == [0.0]
     assert agg["rtt_ms_mean"] == [None] and agg["rtt_ms_max"] == [None]
+    assert agg["http_ms_mean"] == [None] and agg["http_ms_max"] == [None]
     assert agg["took_ms_p95"] == [None]
+    assert agg["timeout_sends"] == [0] and agg["timeout_wait_ms"] == [0.0]
+    assert agg["error_sends"] == [0] and agg["error_wait_ms"] == [0.0]
 
 
 def test_aggregate_gil_wait_summary_and_empty():
@@ -997,10 +1026,11 @@ def test_ship_chunk_records_a_send_on_the_fast_path():
     assert counts["written"] == 2
     assert es.calls == [(["a", "b"], "errors,took")]    # took requested, items still omitted
     assert len(stats) == 1
-    docs, byts, rtt_ms, took_ms, cpu_ms = stats[0]
+    docs, byts, rtt_ms, took_ms, cpu_ms, http_ms, outcome = stats[0]
     assert docs == 2 and took_ms == 7 and rtt_ms >= 0.0
     assert byts == 2          # sum of len("a") + len("b") = uncompressed NDJSON size
     assert cpu_ms >= 0.0      # worker-thread CPU inside es.bulk (thread_time delta), never negative
+    assert outcome == "ok"    # a returned response; a raised send would be "timeout"/"error"
 
 
 def test_ship_chunk_no_stats_and_no_took_when_disabled():
@@ -1023,8 +1053,8 @@ def test_ship_chunk_records_took_on_full_path():
     stats = []
     _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, stats=stats, error_samples=[])
     assert counts["written"] == 2 and len(stats) == 2
-    # re-ship send is (docs, bytes, rtt, took, cpu): took at idx 3, cpu at idx 4.
-    assert stats[-1][0] == 2 and stats[-1][3] == 3 and stats[-1][4] >= 0.0
+    # re-ship send is (docs, bytes, rtt, took, cpu, http, outcome): took at idx 3, cpu at idx 4.
+    assert stats[-1][0] == 2 and stats[-1][3] == 3 and stats[-1][4] >= 0.0 and stats[-1][6] == "ok"
 
 
 def test_pipelined_shipper_merges_stats_across_sends():
@@ -1161,3 +1191,280 @@ def test_fast_path_through_the_writer_counts_all_written(monkeypatch):
     assert int(row["written"]) == 5 and int(row["total_input"]) == 5
     assert int(row["errors"]) == 0
     assert all(fp == "errors" for _ops, fp in es.calls)
+
+
+# =====================================================================================
+# retry_transport_timeout: connector-owned whole-request timeout retry
+#
+# With cfg.retry_transport_timeout on, the write client is built with retry_on_timeout=False (so the
+# transport stops re-sending timed-out bulks silently) and _ship_ndjson_chunk re-sends a timed-out
+# chunk -- ConnectionTimeout ONLY -- up to transport_max_retries times with the same bounded
+# exponential backoff the per-doc loop uses, then falls closed into errors exactly as before. Off by
+# default: a timeout is counted as errors on its first surfaced attempt (today's behavior; the
+# transport owns its own retries). A timed-out re-send re-applies the chunk (idempotent with id_field;
+# a duplicate with auto-ids, accepted at-least-once).
+# =====================================================================================
+
+from elasticsearch import ConnectionTimeout, ConnectionError as _EsConnectionError
+
+
+class _TimeoutThenOkES:
+    """Raises ConnectionTimeout on the first `fail_times` bulk() calls, then returns `ok_response`."""
+    def __init__(self, fail_times, ok_response):
+        self.fail_times = fail_times
+        self.ok_response = ok_response
+        self.calls = 0
+
+    def bulk(self, operations=None, filter_path=None, **kw):
+        self.calls += 1
+        if self.calls <= self.fail_times:
+            raise ConnectionTimeout("read timed out")
+        return self.ok_response
+
+
+class _AlwaysTimeoutES:
+    def __init__(self):
+        self.calls = 0
+
+    def bulk(self, operations=None, filter_path=None, **kw):
+        self.calls += 1
+        raise ConnectionTimeout("read timed out")
+
+
+@pytest.fixture
+def _no_backoff(monkeypatch):
+    # The backoff sleeps are negligible next to a real request_timeout, but must not slow the suite.
+    import time
+    monkeypatch.setattr(time, "sleep", lambda *_a, **_k: None)
+
+
+def test_config_retry_transport_timeout_off_by_default():
+    assert _cfg().retry_transport_timeout is False
+    # Default keeps the transport's own timeout retry, so existing callers are unaffected.
+    assert _cfg().client_kwargs()["retry_on_timeout"] is True
+
+
+def test_retry_transport_timeout_disables_the_transport_timeout_retry():
+    # On => the connector owns it, so the client must NOT also re-send timeouts (no stacking layers).
+    assert _cfg(retry_transport_timeout=True).client_kwargs()["retry_on_timeout"] is False
+    # It overrides an explicit retry_on_timeout=True: the higher-level switch wins, never silent stacking.
+    both = _cfg(retry_transport_timeout=True, retry_on_timeout=True)
+    assert both.client_kwargs()["retry_on_timeout"] is False
+
+
+def test_timeout_not_retried_when_knob_off():
+    # Guard: knob off (default) => a ConnectionTimeout is counted as errors on its first surfaced
+    # attempt, NOT re-sent by the connector. Pins that the feature is genuinely opt-in.
+    es = _AlwaysTimeoutES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, samples)
+    assert es.calls == 1
+    assert counts["errors"] == 2 and counts["written"] == 0
+    assert "ConnectionTimeout" in samples[0]["reason"]
+
+
+def test_timeout_retried_then_succeeds_when_knob_on(_no_backoff):
+    # A ConnectionTimeout re-sends the whole chunk; a later clean response writes every line and the
+    # chunk is NOT an error.
+    es = _TimeoutThenOkES(fail_times=2, ok_response={"errors": False})
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b", "c"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3),
+                       counts, [])
+    assert es.calls == 3                        # 1 initial + 2 retries, then success
+    assert counts == {"written": 3, "deleted": 0, "ignored": 0, "errors": 0}
+
+
+def test_timeout_exhausts_budget_then_fails_closed(_no_backoff):
+    # After transport_max_retries connector retries all time out, fall closed into errors (surfaced via
+    # reconcile), rather than retrying forever or aborting the partition.
+    es = _AlwaysTimeoutES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=2),
+                       counts, samples)
+    assert es.calls == 3                        # 1 initial + 2 retries, all timed out
+    assert counts["errors"] == 2 and counts["written"] == 0
+    assert "ConnectionTimeout" in samples[0]["reason"]
+
+
+def test_timeout_retry_backoff_is_bounded_exponential(monkeypatch):
+    # The backoff between connector retries is the same bounded exponential the per-doc loop uses:
+    # min(2**attempt, 30) for attempts 1, 2, 3 => 2, 4, 8. No unbounded or absent backoff.
+    slept = []
+    import time
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    es = _AlwaysTimeoutES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3),
+                       counts, [])
+    assert slept == [2, 4, 8]
+    assert es.calls == 4                         # 1 initial + 3 retries before the budget is spent
+
+
+def test_timeout_retry_covers_the_full_path_too(_no_backoff):
+    # The retry wraps BOTH the fast-path probe send and the full-path send. A delete-bearing write
+    # skips the fast path and goes straight to the full path, so a timeout there is retried the same.
+    es = _TimeoutThenOkES(fail_times=1, ok_response={"items": [{"delete": {"status": 200}}]})
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    cfg = _cfg(retry_transport_timeout=True, transport_max_retries=2,
+               has_deletes=True, delete_flag_column="d")
+    _ship_ndjson_chunk(es, ["header-only-delete-line"], cfg, counts, [])
+    assert es.calls == 2                          # 1 timeout + 1 success on the full path
+    assert counts["deleted"] == 1 and counts["errors"] == 0
+
+
+def test_non_timeout_transport_error_is_not_retried_even_when_knob_on(_no_backoff):
+    # Allow-list, not deny-list: only ConnectionTimeout is retried. A sibling ConnectionError (which
+    # the transport already retries and then surfaces) still fails closed on its first surfaced attempt,
+    # so a persistent non-timeout failure can't spin in the connector.
+    class _RaisingES:
+        def __init__(self):
+            self.calls = 0
+
+        def bulk(self, operations=None, filter_path=None, **kw):
+            self.calls += 1
+            raise _EsConnectionError("connection reset")
+
+    es = _RaisingES()
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    samples = []
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3),
+                       counts, samples)
+    assert es.calls == 1                          # NOT retried by the connector
+    assert counts["errors"] == 2 and counts["written"] == 0
+    assert "ConnectionError" in samples[0]["reason"]
+
+
+def test_ship_chunk_records_timeout_attempts_in_stats(_no_backoff):
+    # End-to-end: with bulk_stats collecting and retry_transport_timeout on, each timed-out attempt is
+    # recorded (outcome "timeout") and the final success as "ok", so the retry's wall cost is visible
+    # in bulk_stats rather than vanishing inside a hidden transport retry.
+    from databricks_es_connector.bulk import _aggregate_bulk_stats
+    es = _TimeoutThenOkES(fail_times=2, ok_response={"errors": False})
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    stats = []
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(id_field=None, retry_transport_timeout=True, transport_max_retries=3,
+                            bulk_stats=True),
+                       counts, [], stats=stats)
+    assert [s[6] for s in stats] == ["timeout", "timeout", "ok"]
+    assert counts["written"] == 2
+    agg = _aggregate_bulk_stats(stats)
+    assert agg["timeout_sends"] == [2] and agg["n_sends"] == [1]
+    assert agg["timeout_wait_ms"][0] > 0
+
+
+def test_ship_chunk_records_http_ms_from_response_meta():
+    # http_ms is read from resp.meta.duration (elastic_transport node HTTP wall) on a successful send,
+    # sitting between rtt and took. A response with no .meta records http_ms None (no crash).
+    from elastic_transport import ObjectApiResponse, ApiResponseMeta, HttpHeaders
+    meta = ApiResponseMeta(status=200, http_version="1.1", headers=HttpHeaders({}),
+                           duration=0.25, node=None)   # 250 ms node HTTP wall
+
+    class _MetaES:
+        def bulk(self, operations=None, filter_path=None, **kw):
+            return ObjectApiResponse(body={"errors": False, "took": 40}, meta=meta)
+
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    stats = []
+    _ship_ndjson_chunk(_MetaES(), ["a"], _cfg(id_field=None, bulk_stats=True), counts, [], stats=stats)
+    assert len(stats) == 1
+    docs, _bytes, rtt, took, _cpu, http, outcome = stats[0]
+    assert outcome == "ok" and took == 40 and http == 250.0     # took_ms=40 (ES), http_ms=250 (node)
+    assert rtt >= 0.0                                           # real timer around the (instant) mock
+
+
+# =====================================================================================
+# Full-path diagnostics: docs_retried (429 retry volume) + fixed reject buckets, and the trimmed
+# full-path filter_path. All bulk_stats-only and full-path-only (zero on a clean chunk).
+# =====================================================================================
+
+def test_diag_counts_docs_retried_and_reject_buckets(_no_backoff):
+    from databricks_es_connector.bulk import _new_diag
+    # id_field=None fast path: probe errors=True -> full reship carrying 201 / 429(retry->201) / 400 / 409.
+    es = _RecordingES([
+        {"errors": True},
+        {"items": [{"index": {"status": 201}},
+                   {"index": {"status": 429}},
+                   {"index": {"status": 400, "_id": "d3", "error": {"reason": "map"}}},
+                   {"index": {"status": 409, "_id": "d4", "error": {"reason": "conflict"}}}]},
+        {"items": [{"index": {"status": 201}}]},          # retry of the 429'd line succeeds
+    ])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a", "b", "c", "d"],
+                       _cfg(id_field=None, max_retries_per_doc=3), counts, [], diag=diag)
+    assert diag["docs_retried"] == 1          # one 429'd line re-sent
+    assert diag["rejected_429"] == 1          # the 429, counted before the retry
+    assert diag["rejected_4xx_other"] == 1    # the 400
+    assert diag["rejected_409"] == 1          # the 409
+    assert diag["rejected_5xx"] == 0
+    assert counts == {"written": 2, "deleted": 0, "ignored": 0, "errors": 2}
+
+
+def test_diag_zero_on_a_clean_fast_path():
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"errors": False}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), counts, [], diag=diag)
+    assert counts["written"] == 2
+    assert diag == _new_diag()                 # all zero: a clean chunk never touches the full path
+    assert es.calls == [(["a", "b"], "errors")]   # only the probe, no full reship
+
+
+def test_diag_5xx_bucket_and_delete_404_not_counted(_no_backoff):
+    # 503 -> rejected_5xx; a delete-404 is an expected no-op (IGNORED) and must NOT count as a rejection.
+    from databricks_es_connector.bulk import _new_diag
+    from databricks_es_connector.config import EsWriteConfig
+    cfg = EsWriteConfig(hosts="https://h:9200", basic_auth=("u", "p"), index="i", id_field="id",
+                        require_existing_index=False, has_deletes=True, delete_flag_column="d")
+    es = _RecordingES([{"items": [{"delete": {"status": 404}},
+                                  {"index": {"status": 503, "_id": "x", "error": {"reason": "unavail"}}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["del", "idx"], cfg, counts, [], diag=diag)
+    assert diag["rejected_5xx"] == 1
+    assert diag["rejected_429"] == 0 and diag["rejected_4xx_other"] == 0 and diag["rejected_409"] == 0
+    assert diag["docs_retried"] == 0           # 503 is not retryable by default (retry_on_doc_status=(429,))
+    assert counts["ignored"] == 1 and counts["errors"] == 1   # delete-404 ignored; 503 an error
+
+
+def test_full_path_uses_trimmed_filter_path_with_and_without_stats():
+    # The full-path reship trims the ES response; the probe stays "errors"-only. Without stats the
+    # trim omits took; with stats it prepends took.
+    es = _RecordingES([{"errors": True},
+                       {"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}])
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(id_field=None), {"written": 0, "deleted": 0, "ignored": 0,
+                                                             "errors": 0}, [])
+    assert es.calls[0][1] == "errors"                                        # probe unchanged
+    assert es.calls[1][1] == "items.*.status,items.*.error,items.*._id"      # trimmed, no took
+
+    es2 = _RecordingES([{"errors": True, "took": 1},
+                        {"items": [{"index": {"status": 201}}, {"index": {"status": 201}}], "took": 2}])
+    _ship_ndjson_chunk(es2, ["a", "b"], _cfg(id_field=None), {"written": 0, "deleted": 0, "ignored": 0,
+                                                              "errors": 0}, [], stats=[])
+    assert es2.calls[0][1] == "errors,took"                                          # probe (stats)
+    assert es2.calls[1][1] == "took,items.*.status,items.*.error,items.*._id"        # trimmed + took
+
+
+def test_ndjson_writer_bulk_stats_surfaces_diag_columns(monkeypatch, _no_backoff):
+    pd = pytest.importorskip("pandas")
+    import elasticsearch
+    responses = [{"errors": True},
+                 {"items": [{"index": {"status": 429}},
+                            {"index": {"status": 400, "_id": "z", "error": {"reason": "bad"}}}], "took": 2},
+                 {"items": [{"index": {"status": 201}}], "took": 1}]      # retry of the 429'd line
+    monkeypatch.setattr(elasticsearch, "Elasticsearch", lambda **kw: _RecordingES(responses))
+    writer = make_ndjson_partition_writer(
+        _cfg(id_field=None, chunk_size=500, bulk_stats=True, max_retries_per_doc=3))
+    row = list(writer(iter([pd.DataFrame({"_ndjson": ["a", "b"]})])))[0].iloc[0]
+    assert int(row["docs_retried"]) == 1
+    assert int(row["rejected_429"]) == 1
+    assert int(row["rejected_4xx_other"]) == 1
+    assert int(row["rejected_409"]) == 0 and int(row["rejected_5xx"]) == 0

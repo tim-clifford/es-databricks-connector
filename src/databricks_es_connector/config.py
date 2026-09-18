@@ -45,6 +45,12 @@ One asymmetry worth knowing before raising the umbrella: per-document retries sl
 executor with exponential backoff (elasticsearch-py: 2s, doubling, capped at 600s), so
 `max_retries=8` is up to ~8.5 minutes of sleep per partition, while the same value costs the
 transport layer almost nothing. Prefer the granular form when you need a high transport count.
+
+A third, OPT-IN behavior sits beside these two layers: `EsWriteConfig.retry_transport_timeout` moves
+the whole-REQUEST timeout retry out of the transport and into the connector, so a timed-out bulk is
+re-sent with backoff from connector code instead of being re-sent invisibly by the transport and then
+failing the write. It reuses `transport_max_retries` as its budget and leaves connection-reset and
+429/503 retries with the transport. See that field.
 """
 from __future__ import annotations
 
@@ -150,6 +156,24 @@ class EsWriteConfig(EsConnection):
     max_retries_per_doc: int = 3
     retry_on_doc_status: tuple = (429,)     # per-doc statuses worth retrying (429 = ES queue full)
 
+    # Whole-REQUEST timeout retries, owned by the connector instead of the transport. A bulk send that
+    # exceeds request_timeout raises ConnectionTimeout; by default (retry_on_timeout=True) elasticsearch-py
+    # re-sends the WHOLE request up to transport_max_retries times, immediately (no backoff) and invisibly
+    # to bulk_stats and the error counts, so a slow send can burn (1 + transport_max_retries) * request_timeout
+    # before a surfaced timeout fails the write (task/batch) and Spark re-runs everything -- a latency-bound
+    # pipeline then falls further behind. Set True to move that retry INTO the connector: the write client
+    # is built with retry_on_timeout=False (this knob takes precedence over the retry_on_timeout field
+    # below), and bulk._ship_ndjson_chunk re-sends a timed-out chunk up to transport_max_retries times with
+    # exponential backoff -- in connector code with a bounded budget, not the transport's hidden immediate
+    # re-sends -- before falling closed into errors exactly as before.
+    # request_timeout is NOT shortened. Only ConnectionTimeout is retried this way; connection resets
+    # (ConnectionError) and 429/502/503/504 on the bulk call itself stay with the transport, and every other
+    # error still fails closed on its first attempt. A timed-out send is an UNKNOWN outcome, so the re-send
+    # re-applies the chunk: with id_field an idempotent upsert (safe); with auto-generated ids a re-create,
+    # which DUPLICATES (at-least-once) -- the same trade-off as the fast-path reship and as the default
+    # retry_on_timeout=True already carries today. Off by default; opt in per write.
+    retry_transport_timeout: bool = False
+
     # Diagnostics: when True, time every individual `es.bulk` send and surface PER-PARTITION
     # aggregates (send count, docs/send, and client round-trip vs ES `took` distributions) on the
     # result dict under `bulk_stats`, so a caller can see where the DBR<->ES round trip goes without
@@ -239,6 +263,14 @@ class EsWriteConfig(EsConnection):
         kw = super().client_kwargs()
         if self.write_concurrency > 1:
             kw["connections_per_node"] = self.write_concurrency
+        # When the connector owns whole-request timeout retries (retry_transport_timeout), disable the
+        # transport's own timeout re-sends so the two layers do not stack (each transport re-send waits a
+        # full request_timeout, invisibly). This deliberately OVERRIDES the retry_on_timeout field:
+        # retry_transport_timeout is the higher-level switch and moving the retry into the connector is the
+        # whole point. Non-timeout transport retries (ConnectionError, and the retry_on_status codes
+        # 429/502/503/504) are unaffected -- they keep firing up to transport_max_retries at the transport.
+        if self.retry_transport_timeout:
+            kw["retry_on_timeout"] = False
         return kw
 
 

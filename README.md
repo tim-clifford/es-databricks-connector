@@ -263,18 +263,32 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   from your own pipeline, the connector does not persist them.
 - **`bulk_stats` is opt-in diagnostics, absent by default.** With `EsWriteConfig(bulk_stats=True)`,
   the result carries an extra `bulk_stats` key: a list with one entry per write partition, each
-  `{n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms,
-  rtt_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max, gil_wait_ms_total/p50/p95/max, gil_wait_samples}`.
-  `rtt_ms` is the full client-observed round trip per `_bulk`; `took_ms` is Elasticsearch's own reported
-  service time, so `rtt − took` is network/queue overhead and `docs_sent / n_sends` is the real
-  docs-per-bulk. `send_cpu_ms` and `gil_wait_ms_*` diagnose WHY a round trip is slow: `send_cpu_ms` is
+  `{n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms, timeout_sends,
+  timeout_wait_ms, error_sends, error_wait_ms, docs_retried, rejected_429, rejected_409,
+  rejected_4xx_other, rejected_5xx, rtt_ms_mean/p50/p95/max, http_ms_mean/p50/p95/max,
+  took_ms_mean/p50/p95/max, gil_wait_ms_total/p50/p95/max, gil_wait_samples}`.
+  The round trip splits into three **nested** timings, `rtt_ms ≥ http_ms ≥ took_ms`: `rtt_ms` is the full
+  client-observed `_bulk` wall; `http_ms` is `elastic_transport`'s node-level HTTP wall (request gzip +
+  network + ES + response read); `took_ms` is Elasticsearch's own service time. So `rtt − http` is the
+  client layer above the node (response decode + dispatch + GIL, what the fast path avoids), `http − took`
+  is compression + network transit, and `took` is ES itself; `docs_sent / n_sends` is the real docs-per-bulk.
+  `send_cpu_ms` and `gil_wait_ms_*` diagnose WHY a round trip is slow: `send_cpu_ms` is
   the CPU each worker actually burned inside `_bulk`, so `send_busy_ms − send_cpu_ms` is the off-CPU send
   time, and `gil_wait_ms_*` (from a background probe measuring how long a runnable thread waited to
   re-acquire the GIL) says whether that off-CPU time is a genuine socket/ES wait (`gil_wait_ms` near
   zero while `rtt_ms` is high) or client-side GIL starvation (`gil_wait_ms_total` a large share of
   `partition_wall_ms`, meaning a high `write_concurrency` is contending on the interpreter rather than
-  overlapping I/O). The key is **absent** when `bulk_stats` is off, so the core result shape above is
-  unchanged.
+  overlapping I/O). All of those are over **successful** sends; the sends that **raised** are summarized
+  by `timeout_sends`/`timeout_wait_ms` (a `ConnectionTimeout`, e.g. the wall cost of
+  [`retry_transport_timeout`](#write-behavior-eswriteconfig) re-sends) and `error_sends`/`error_wait_ms`
+  (any other transport error), so total time in `_bulk` = `send_busy_ms + timeout_wait_ms + error_wait_ms`
+  and none of it is hidden. `docs_retried` is the number of documents re-sent because of a retryable
+  per-item **429** (the item-level analog of `timeout_sends`), and `rejected_429` / `rejected_409` /
+  `rejected_4xx_other` / `rejected_5xx` bucket every non-2xx, non-ignored item response by status (counted
+  on every occurrence, so a 429 that later succeeds on retry still shows), which separates transient
+  backpressure you can retry (429/503) from permanent rejections you cannot (400/409). These are populated
+  only on the full (errors) path, so a clean chunk contributes nothing. The key is **absent** when
+  `bulk_stats` is off, so the core result shape above is unchanged.
 - **Duplicate `id_field` values collapse, and reconciliation won't flag it.** If `id_field` is
   set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
   over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
@@ -470,7 +484,7 @@ These fields are defined on the `EsConnection` base and accepted by both `EsWrit
 | `request_timeout` | `int` | `60` | No | Per-request timeout (seconds). |
 | `transport_max_retries` | `int` | `3` | No | Retries for a whole **HTTP request**: a connection reset, a load-balancer 503, a gateway timeout, or a 429 on the bulk call itself. Re-sends the entire request. Does **not** retry an individual rejected document, see [Retries on a write](#retries-on-a-write-two-layers). |
 | `max_retries` | `int` | - | No | Shorthand that sets **both** retry levels at once: `transport_max_retries` and [`max_retries_per_doc`](#write-behavior-eswriteconfig). Cannot be combined with either of those (raises). Reading `cfg.max_retries` back gives the shared number, or `None` if the levels were set to different values. |
-| `retry_on_timeout` | `bool` | `True` | No | Whether a **timed-out** request is retried. Narrower than it sounds: connection errors and the `retry_on_status` codes are retried regardless, so setting this `False` only stops retries on timeouts. It is separate because a timeout is ambiguous, the write may have been applied and only the response lost, so replaying it is a judgment call. To disable transport retries entirely, use `transport_max_retries=0`. |
+| `retry_on_timeout` | `bool` | `True` | No | Whether a **timed-out** request is retried. Narrower than it sounds: connection errors and the `retry_on_status` codes are retried regardless, so setting this `False` only stops retries on timeouts. It is separate because a timeout is ambiguous, the write may have been applied and only the response lost, so replaying it is a judgment call. To disable transport retries entirely, use `transport_max_retries=0`. Forced `False` when [`retry_transport_timeout`](#write-behavior-eswriteconfig) is set, since the connector then owns timeout retries. |
 
 \* **Auth is required**: you must set exactly one of `api_key` or `basic_auth`, or the
 constructor raises `ValueError`. Setting `ca_certs` together with `verify_certs=False` also
@@ -493,8 +507,9 @@ per-document level, and `max_retries=N` sets both at once, see
 | `write_concurrency` | `int` | `1` | No | How many `_bulk` requests run **in parallel within a single partition**. `1` (default) ships a partition's chunks serially, so write concurrency across the cluster is just the partition count. Raise it when the write is **latency-bound** — executors idle waiting on each bulk's ES round-trip, with CPU *and* network both under-utilized — rather than CPU- or bandwidth-bound; each partition then keeps that many `chunk_size` sends **continuously in flight**, fed across Arrow-batch boundaries (a slow round-trip ties up one slot instead of stalling the whole partition), with the same per-document retry, so error accounting is unchanged. Per-send size is governed by `chunk_size` alone (bounded above by the Spark Arrow batch), independent of `write_concurrency`. Total requests hitting ES at once = (running partitions) × `write_concurrency`; raise it gradually and watch for 429s (if they climb, the ES cluster is the ceiling, not the client). Costs one executor thread per unit and up to `write_concurrency` chunks of in-flight docs per partition. |
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
 | `retry_on_doc_status` | `tuple` | `(429,)` | No | Which per-document statuses to retry. `429` is ES's write queue being full, the one reliably transient case. Adding `503` (a shard briefly unavailable, e.g. during relocation) is the main sensible extension: `retry_on_doc_status=(429, 503)`. Do **not** add deterministic statuses like `400` (malformed doc) or `409` (version conflict): the retry fails identically and only delays the real error. Empty with a non-zero `max_retries_per_doc` raises. |
+| `retry_transport_timeout` | `bool` | `False` | No | Opt in to have the **connector** retry a whole-request **timeout** rather than the transport. A bulk exceeding `request_timeout` raises `ConnectionTimeout`; by default `elasticsearch-py` re-sends the whole request up to `transport_max_retries` times immediately and invisibly, and a surfaced timeout then fails the write, so a latency-bound stream falls behind on Spark's re-run. `True` builds the write client with `retry_on_timeout=False` (so the two layers don't stack) and re-sends a timed-out chunk — only on `ConnectionTimeout` — up to `transport_max_retries` times with bounded exponential backoff, in connector code, before falling closed into errors as before. `request_timeout` is **not** shortened. A timed-out re-send re-applies the chunk: idempotent with `id_field`, a **duplicate** with auto-generated ids (at-least-once, accepted). See [Retries on a write](#retries-on-a-write-two-layers). |
 | `require_existing_index` | `bool` | `True` | No | Verify the index exists before writing. ES auto-creates a missing index, so a **typo'd index name** otherwise produces a brand-new dynamically-mapped index and a perfect-looking `written` count. One `indices.exists` call on the driver. Set `False` to allow auto-creation (e.g. with an index template). |
-| `bulk_stats` | `bool` | `False` | No | Diagnostics: collect per-`_bulk` send stats and return them under an extra `bulk_stats` key in the write result (see [The write result](#the-write-result-bulk_write-return-value)), one entry per write partition. Each carries `n_sends`, `docs_sent`, `bytes_sent`, `send_busy_ms`, `send_cpu_ms`, `partition_wall_ms`, the round-trip `rtt_ms_*` and ES-reported `took_ms_*` (mean/p50/p95/max), and `gil_wait_ms_*` + `gil_wait_samples`. `rtt_ms − took_ms` is the network/queue overhead and `docs_sent / n_sends` is the real docs-per-bulk, so it answers whether a write is bound on ES service time, the network, or the client. `send_cpu_ms` plus the `gil_wait_ms_*` probe separate a slow round trip that is a genuine socket/ES wait from one inflated by GIL starvation under a high `write_concurrency` (see [The write result](#the-write-result-bulk_write-return-value)). On the happy path it adds `took` to the `filter_path`, so the cost is one small extra timing per request plus a lightweight background probe thread; **off by default** (zero overhead and the result key absent when unset). |
+| `bulk_stats` | `bool` | `False` | No | Diagnostics: collect per-`_bulk` send stats and return them under an extra `bulk_stats` key in the write result (see [The write result](#the-write-result-bulk_write-return-value)), one entry per write partition. Each carries `n_sends`, `docs_sent`, `bytes_sent`, `send_busy_ms`, `send_cpu_ms`, `partition_wall_ms`, the failed-send counters `timeout_sends`/`timeout_wait_ms` and `error_sends`/`error_wait_ms`, the retry/reject counters `docs_retried` (docs re-sent for a 429) and `rejected_429`/`rejected_409`/`rejected_4xx_other`/`rejected_5xx` (non-2xx item responses by status), the three nested round-trip distributions `rtt_ms_* ≥ http_ms_* ≥ took_ms_*` (mean/p50/p95/max), and `gil_wait_ms_*` + `gil_wait_samples`. `rtt − http` is the client layer above the node, `http − took` is compression + network, and `took` is ES service, so it answers whether a write is bound on ES, the network, client-side decode/GIL, or timeout retries. `send_cpu_ms` plus the `gil_wait_ms_*` probe separate a slow round trip that is a genuine socket/ES wait from one inflated by GIL starvation under a high `write_concurrency` (see [The write result](#the-write-result-bulk_write-return-value)). On the happy path it adds `took` to the `filter_path`, so the cost is one small extra timing per request plus a lightweight background probe thread; **off by default** (zero overhead and the result key absent when unset). |
 
 #### Retries on a write: two layers
 
@@ -530,6 +545,16 @@ effective value is never in doubt.
 backoff (2s, doubling, capped at 600s), so `8` can stall a partition for ~8.5 minutes. The transport
 layer has no such cost, so if you want many transport retries, set the two levels separately rather
 than raising `max_retries`.
+
+**Timeout retries: transport or connector.** By default a whole-request timeout is retried by the
+transport (`retry_on_timeout`, immediate, up to `transport_max_retries`), and a timeout that outlives
+those retries fails the write. Set `retry_transport_timeout=True` to move that retry into the connector:
+the client is built with `retry_on_timeout=False` (no stacking) and a timed-out chunk is re-sent with
+bounded exponential backoff up to `transport_max_retries` times before it counts as an error. Only
+`ConnectionTimeout` is handled this way; connection resets and `429/503` stay with the transport. Use
+it for a latency-bound pipeline where failing the batch and re-running it costs more than re-sending the
+slow chunk. With auto-generated ids a re-send duplicates (at-least-once); with `id_field` it is an
+idempotent upsert.
 
 **Doc shaping**
 
