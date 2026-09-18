@@ -985,7 +985,9 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     spent in es.bulk = send_busy_ms + timeout_wait_ms + error_wait_ms and none of it is hidden.
     `timeout_wait_ms` is the wall cost of connector-owned timeout retries (see `retry_transport_timeout`):
     a non-zero value with a low final error count means retries are landing the data; a large value with
-    errors still nonzero means timeouts are outliving the budget.
+    errors still nonzero means timeouts are outliving the budget. Note `n_sends` counts only SUCCESSFUL
+    sends, so it can be 0 while `timeout_sends`/`error_sends` are non-zero (a partition whose every send
+    failed): a consumer computing per-send ratios (e.g. `docs_sent / n_sends`) must guard a zero `n_sends`.
 
     `send_cpu_ms` and the gil_wait_ms columns diagnose WHY a round trip is slow -- whether it is a real
     socket/ES wait or the worker being starved of the GIL (client-side, but indistinguishable from ES
