@@ -61,3 +61,35 @@ def test_write_delete_validation_still_enforced_on_write_config():
     with pytest.raises(ValueError, match="delete_flag_column"):
         EsWriteConfig(hosts="https://h:9200", api_key="k", index="i",
                       id_field="doc_id", has_deletes=True)
+
+
+def test_op_type_defaults_to_index():
+    # Default preserves today's behavior (index/upsert); create is strictly opt-in.
+    assert EsWriteConfig(hosts="https://h:9200", api_key="k", index="i").op_type == "index"
+
+
+def test_op_type_allow_list_rejects_unknown():
+    # Fail closed on a typo rather than emitting a bogus _bulk action ES would reject wholesale.
+    with pytest.raises(ValueError, match="op_type must be 'index' or 'create'"):
+        EsWriteConfig(hosts="https://h:9200", api_key="k", index="i",
+                      id_field="doc_id", op_type="upsert")
+
+
+def test_op_type_create_requires_id_field():
+    # create without an explicit _id never conflicts, so it would be index with extra steps and no dedup.
+    with pytest.raises(ValueError, match="op_type='create' requires id_field"):
+        EsWriteConfig(hosts="https://h:9200", api_key="k", index="i", op_type="create")
+
+
+def test_op_type_create_incompatible_with_deletes():
+    # A feed that issues deletes is not append-only.
+    with pytest.raises(ValueError, match="op_type='create' is incompatible with has_deletes"):
+        EsWriteConfig(hosts="https://h:9200", api_key="k", index="i", id_field="doc_id",
+                      op_type="create", has_deletes=True, delete_flag_column="d")
+
+
+def test_op_type_create_valid_with_id_field():
+    # The happy config: append-only feed with an explicit _id.
+    cfg = EsWriteConfig(hosts="https://h:9200", api_key="k", index="i", id_field="doc_id",
+                        op_type="create")
+    assert cfg.op_type == "create"

@@ -1,4 +1,4 @@
-# Production Readiness / Known Limitations (0.9.7)
+# Production Readiness / Known Limitations (0.10.0)
 
 `databricks-es-connector` proves the **mechanism** in both directions: serverless Databricks can
 bulk-write to Elasticsearch with gzip compression (measured ~7x on event-log NDJSON) and idempotent
@@ -96,6 +96,14 @@ Hardening still needed before production for SIEM/audit data:
   test that claims to validate mapping must read indexed values (`fields`, an aggregation, or
   `GET /_mapping`). Pre-creating explicit mappings is the real fix; an acceptance test should assert
   on the indexed value rather than on a `read_index` round-trip.
+- **Append-only feeds.** For a feed that only ever inserts (never updates an existing `_id`), set
+  `op_type="create"`: the connector ships `create` bulk actions and treats the `409` a duplicate `_id`
+  returns as an expected no-op (counted in `ignored`, surfaced as `docs_deduped` under `bulk_stats`),
+  not an error. That gives true idempotency on resend (a redelivered doc is neither overwritten nor
+  duplicated) and lets ES use its cheaper append path. It requires `id_field`, is incompatible with
+  `has_deletes`, and must NOT be used where a legitimate update to an existing `_id` can occur (the
+  update would be silently absorbed as a 409). This is distinct from the out-of-order-clobber problem
+  below, which `create` does not solve.
 - **Updates & deletes.** Inserts/upserts via deterministic `_id`, and deletes via `has_deletes` +
   `delete_flag_column` (emitting delete-by-`_id` bulk actions with scoped 404 no-op suppression),
   are supported. The delete flag must be a real **BooleanType** column (routing is done in Catalyst

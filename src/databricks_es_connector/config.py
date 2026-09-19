@@ -207,6 +207,23 @@ class EsWriteConfig(EsConnection):
     has_deletes: bool = False
     delete_flag_column: Optional[str] = None  # boolean column: true => delete this _id
 
+    # --- write op type: index (default) vs create ---
+    # The `_bulk` action used for every NON-delete row. "index" (default) upserts by _id, so a resend
+    # overwrites the existing doc. "create" appends only: Elasticsearch rejects a write whose _id
+    # already exists with a 409, which the connector then treats as an expected no-op -- counted as
+    # `ignored` (never an error) and surfaced distinctly as `docs_deduped` under bulk_stats. That gives
+    # an APPEND-ONLY feed true idempotency on resend (a redelivered doc is neither overwritten, as
+    # "index" would, nor duplicated) and lets Elasticsearch take its cheaper append path (Lucene
+    # addDocument, no delete-by-_id term) instead of the update path.
+    # Use ONLY for feeds that never legitimately UPDATE an existing _id: under "create" a real update to
+    # an already-indexed doc is silently absorbed as a 409 no-op. Requires id_field (a create without an
+    # explicit _id can never conflict, so it would be "index" with extra steps and no dedup) and is
+    # incompatible with has_deletes (a feed that deletes is not append-only). Auto-id feeds gain nothing
+    # here (ES already appends known-unique ids) and must stay "index". A 409 on an "index" op (an
+    # external version conflict) stays a hard error; only create+409 is the benign no-op. See
+    # bulk.classify_bulk_result and spark_serialize.build_ndjson.
+    op_type: str = "index"
+
     def __post_init__(self):
         super().__post_init__()
         if self.max_retries_per_doc < 0:
@@ -250,6 +267,21 @@ class EsWriteConfig(EsConnection):
         # The remaining delete requirement -- delete_flag_column must be a real BooleanType column, so
         # build_ndjson can route it in Catalyst via `flag === true` -- needs the DataFrame schema, so
         # it is enforced in bulk._preflight (driver-side, once), not here where only field values exist.
+        # op_type governs the non-delete action. Allow-list it (a typo fails closed here rather than
+        # emitting a bogus _bulk action ES rejects wholesale), and enforce the two invariants that make
+        # "create" both meaningful and safe.
+        if self.op_type not in ("index", "create"):
+            raise ValueError(f"op_type must be 'index' or 'create', got {self.op_type!r}")
+        if self.op_type == "create":
+            if self.id_field is None:
+                raise ValueError(
+                    "op_type='create' requires id_field: without an explicit _id a create never "
+                    "conflicts, so it would be 'index' with extra steps and no dedup. Set id_field, or "
+                    "use op_type='index'.")
+            if self.has_deletes:
+                raise ValueError(
+                    "op_type='create' is incompatible with has_deletes: a feed that issues deletes is "
+                    "not append-only. Use op_type='index' for delete-bearing feeds.")
 
     def client_kwargs(self) -> dict:
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.

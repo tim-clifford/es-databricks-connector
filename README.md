@@ -224,7 +224,7 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   "written": 998,          # index/upsert ops that succeeded
   "deleted": 0,            # successful delete-by-id ops (non-zero only with has_deletes)
   "errors": 2,             # docs Elasticsearch rejected (exact count)
-  "ignored": 0,            # delete-404 no-ops (deleting an already-absent doc: expected)
+  "ignored": 0,            # expected no-ops: delete-404s, plus create-409 dedups under op_type="create"
   "coerced_nonfinite": 0,  # always 0 (see below): non-finite floats become null in Spark, uncounted
   "total_input": 1000,     # rows handed to the writer
   "unaccounted": 0,        # rows that produced NO per-document outcome (loss below that level)
@@ -239,8 +239,8 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
 - **`unaccounted` is the reconciliation check, pre-computed.** Every input row yields exactly one of
   `written`/`deleted`/`errors`/`ignored`, so any shortfall means rows vanished below the per-document
   level (e.g. a chunk-level serialization/transport error) where the `errors` count structurally
-  cannot see them. `ignored` is part of the identity precisely so an expected delete-404 no-op does
-  not masquerade as loss. `bulk_write(df, cfg, raise_on_error=True)` (or `reconcile_or_raise(result)`)
+  cannot see them. `ignored` is part of the identity precisely so an expected no-op (a delete-404, or
+  a create-409 dedup under `op_type="create"`) does not masquerade as loss. `bulk_write(df, cfg, raise_on_error=True)` (or `reconcile_or_raise(result)`)
   turns both signals into an `EsWriteError`; the streaming path does this by default.
 - **`overcounted` should always be 0.** It counts the reverse discrepancy, more per-document outcomes
   than input rows, which is impossible by construction and so indicates a counting bug in this
@@ -265,7 +265,7 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   the result carries an extra `bulk_stats` key: a list with one entry per write partition, each
   `{n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms, timeout_sends,
   timeout_wait_ms, error_sends, error_wait_ms, docs_retried, rejected_429, rejected_409,
-  rejected_4xx_other, rejected_5xx, rtt_ms_mean/p50/p95/max, http_ms_mean/p50/p95/max,
+  rejected_4xx_other, rejected_5xx, docs_deduped, rtt_ms_mean/p50/p95/max, http_ms_mean/p50/p95/max,
   took_ms_mean/p50/p95/max, gil_wait_ms_total/p50/p95/max, gil_wait_samples}`.
   The round trip splits into three **nested** timings, `rtt_ms ≥ http_ms ≥ took_ms`: `rtt_ms` is the full
   client-observed `_bulk` wall; `http_ms` is `elastic_transport`'s node-level HTTP wall (request gzip +
@@ -286,9 +286,12 @@ authoritative with ES external versioning (`version` = `event_ts` epoch-millis,
   per-item **429** (the item-level analog of `timeout_sends`), and `rejected_429` / `rejected_409` /
   `rejected_4xx_other` / `rejected_5xx` bucket every non-2xx, non-ignored item response by status (counted
   on every occurrence, so a 429 that later succeeds on retry still shows), which separates transient
-  backpressure you can retry (429/503) from permanent rejections you cannot (400/409). These are populated
-  only on the full (errors) path, so a clean chunk contributes nothing. The key is **absent** when
-  `bulk_stats` is off, so the core result shape above is unchanged.
+  backpressure you can retry (429/503) from permanent rejections you cannot (400/409). `docs_deduped`
+  counts create-409 append-only dedups (an `op_type="create"` resend whose `_id` already existed): a
+  benign no-op, tracked separately from a genuine `rejected_409` conflict so you can watch how many
+  resends a feed is absorbing. These are populated only on the full (errors) path, so a clean chunk
+  contributes nothing. The key is **absent** when `bulk_stats` is off, so the core result shape above is
+  unchanged.
 - **Duplicate `id_field` values collapse, and reconciliation won't flag it.** If `id_field` is
   set and two input rows share the same id, the deterministic `_id` makes the later row **upsert
   over** the earlier one, so ES ends up with fewer documents than rows you sent. Every op reports
@@ -503,6 +506,7 @@ per-document level, and `max_retries=N` sets both at once, see
 |-------|------|---------|----------|-------|
 | `index` | `str` | `""` | **Yes** | Target index. `bulk_write` raises if empty. |
 | `id_field` | `str \| None` | `None` | No | Column used as the deterministic `_id` → idempotent upserts. If unset, ES assigns random IDs, so a retry duplicates the row rather than overwriting it (at-least-once). This includes a Spark/stream replay **and**, within one write, any bulk in which some documents fail: the connector re-sends the whole bulk to classify the failures, re-creating the documents that had already succeeded in it. That covers a permanent rejection **and a transient, retryable `429` (routine ES backpressure)** — so under load an auto-id bulk that hits a single 429 is re-sent whole and its good documents are duplicated (with `id_field` set the re-send is an idempotent upsert instead). Set `id_field` for idempotent (exactly-once) upserts. If set, the column must **exist** (`bulk_write` raises before writing) and be non-null in every row. |
+| `op_type` | `str` | `"index"` | No | The `_bulk` action for non-delete rows. `"index"` upserts by `_id` (a resend **overwrites** the existing doc). `"create"` appends only: ES answers a write whose `_id` already exists with a **409**, which the connector treats as an expected **no-op** (counted in `ignored`, surfaced as `docs_deduped` under `bulk_stats`) rather than an error — giving an **append-only** feed true idempotency on resend (a redelivered doc is neither overwritten nor duplicated) and letting ES take its cheaper append path (Lucene `addDocument`, no delete-by-`_id`). Use **only** where the feed never legitimately **updates** an existing `_id`: under `"create"` a real update is silently absorbed as a 409 no-op. Requires `id_field` (a create without an explicit `_id` never conflicts) and is incompatible with `has_deletes` (a feed that deletes is not append-only); auto-id feeds gain nothing (ES already appends known-unique ids) and must stay `"index"`. A 409 on an `"index"` op (an external version conflict) stays a hard error. |
 | `chunk_size` | `int` | `500` | No | How many documents the connector groups into each `_bulk` HTTP request (the `N` in [Retries on a write](#retries-on-a-write-two-layers)). A chunk is also flushed early if it first reaches 100 MB (elasticsearch-py's `max_chunk_bytes` default, which matches Elasticsearch's own `http.max_content_length` request ceiling). Larger values mean fewer, bigger requests (higher throughput but more executor memory per request); smaller values mean more, smaller requests. `500` suits most workloads; lower it for very large documents. |
 | `write_concurrency` | `int` | `1` | No | How many `_bulk` requests run **in parallel within a single partition**. `1` (default) ships a partition's chunks serially, so write concurrency across the cluster is just the partition count. Raise it when the write is **latency-bound** — executors idle waiting on each bulk's ES round-trip, with CPU *and* network both under-utilized — rather than CPU- or bandwidth-bound; each partition then keeps that many `chunk_size` sends **continuously in flight**, fed across Arrow-batch boundaries (a slow round-trip ties up one slot instead of stalling the whole partition), with the same per-document retry, so error accounting is unchanged. Per-send size is governed by `chunk_size` alone (bounded above by the Spark Arrow batch), independent of `write_concurrency`. Total requests hitting ES at once = (running partitions) × `write_concurrency`; raise it gradually and watch for 429s (if they climb, the ES cluster is the ceiling, not the client). Costs one executor thread per unit and up to `write_concurrency` chunks of in-flight docs per partition. |
 | `max_retries_per_doc` | `int` | `3` | No | Retries for an individual document ES rejected with a retryable status, with exponential backoff (only the failed subset is re-sent). `elasticsearch-py`'s own default is **0**; this is the knob that actually covers a 429, since the connection-level `max_retries` cannot see it. |
@@ -802,6 +806,7 @@ integration_tests/             # live-Spark/ES tests run on Databricks serverles
   test_datatype_coverage.py    #   every Spark datatype + edge cases, round-tripped through ES
   test_bulk_write_roundtrip.py #   the bulk_write result contract (counts, total_input, error_samples)
   test_autoid_fast_path.py     #   auto-id (no id_field) fast path: clean = no dup, chunk w/ a reject re-ships (dup)
+  test_create_append_only.py   #   op_type="create": resend of an existing _id dedups (409, no dup, no overwrite)
   test_concurrency_roundtrip.py #  write_concurrency>1: threaded per-partition write, no loss/dupe/miscount
   test_deletes_roundtrip.py    #   has_deletes routing live: delete-by-id, delete-404 no-op
   test_preflight_column_guards.py # a config field naming a missing column fails before any write
