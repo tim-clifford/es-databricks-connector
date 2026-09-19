@@ -93,3 +93,14 @@ def test_op_type_create_valid_with_id_field():
     cfg = EsWriteConfig(hosts="https://h:9200", api_key="k", index="i", id_field="doc_id",
                         op_type="create")
     assert cfg.op_type == "create"
+
+
+def test_bypass_fast_path_defaults_false():
+    # Default preserves the fast path (its GIL-avoidance); opt in for exact per-item accounting.
+    assert EsWriteConfig(hosts="https://h:9200", api_key="k", index="i").bypass_fast_path is False
+
+
+def test_bypass_fast_path_is_independent_of_op_type():
+    # It is a general knob, not coupled to create: settable with the default op_type="index".
+    cfg = EsWriteConfig(hosts="https://h:9200", api_key="k", index="i", bypass_fast_path=True)
+    assert cfg.bypass_fast_path is True and cfg.op_type == "index"

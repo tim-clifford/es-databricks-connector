@@ -1519,6 +1519,50 @@ def test_index_mode_409_is_error_not_deduped(_no_backoff):
     assert diag["rejected_409"] == 1 and diag["docs_deduped"] == 0
 
 
+def test_bypass_fast_path_skips_probe_full_path_only(_no_backoff):
+    # bypass_fast_path=True => no filter_path="errors" probe; the chunk is classified on the full path
+    # directly (a single send with the trimmed item detail), so a clean chunk still counts written.
+    es = _RecordingES([{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(bypass_fast_path=True), counts, [])
+    assert [c[1] for c in es.calls] == [_FULL_FP]      # only the full path, NO "errors" probe
+    assert counts["written"] == 2
+
+
+def test_bypass_fast_path_gives_exact_create_counts_on_mixed_chunk(_no_backoff):
+    # The scenario that MIScounts under the default fast path (see the test below): a chunk with 1 new
+    # + 2 existing create ops. Under bypass, one full-path send classifies exactly: new 201 -> written,
+    # existing 409 -> deduped. No probe, no whole-chunk re-ship, so nothing self-409s.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"items": [{"create": {"status": 201}},
+                                  {"create": {"status": 409}}, {"create": {"status": 409}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["new", "ex1", "ex2"],
+                       _cfg(op_type="create", bypass_fast_path=True), counts, [], diag=diag)
+    assert [c[1] for c in es.calls] == [_FULL_FP]      # no probe
+    assert counts["written"] == 1 and counts["ignored"] == 2, counts
+    assert diag["docs_deduped"] == 2
+
+
+def test_default_fast_path_miscounts_mixed_create_chunk(_no_backoff):
+    # Documents the count caveat on op_type="create" under the DEFAULT fast path (bypass_fast_path=False):
+    # the probe sees errors:true (the two existing docs 409), re-ships the WHOLE chunk, and the new doc
+    # the probe just created now self-409s -> written=0, docs_deduped=3 (not 1 / 2). The doc is still
+    # correct in ES (present once); only the attribution is off. Use bypass_fast_path=True (test above)
+    # for exact counts. This asserts the documented behavior so it cannot change silently.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"errors": True},
+                       {"items": [{"create": {"status": 409}}, {"create": {"status": 409}},
+                                  {"create": {"status": 409}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["new", "ex1", "ex2"], _cfg(op_type="create"), counts, [], diag=diag)
+    assert [c[1] for c in es.calls] == ["errors", _FULL_FP]   # probe, then whole-chunk re-ship
+    assert counts["written"] == 0 and counts["ignored"] == 3, counts
+    assert diag["docs_deduped"] == 3
+
+
 def test_bulk_stats_diag_keys_agree_across_new_diag_and_stat_keys():
     # Lock the invariant the comments on _DIAG_KEYS / _STAT_KEYS state: every full-path diag key must
     # be produced by _new_diag() and carried in _STAT_KEYS (which now splices *_DIAG_KEYS in, so this

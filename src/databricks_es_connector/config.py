@@ -222,7 +222,29 @@ class EsWriteConfig(EsConnection):
     # here (ES already appends known-unique ids) and must stay "index". A 409 on an "index" op (an
     # external version conflict) stays a hard error; only create+409 is the benign no-op. See
     # bulk.classify_bulk_result and spark_serialize.build_ndjson.
+    #
+    # COUNT CAVEAT under the default fast path (bypass_fast_path=False): the fast path probes a chunk
+    # with filter_path="errors" and, if ANY item failed, re-ships the WHOLE chunk to classify per item.
+    # A chunk that mixes a brand-new _id with an already-existing one (or that hits a transient 429)
+    # therefore creates the new doc on the probe, then RE-creates it on the re-ship, where it now
+    # self-409s and is classified as a dedup. The document is still correct in ES (present once, no
+    # duplicate, no overwrite, reconcile balances), but `written` UNDER-counts it and `docs_deduped`
+    # OVER-counts it for that chunk. The miscount is confined to chunks that straddle new + existing
+    # docs; all-new and all-existing chunks count exactly. Set bypass_fast_path=True for exact counts
+    # (and to skip the wasteful whole-chunk re-ship) at the cost of per-item decode on every chunk.
     op_type: str = "index"
+
+    # Skip the filter_path="errors" fast-path probe and classify every chunk on the full per-item path
+    # (a single send with a trimmed status/_id response, then a per-document 429 retry of only the
+    # rejected lines -- no whole-chunk re-ship). Default False keeps the fast path, whose GIL-avoidance
+    # (no per-item decode on a clean chunk) is the throughput win on wide/large writes. Set True when
+    # exact per-item accounting matters more than that decode saving, independent of op_type:
+    #   - op_type="create": makes `written` / `docs_deduped` exact on mixed new+existing chunks (see the
+    #     count caveat on op_type) and avoids re-shipping conflict-heavy chunks at an already-busy ES.
+    #   - op_type="index" auto-id: avoids the documented at-least-once DUPLICATION a fast-path re-ship
+    #     causes when a chunk that hit a 429 is re-sent whole (the full path retries only the 429'd line).
+    # Costs per-item response decode on every chunk (including clean ones), which the fast path avoids.
+    bypass_fast_path: bool = False
 
     def __post_init__(self):
         super().__post_init__()

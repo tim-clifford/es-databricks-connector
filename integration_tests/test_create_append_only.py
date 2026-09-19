@@ -11,8 +11,13 @@
 # MAGIC    (no duplication) and the stored value is **unchanged** (the create did not overwrite). This is
 # MAGIC    what distinguishes `create` from `index`: `index` would overwrite with the changed value and
 # MAGIC    report `written == N`.
-# MAGIC 3. **Mixed resend** (one NEW `_id` + the existing ones): the new doc is written once, the existing
-# MAGIC    ones dedup, ES ends with N+1 and no duplicates.
+# MAGIC 3. **Mixed resend** (one NEW `_id` + the existing ones) with `bypass_fast_path=True`, forced into
+# MAGIC    ONE chunk (`repartition(1)`): the new doc is written **once** and the existing ones dedup, with
+# MAGIC    EXACT counts (`written==1`, `docs_deduped==N`). This is the case that miscounts under the default
+# MAGIC    fast path (the probe creates the new doc, then the whole-chunk re-ship self-409s it, so it lands
+# MAGIC    as a dedup); `bypass_fast_path` sends the chunk once on the full classify path, so the new doc is
+# MAGIC    counted `written`. ES ends with N+1 and no duplicates. (The default-fast-path miscount itself is
+# MAGIC    partition-dependent, so it is pinned deterministically in the unit tier, not here.)
 # MAGIC
 # MAGIC Live ES + the `es_poc` scope required.
 
@@ -82,10 +87,16 @@ class TestCreateAppendOnly(NotebookTestFixture):
         self.count_resend = _count(INDEX)
         self.v_after_resend = _source(INDEX, 1)["v"]
 
-        # 3. Mixed resend: one NEW id (N+1) plus the existing ids. The new doc writes; the rest dedup.
+        # 3. Mixed resend: one NEW id (N+1) plus the existing ids, forced into ONE chunk (repartition(1))
+        #    so the new doc SHARES a chunk with existing docs -- the exact case that miscounts under the
+        #    default fast path. bypass_fast_path=True classifies the chunk on one full-path send, so the
+        #    new doc counts `written` and the existing ones `docs_deduped`, exactly.
+        cfg_exact = EsConfig(hosts=ES_HOSTS, basic_auth=ES_AUTH, verify_certs=False, index=INDEX,
+                             id_field="id", op_type="create", http_compress=True, bulk_stats=True,
+                             bypass_fast_path=True)
         mixed = spark.range(1, _N + 2).selectExpr("CAST(id AS INT) AS id", "CAST(id AS INT) AS n",
-                                                  "'orig' AS v")
-        self.res_mixed = bulk_write(mixed, cfg)
+                                                  "'orig' AS v").repartition(1)
+        self.res_mixed = bulk_write(mixed, cfg_exact)
         self.count_mixed = _count(INDEX)
 
     def run_cleanup(self):
@@ -123,7 +134,7 @@ class TestCreateAppendOnly(NotebookTestFixture):
         # 409'd instead of overwriting, so the stored value is still the original "orig".
         assert self.v_after_resend == "orig", self.v_after_resend
 
-    # --- 3. mixed resend: the new id writes, the existing ones dedup ---
+    # --- 3. mixed resend (bypass_fast_path, one chunk): the new id writes, the existing ones dedup ---
     def test_mixed_resend_writes_only_the_new_doc(self):
         r = self.res_mixed
         assert r["written"] == 1, r           # only id N+1 is new

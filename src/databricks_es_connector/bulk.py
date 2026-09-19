@@ -454,10 +454,14 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     # cost of omitting id_field; set id_field for idempotent upserts and none of it happens). The
     # written count is taken from the re-ship, so reconciliation stays consistent (the duplicates are
     # extra copies in ES, not a miscount).
-    # Deletes are the one exclusion: a delete-404 is IGNORED (not written), so `errors: false` would not
+    # Deletes are one exclusion: a delete-404 is IGNORED (not written), so `errors: false` would not
     # justify counting the whole chunk as written -- delete-bearing writes always take the full classify
-    # path below.
-    if not cfg.has_deletes:
+    # path below. `bypass_fast_path` is the other: a caller opts out of the probe (see EsWriteConfig) to
+    # get exact per-item accounting and avoid the whole-chunk re-ship -- notably for op_type="create",
+    # where the probe-then-re-ship makes a just-created doc self-409 and miscount (written under,
+    # docs_deduped over) on a chunk that mixes new + existing _ids, and for auto-id, where the re-ship
+    # duplicates. Both send straight to the full classify path.
+    if not cfg.has_deletes and not cfg.bypass_fast_path:
         try:
             # `took` (ES service time) is only needed when collecting stats; requesting it still
             # omits the per-item array, so the GIL win is preserved.

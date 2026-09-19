@@ -103,7 +103,11 @@ Hardening still needed before production for SIEM/audit data:
   duplicated) and lets ES use its cheaper append path. It requires `id_field`, is incompatible with
   `has_deletes`, and must NOT be used where a legitimate update to an existing `_id` can occur (the
   update would be silently absorbed as a 409). This is distinct from the out-of-order-clobber problem
-  below, which `create` does not solve.
+  below, which `create` does not solve. **Count caveat:** under the default fast path a chunk that mixes
+  a new `_id` with an existing one miscounts the new doc as `docs_deduped` rather than `written` (the
+  probe creates it, the whole-chunk re-ship self-409s it; the doc is still correct in ES, present once).
+  Set `bypass_fast_path=True` for exact counts and to avoid re-shipping conflict-heavy chunks; it trades
+  the fast path's GIL-avoidance for per-item decode on every chunk.
 - **Updates & deletes.** Inserts/upserts via deterministic `_id`, and deletes via `has_deletes` +
   `delete_flag_column` (emitting delete-by-`_id` bulk actions with scoped 404 no-op suppression),
   are supported. The delete flag must be a real **BooleanType** column (routing is done in Catalyst
