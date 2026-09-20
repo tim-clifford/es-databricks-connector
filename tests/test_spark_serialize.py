@@ -1563,6 +1563,24 @@ def test_default_fast_path_miscounts_mixed_create_chunk(_no_backoff):
     assert diag["docs_deduped"] == 3
 
 
+def test_ignored_no_op_not_retried_even_if_status_configured_retryable(_no_backoff):
+    # An IGNORED no-op is terminal: a create-409 dedup must NOT be retried even if 409 is (mis)configured
+    # into retry_on_doc_status. Without the `outcome != IGNORED` guard it is re-sent (pointless backoff,
+    # inflated docs_retried) before finally counting IGNORED. probe + ONE full send, then done.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"errors": True},
+                       {"items": [{"create": {"status": 409}}, {"create": {"status": 409}}]},
+                       {"items": [{"create": {"status": 409}}, {"create": {"status": 409}}]}])  # unused if guarded
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(op_type="create", retry_on_doc_status=(429, 409), max_retries_per_doc=1),
+                       counts, [], diag=diag)
+    assert len(es.calls) == 2                       # probe + one full send; NO retry re-send
+    assert counts["ignored"] == 2 and counts["errors"] == 0
+    assert diag["docs_deduped"] == 2 and diag["docs_retried"] == 0   # deduped, never retried
+
+
 def test_bulk_stats_diag_keys_agree_across_new_diag_and_stat_keys():
     # Lock the invariant the comments on _DIAG_KEYS / _STAT_KEYS state: every full-path diag key must
     # be produced by _new_diag() and carried in _STAT_KEYS (which now splices *_DIAG_KEYS in, so this

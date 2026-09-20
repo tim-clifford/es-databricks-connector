@@ -520,7 +520,12 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
             # trivial dict increment on a chunk already decoding items; clean chunks never reach it.
             if diag is not None and not ok and outcome != IGNORED:
                 diag[_reject_bucket(status)] += 1
-            if (not ok and status in cfg.retry_on_doc_status
+            # An IGNORED no-op is TERMINAL and must never be retried -- a delete-404, or a create-409
+            # append-only dedup -- even if a caller has (mis)configured its status into
+            # retry_on_doc_status (the README warns against 404/409 there). Re-sending just repeats the
+            # same no-op with pointless backoff and inflates docs_retried; the default (429,) never hits
+            # this, but the guard makes the no-op terminal regardless of configuration.
+            if (not ok and outcome != IGNORED and status in cfg.retry_on_doc_status
                     and attempt < cfg.max_retries_per_doc):
                 retry_lines.append(pending[idx])
                 continue
