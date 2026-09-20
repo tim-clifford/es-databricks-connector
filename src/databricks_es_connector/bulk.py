@@ -69,15 +69,21 @@ def classify_bulk_result(ok: bool, op_type: str, status: int) -> str:
 
     Pure so the suppression rule is unit-testable without Spark or a live ES client.
 
-    The one suppression: a *delete* that returns *404* is an expected no-op (the doc was
-    never indexed, was filtered out, or a replay already deleted it). It is IGNORED, not an
-    error. Every other non-ok result (including a 404 on an index/create/update, or a
-    409/5xx on a delete) is an ERROR and must be counted. Suppression is scoped to the
-    (op_type == 'delete' AND status == 404) pair only; nothing broader.
+    Two suppressions, each scoped to one (op_type, status) pair and nothing broader:
+      - a *delete* that returns *404* is an expected no-op (the doc was never indexed, was filtered
+        out, or a replay already deleted it).
+      - a *create* that returns *409* is an append-only dedup (the _id already exists, so an at-least-
+        once resend of an append-only feed is a no-op, not a rejection). Only fires under
+        op_type='create', because the response item's op key is "create" only when we sent a create;
+        a 409 on an "index" op (an external version conflict) stays an ERROR.
+    Both are IGNORED: counted as neither a write nor an error. Every other non-ok result (a 404 on an
+    index/create/update, a 409 on an index or delete, any 5xx) is an ERROR and must be counted.
     """
     if ok:
         return DELETED if op_type == "delete" else WRITTEN
     if op_type == "delete" and status == 404:
+        return IGNORED
+    if op_type == "create" and status == 409:
         return IGNORED
     return ERROR
 
@@ -283,8 +289,10 @@ def _reject_bucket(status: int) -> str:
     Fixed buckets (not an open histogram) so they fit the single-row mapInPandas summary schema:
     429 (ES write queue full -> transient backpressure worth retrying), 409 (version conflict), other
     4xx (permanent, e.g. 400 mapper_parsing), and 5xx (server-side). The split is what tells transient
-    backpressure you can retry apart from permanent rejections you cannot. Delete-404 no-ops are
-    excluded by the caller (they are IGNORED, not a rejection)."""
+    backpressure you can retry apart from permanent rejections you cannot. So rejected_409 is a genuine
+    conflict (an index-mode external version clash); a create-409 append-only dedup never reaches here.
+    IGNORED no-ops are excluded by the caller (delete-404 and create-409 dedups are IGNORED, not a
+    rejection; create-409 dedups are tallied separately as docs_deduped)."""
     if status == 429:
         return "rejected_429"
     if status == 409:
@@ -296,7 +304,8 @@ def _reject_bucket(status: int) -> str:
 
 # The per-partition full-path diagnostics keys (bulk_stats only). MUST match _new_diag()'s keys, the
 # summary_schema bulk_stats columns, and _merge_partition_results._STAT_KEYS.
-_DIAG_KEYS = ("docs_retried", "rejected_429", "rejected_409", "rejected_4xx_other", "rejected_5xx")
+_DIAG_KEYS = ("docs_retried", "rejected_429", "rejected_409", "rejected_4xx_other", "rejected_5xx",
+              "docs_deduped")
 
 
 def _new_diag() -> dict:
@@ -304,8 +313,26 @@ def _new_diag() -> dict:
     touched only on the full (errors=True) classify path, so a clean chunk never reaches it. `docs_retried`
     counts docs re-sent because of a retryable per-item status (429); `rejected_*` count non-2xx, non-
     ignored item responses by status bucket, tallied on every occurrence so a 429 that later succeeds on
-    retry is still visible as backpressure."""
+    retry is still visible as backpressure; `docs_deduped` counts create-409 append-only dedups (an _id
+    that already existed on an op_type='create' resend), a benign no-op tracked distinctly from a real
+    rejected_409 conflict."""
     return {k: 0 for k in _DIAG_KEYS}
+
+
+# The full per-partition bulk_stats key set carried on each summary row when cfg.bulk_stats is on. It
+# MUST stay in agreement with: the columns make_ndjson_partition_writer emits (send aggregates +
+# partition_wall_ms + gil-wait keys + every _DIAG_KEYS key), and the bulk_write summary_schema string.
+# _DIAG_KEYS is spliced in (not re-typed) so a new diag key reaches this set automatically; a test
+# (test_bulk_stats_diag_keys_agree_*) asserts the _DIAG_KEYS subset relationship to catch drift.
+_STAT_KEYS = ("n_sends", "docs_sent", "bytes_sent", "send_busy_ms", "send_cpu_ms",
+              "partition_wall_ms",
+              "timeout_sends", "timeout_wait_ms", "error_sends", "error_wait_ms",
+              *_DIAG_KEYS,
+              "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
+              "http_ms_mean", "http_ms_p50", "http_ms_p95", "http_ms_max",
+              "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max",
+              "gil_wait_ms_total", "gil_wait_ms_p50", "gil_wait_ms_p95", "gil_wait_ms_max",
+              "gil_wait_samples")
 
 
 def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: list, stats=None,
@@ -427,10 +454,14 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
     # cost of omitting id_field; set id_field for idempotent upserts and none of it happens). The
     # written count is taken from the re-ship, so reconciliation stays consistent (the duplicates are
     # extra copies in ES, not a miscount).
-    # Deletes are the one exclusion: a delete-404 is IGNORED (not written), so `errors: false` would not
+    # Deletes are one exclusion: a delete-404 is IGNORED (not written), so `errors: false` would not
     # justify counting the whole chunk as written -- delete-bearing writes always take the full classify
-    # path below.
-    if not cfg.has_deletes:
+    # path below. `bypass_fast_path` is the other: a caller opts out of the probe (see EsWriteConfig) to
+    # get exact per-item accounting and avoid the whole-chunk re-ship -- notably for op_type="create",
+    # where the probe-then-re-ship makes a just-created doc self-409 and miscount (written under,
+    # docs_deduped over) on a chunk that mixes new + existing _ids, and for auto-id, where the re-ship
+    # duplicates. Both send straight to the full classify path.
+    if not cfg.has_deletes and not cfg.bypass_fast_path:
         try:
             # `took` (ES service time) is only needed when collecting stats; requesting it still
             # omits the per-item array, so the GIL win is preserved.
@@ -489,7 +520,12 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
             # trivial dict increment on a chunk already decoding items; clean chunks never reach it.
             if diag is not None and not ok and outcome != IGNORED:
                 diag[_reject_bucket(status)] += 1
-            if (not ok and status in cfg.retry_on_doc_status
+            # An IGNORED no-op is TERMINAL and must never be retried -- a delete-404, or a create-409
+            # append-only dedup -- even if a caller has (mis)configured its status into
+            # retry_on_doc_status (the README warns against 404/409 there). Re-sending just repeats the
+            # same no-op with pointless backoff and inflates docs_retried; the default (429,) never hits
+            # this, but the guard makes the no-op terminal regardless of configuration.
+            if (not ok and outcome != IGNORED and status in cfg.retry_on_doc_status
                     and attempt < cfg.max_retries_per_doc):
                 retry_lines.append(pending[idx])
                 continue
@@ -499,6 +535,12 @@ def _ship_ndjson_chunk(es, lines, cfg: EsConfig, counts: dict, error_samples: li
                 counts["deleted"] += 1
             elif outcome == IGNORED:
                 counts["ignored"] += 1
+                # A create whose _id already exists returns 409 and classifies IGNORED (an append-only
+                # dedup, not a rejection). Tally it distinctly from delete-404 no-ops so bulk_stats shows
+                # how many resends were absorbed. A subset of `ignored`; full path only, so a clean
+                # first delivery (fast path) never reaches it.
+                if diag is not None and op_type == "create" and status == 409:
+                    diag["docs_deduped"] += 1
             else:
                 counts["errors"] += 1
                 if len(error_samples) < ERROR_SAMPLE_CAP:
@@ -828,15 +870,6 @@ def _merge_partition_results(rows) -> dict:
     # Optional per-partition bulk-send aggregates: present only when the rows carry them (cfg.bulk_stats
     # was on). Kept OUT of the result otherwise, so the core key set is unchanged when off. One entry
     # per partition; the caller (e.g. an on_batch hook) rolls up or logs as it sees fit.
-    _STAT_KEYS = ("n_sends", "docs_sent", "bytes_sent", "send_busy_ms", "send_cpu_ms",
-                  "partition_wall_ms",
-                  "timeout_sends", "timeout_wait_ms", "error_sends", "error_wait_ms",
-                  "docs_retried", "rejected_429", "rejected_409", "rejected_4xx_other", "rejected_5xx",
-                  "rtt_ms_mean", "rtt_ms_p50", "rtt_ms_p95", "rtt_ms_max",
-                  "http_ms_mean", "http_ms_p50", "http_ms_p95", "http_ms_max",
-                  "took_ms_mean", "took_ms_p50", "took_ms_p95", "took_ms_max",
-                  "gil_wait_ms_total", "gil_wait_ms_p50", "gil_wait_ms_p95", "gil_wait_ms_max",
-                  "gil_wait_samples")
     bulk_stats = [{k: (r[k] if k in r else None) for k in _STAT_KEYS}
                   for r in rows if "n_sends" in r]
     if bulk_stats:
@@ -1033,7 +1066,7 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     When `cfg.bulk_stats=True`, the result additionally carries 'bulk_stats': one entry per partition,
     each {n_sends, docs_sent, bytes_sent, send_busy_ms, send_cpu_ms, partition_wall_ms,
     timeout_sends, timeout_wait_ms, error_sends, error_wait_ms,
-    docs_retried, rejected_429, rejected_409, rejected_4xx_other, rejected_5xx,
+    docs_retried, rejected_429, rejected_409, rejected_4xx_other, rejected_5xx, docs_deduped,
     rtt_ms_mean/p50/p95/max, http_ms_mean/p50/p95/max, took_ms_mean/p50/p95/max,
     gil_wait_ms_total/p50/p95/max, gil_wait_samples}. The round trip splits into three NESTED timings,
     rtt_ms >= http_ms >= took_ms: `rtt_ms` is the full es.bulk wall the client observes; `http_ms` is
@@ -1060,8 +1093,10 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
     / `rejected_409` / `rejected_4xx_other` / `rejected_5xx` bucket every non-2xx, non-ignored item
     response by status, counted on every occurrence -- so a 429 that later succeeds on retry still shows
     as backpressure -- which distinguishes transient pushback you can retry (429/503) from permanent
-    rejections you cannot (400/409). All of these are populated only on the full (errors) path, so a
-    clean chunk contributes nothing to them.
+    rejections you cannot (400/409). `docs_deduped` counts create-409 append-only dedups (an op_type=
+    'create' resend whose _id already existed): a benign no-op, tracked separately from a genuine
+    `rejected_409` conflict, so you can watch how many resends the feed is absorbing. All of these are
+    populated only on the full (errors) path, so a clean chunk contributes nothing to them.
 
     `send_cpu_ms` and the gil_wait_ms columns diagnose WHY a round trip is slow -- whether it is a real
     socket/ES wait or the worker being starved of the GIL (client-side, but indistinguishable from ES
@@ -1108,7 +1143,7 @@ def bulk_write(df, cfg: EsConfig, *, raise_on_error: bool = False) -> dict:
                            "send_busy_ms double, send_cpu_ms double, partition_wall_ms double, "
                            "timeout_sends long, timeout_wait_ms double, error_sends long, error_wait_ms double, "
                            "docs_retried long, rejected_429 long, rejected_409 long, "
-                           "rejected_4xx_other long, rejected_5xx long, "
+                           "rejected_4xx_other long, rejected_5xx long, docs_deduped long, "
                            "rtt_ms_mean double, rtt_ms_p50 double, rtt_ms_p95 double, rtt_ms_max double, "
                            "http_ms_mean double, http_ms_p50 double, http_ms_p95 double, http_ms_max double, "
                            "took_ms_mean double, took_ms_p50 double, took_ms_p95 double, took_ms_max double, "

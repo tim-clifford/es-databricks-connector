@@ -207,6 +207,45 @@ class EsWriteConfig(EsConnection):
     has_deletes: bool = False
     delete_flag_column: Optional[str] = None  # boolean column: true => delete this _id
 
+    # --- write op type: index (default) vs create ---
+    # The `_bulk` action used for every NON-delete row. "index" (default) upserts by _id, so a resend
+    # overwrites the existing doc. "create" appends only: Elasticsearch rejects a write whose _id
+    # already exists with a 409, which the connector then treats as an expected no-op -- counted as
+    # `ignored` (never an error) and surfaced distinctly as `docs_deduped` under bulk_stats. That gives
+    # an APPEND-ONLY feed true idempotency on resend (a redelivered doc is neither overwritten, as
+    # "index" would, nor duplicated) and lets Elasticsearch take its cheaper append path (Lucene
+    # addDocument, no delete-by-_id term) instead of the update path.
+    # Use ONLY for feeds that never legitimately UPDATE an existing _id: under "create" a real update to
+    # an already-indexed doc is silently absorbed as a 409 no-op. Requires id_field (a create without an
+    # explicit _id can never conflict, so it would be "index" with extra steps and no dedup) and is
+    # incompatible with has_deletes (a feed that deletes is not append-only). Auto-id feeds gain nothing
+    # here (ES already appends known-unique ids) and must stay "index". A 409 on an "index" op (an
+    # external version conflict) stays a hard error; only create+409 is the benign no-op. See
+    # bulk.classify_bulk_result and spark_serialize.build_ndjson.
+    #
+    # COUNT CAVEAT under the default fast path (bypass_fast_path=False): the fast path probes a chunk
+    # with filter_path="errors" and, if ANY item failed, re-ships the WHOLE chunk to classify per item.
+    # A chunk that mixes a brand-new _id with an already-existing one (or that hits a transient 429)
+    # therefore creates the new doc on the probe, then RE-creates it on the re-ship, where it now
+    # self-409s and is classified as a dedup. The document is still correct in ES (present once, no
+    # duplicate, no overwrite, reconcile balances), but `written` UNDER-counts it and `docs_deduped`
+    # OVER-counts it for that chunk. The miscount is confined to chunks that straddle new + existing
+    # docs; all-new and all-existing chunks count exactly. Set bypass_fast_path=True for exact counts
+    # (and to skip the wasteful whole-chunk re-ship) at the cost of per-item decode on every chunk.
+    op_type: str = "index"
+
+    # Skip the filter_path="errors" fast-path probe and classify every chunk on the full per-item path
+    # (a single send with a trimmed status/_id response, then a per-document 429 retry of only the
+    # rejected lines -- no whole-chunk re-ship). Default False keeps the fast path, whose GIL-avoidance
+    # (no per-item decode on a clean chunk) is the throughput win on wide/large writes. Set True when
+    # exact per-item accounting matters more than that decode saving, independent of op_type:
+    #   - op_type="create": makes `written` / `docs_deduped` exact on mixed new+existing chunks (see the
+    #     count caveat on op_type) and avoids re-shipping conflict-heavy chunks at an already-busy ES.
+    #   - op_type="index" auto-id: avoids the documented at-least-once DUPLICATION a fast-path re-ship
+    #     causes when a chunk that hit a 429 is re-sent whole (the full path retries only the 429'd line).
+    # Costs per-item response decode on every chunk (including clean ones), which the fast path avoids.
+    bypass_fast_path: bool = False
+
     def __post_init__(self):
         super().__post_init__()
         if self.max_retries_per_doc < 0:
@@ -250,6 +289,21 @@ class EsWriteConfig(EsConnection):
         # The remaining delete requirement -- delete_flag_column must be a real BooleanType column, so
         # build_ndjson can route it in Catalyst via `flag === true` -- needs the DataFrame schema, so
         # it is enforced in bulk._preflight (driver-side, once), not here where only field values exist.
+        # op_type governs the non-delete action. Allow-list it (a typo fails closed here rather than
+        # emitting a bogus _bulk action ES rejects wholesale), and enforce the two invariants that make
+        # "create" both meaningful and safe.
+        if self.op_type not in ("index", "create"):
+            raise ValueError(f"op_type must be 'index' or 'create', got {self.op_type!r}")
+        if self.op_type == "create":
+            if self.id_field is None:
+                raise ValueError(
+                    "op_type='create' requires id_field: without an explicit _id a create never "
+                    "conflicts, so it would be 'index' with extra steps and no dedup. Set id_field, or "
+                    "use op_type='index'.")
+            if self.has_deletes:
+                raise ValueError(
+                    "op_type='create' is incompatible with has_deletes: a feed that issues deletes is "
+                    "not append-only. Use op_type='index' for delete-bearing feeds.")
 
     def client_kwargs(self) -> dict:
         """EsConnection.client_kwargs plus a per-node connection pool sized to write_concurrency.

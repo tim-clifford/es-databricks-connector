@@ -253,7 +253,8 @@ def build_ndjson(df, cfg: EsConfig):
     # ignoreNullFields=false keeps an explicit null field as JSON null rather than dropping the key.
     source = F.to_json(F.struct(*[_source_expr(c) for c in payload]), {"ignoreNullFields": "false"})
 
-    # Index/upsert action header; _id from id_field when set (else ES assigns one).
+    # Index/create action header (the op is cfg.op_type: "index" upserts, "create" appends and 409s on
+    # a duplicate _id); _id from id_field when set (else ES assigns one).
     index_meta = [F.lit(cfg.index).alias("_index")]
     id_col = None
     if cfg.id_field:
@@ -272,7 +273,7 @@ def build_ndjson(df, cfg: EsConfig):
         if isinstance(id_dt, (DoubleType, FloatType)):
             id_col = _null_nonfinite(id_col, id_dt)
         index_meta.append(id_col.cast("string").alias("_id"))
-    index_header = F.to_json(F.struct(F.struct(*index_meta).alias("index")), {"ignoreNullFields": "false"})
+    index_header = F.to_json(F.struct(F.struct(*index_meta).alias(cfg.op_type)), {"ignoreNullFields": "false"})
     index_line = F.concat(index_header, F.lit("\n"), source)
 
     if cfg.has_deletes:

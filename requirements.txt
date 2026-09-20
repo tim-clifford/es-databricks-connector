@@ -6,7 +6,7 @@
 # `# via <parent>` (a transitive dependency), listed in dependency order.
 #
 # Versions are the resolved closure of installing the built wheel (Python 3.13,
-# resolved 2026-07-30). Pins are exact so the scan reflects a reproducible set; the wheel
+# resolved 2026-09-20). Pins are exact so the scan reflects a reproducible set; the wheel
 # itself constrains only `elasticsearch>=8,<9`, so a fresh install may resolve newer
 # transitive patch versions. Regenerate with:
 #     python -m venv /tmp/req && /tmp/req/bin/pip install "elasticsearch>=8,<9"
@@ -20,5 +20,5 @@ elastic-transport==8.19.0     # via elasticsearch
 python-dateutil==2.9.0.post0  # via elasticsearch
 typing_extensions==4.16.0     # via elasticsearch
 certifi==2026.7.22            # via elastic-transport
-urllib3==2.7.0                # via elastic-transport
+urllib3==2.8.0                # via elastic-transport
 six==1.17.0                   # via python-dateutil

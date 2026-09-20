@@ -1468,3 +1468,126 @@ def test_ndjson_writer_bulk_stats_surfaces_diag_columns(monkeypatch, _no_backoff
     assert int(row["rejected_429"]) == 1
     assert int(row["rejected_4xx_other"]) == 1
     assert int(row["rejected_409"]) == 0 and int(row["rejected_5xx"]) == 0
+    assert int(row["docs_deduped"]) == 0    # no create-409s on this index-mode chunk
+
+
+# =====================================================================================
+# op_type='create' + the create-409 append-only dedup (0.10.0). A create whose _id already
+# exists returns 409, which classifies IGNORED (a benign dedup, not a rejection) and is tallied
+# distinctly as docs_deduped. An index-mode 409 (external version conflict) stays a hard error.
+# =====================================================================================
+
+def test_classify_create_409_is_dedup_ignored_index_409_is_error():
+    from databricks_es_connector.bulk import classify_bulk_result, IGNORED, ERROR, WRITTEN
+    assert classify_bulk_result(False, "create", 409) == IGNORED   # append-only dedup: benign no-op
+    assert classify_bulk_result(True, "create", 201) == WRITTEN    # a genuine create still counts written
+    assert classify_bulk_result(False, "index", 409) == ERROR      # index-mode version conflict: an error
+    assert classify_bulk_result(False, "delete", 409) == ERROR     # 409 on a delete: an error
+    assert classify_bulk_result(False, "create", 400) == ERROR     # a real create rejection: an error
+
+
+def test_diag_counts_create_409_as_deduped_not_rejected(_no_backoff):
+    # create-mode resend: probe errors=True -> full reship carrying one new create (201) and two
+    # already-existing docs (409). The two 409s are append-only dedups: IGNORED, tallied as
+    # docs_deduped, and specifically NOT counted as rejected_409 or as errors.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([
+        {"errors": True},
+        {"items": [{"create": {"status": 201}},
+                   {"create": {"status": 409, "_id": "d2", "error": {"reason": "version_conflict"}}},
+                   {"create": {"status": 409, "_id": "d3", "error": {"reason": "version_conflict"}}}]},
+    ])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a", "b", "c"], _cfg(op_type="create"), counts, [], diag=diag)
+    assert diag["docs_deduped"] == 2       # two already-existed: benign dedups, visible in bulk_stats
+    assert diag["rejected_409"] == 0       # NOT a rejection under create mode
+    assert counts == {"written": 1, "deleted": 0, "ignored": 2, "errors": 0}
+    # Reconcile identity holds: written + deleted + errors + ignored == total_input (1+0+0+2 == 3).
+
+
+def test_index_mode_409_is_error_not_deduped(_no_backoff):
+    # The default op_type='index': a 409 (external version conflict) is a hard error, counted in
+    # rejected_409, and never touches docs_deduped.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"errors": True},
+                       {"items": [{"index": {"status": 409, "_id": "x", "error": {"reason": "conflict"}}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a"], _cfg(), counts, [], diag=diag)   # default op_type=index
+    assert counts["errors"] == 1 and counts["ignored"] == 0
+    assert diag["rejected_409"] == 1 and diag["docs_deduped"] == 0
+
+
+def test_bypass_fast_path_skips_probe_full_path_only(_no_backoff):
+    # bypass_fast_path=True => no filter_path="errors" probe; the chunk is classified on the full path
+    # directly (a single send with the trimmed item detail), so a clean chunk still counts written.
+    es = _RecordingES([{"items": [{"index": {"status": 201}}, {"index": {"status": 201}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    _ship_ndjson_chunk(es, ["a", "b"], _cfg(bypass_fast_path=True), counts, [])
+    assert [c[1] for c in es.calls] == [_FULL_FP]      # only the full path, NO "errors" probe
+    assert counts["written"] == 2
+
+
+def test_bypass_fast_path_gives_exact_create_counts_on_mixed_chunk(_no_backoff):
+    # The scenario that MIScounts under the default fast path (see the test below): a chunk with 1 new
+    # + 2 existing create ops. Under bypass, one full-path send classifies exactly: new 201 -> written,
+    # existing 409 -> deduped. No probe, no whole-chunk re-ship, so nothing self-409s.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"items": [{"create": {"status": 201}},
+                                  {"create": {"status": 409}}, {"create": {"status": 409}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["new", "ex1", "ex2"],
+                       _cfg(op_type="create", bypass_fast_path=True), counts, [], diag=diag)
+    assert [c[1] for c in es.calls] == [_FULL_FP]      # no probe
+    assert counts["written"] == 1 and counts["ignored"] == 2, counts
+    assert diag["docs_deduped"] == 2
+
+
+def test_default_fast_path_miscounts_mixed_create_chunk(_no_backoff):
+    # Documents the count caveat on op_type="create" under the DEFAULT fast path (bypass_fast_path=False):
+    # the probe sees errors:true (the two existing docs 409), re-ships the WHOLE chunk, and the new doc
+    # the probe just created now self-409s -> written=0, docs_deduped=3 (not 1 / 2). The doc is still
+    # correct in ES (present once); only the attribution is off. Use bypass_fast_path=True (test above)
+    # for exact counts. This asserts the documented behavior so it cannot change silently.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"errors": True},
+                       {"items": [{"create": {"status": 409}}, {"create": {"status": 409}},
+                                  {"create": {"status": 409}}]}])
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["new", "ex1", "ex2"], _cfg(op_type="create"), counts, [], diag=diag)
+    assert [c[1] for c in es.calls] == ["errors", _FULL_FP]   # probe, then whole-chunk re-ship
+    assert counts["written"] == 0 and counts["ignored"] == 3, counts
+    assert diag["docs_deduped"] == 3
+
+
+def test_ignored_no_op_not_retried_even_if_status_configured_retryable(_no_backoff):
+    # An IGNORED no-op is terminal: a create-409 dedup must NOT be retried even if 409 is (mis)configured
+    # into retry_on_doc_status. Without the `outcome != IGNORED` guard it is re-sent (pointless backoff,
+    # inflated docs_retried) before finally counting IGNORED. probe + ONE full send, then done.
+    from databricks_es_connector.bulk import _new_diag
+    es = _RecordingES([{"errors": True},
+                       {"items": [{"create": {"status": 409}}, {"create": {"status": 409}}]},
+                       {"items": [{"create": {"status": 409}}, {"create": {"status": 409}}]}])  # unused if guarded
+    counts = {"written": 0, "deleted": 0, "ignored": 0, "errors": 0}
+    diag = _new_diag()
+    _ship_ndjson_chunk(es, ["a", "b"],
+                       _cfg(op_type="create", retry_on_doc_status=(429, 409), max_retries_per_doc=1),
+                       counts, [], diag=diag)
+    assert len(es.calls) == 2                       # probe + one full send; NO retry re-send
+    assert counts["ignored"] == 2 and counts["errors"] == 0
+    assert diag["docs_deduped"] == 2 and diag["docs_retried"] == 0   # deduped, never retried
+
+
+def test_bulk_stats_diag_keys_agree_across_new_diag_and_stat_keys():
+    # Lock the invariant the comments on _DIAG_KEYS / _STAT_KEYS state: every full-path diag key must
+    # be produced by _new_diag() and carried in _STAT_KEYS (which now splices *_DIAG_KEYS in, so this
+    # holds by construction and this test catches a future hand-edit that breaks it). The remaining
+    # leg -- _STAT_KEYS vs the bulk_write summary_schema string -- is enforced at runtime by mapInPandas
+    # in the integration tier (a missing/extra column fails the write), which cannot be reached offline.
+    from databricks_es_connector.bulk import _new_diag, _DIAG_KEYS, _STAT_KEYS
+    assert set(_new_diag()) == set(_DIAG_KEYS)
+    assert set(_DIAG_KEYS).issubset(_STAT_KEYS)
+    assert "docs_deduped" in _DIAG_KEYS and "docs_deduped" in _STAT_KEYS
